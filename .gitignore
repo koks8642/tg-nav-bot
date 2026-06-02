@@ -1,0 +1,30 @@
+# Data & secrets
+/data/
+*.db
+*.db-wal
+*.db-shm
+.env
+.env.local
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Claude / editor local
+.claude/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Keep the export for backfill, but ignore its heavy media
+/ChatExport/video_files/
+/ChatExport/images/
+/ChatExport/stickers/

@@ -1,0 +1,30 @@
+# Fly.io deployment. Edit `app` to your unique name, then:
+#   fly launch --no-deploy        (or `fly apps create rqm-nav`)
+#   fly volume create rqm_data --size 1 --region fra
+#   fly secrets set BOT_TOKEN=... OWNER_USER_IDS=... TELEGRAPH_TOKEN=... \
+#       WEBAPP_URL=https://<app>.fly.dev CHANNEL_CHAT_ID=-1003131929652
+#   fly deploy
+app = "rqm-nav"
+primary_region = "fra"
+
+[build]
+
+[env]
+  DB_PATH = "/data/rqm.db"
+  PORT = "8080"
+  HOST = "0.0.0.0"
+
+[[mounts]]
+  source = "rqm_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false   # a polling bot must stay up 24/7
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

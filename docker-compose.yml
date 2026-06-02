@@ -1,0 +1,19 @@
+# For a self-hosted VM (Oracle Cloud Always Free, any VPS).
+#   1. put secrets in .env  (see .env.example)
+#   2. docker compose up -d --build
+#   3. docker compose logs -f
+services:
+  rqm-nav:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /data/rqm.db
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - rqm-data:/data        # persistent SQLite — survives redeploys
+
+volumes:
+  rqm-data:
