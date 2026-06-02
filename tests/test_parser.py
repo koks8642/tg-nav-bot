@@ -185,6 +185,17 @@ def test_parsed_post_from_message_text_link():
     assert chapters[0].telegraph_url == "https://telegra.ph/x-Glava-282-y"
 
 
+def test_bare_telegraph_url_counts_as_chapter():
+    # a pasted bare URL (url entity) becomes a chapter via slug fallback
+    text = "Новая глава https://telegra.ph/Test-Glava-305-Arena-06-03"
+    ent = _Ent("url", 12, 49, url=None)
+    post = parsed_post_from_message(700, text, [ent])
+    chapters = extract_chapters(post)
+    assert len(chapters) == 1
+    assert chapters[0].number == 305
+    assert chapters[0].arc == "Arena"
+
+
 def test_parsed_post_utf16_offsets():
     # emoji before the link shifts UTF-16 offsets; ensure correct slicing
     text = "🎁 Глава 5"

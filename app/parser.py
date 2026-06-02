@@ -84,7 +84,19 @@ class ParsedPost:
 
     @property
     def telegraph_anchors(self) -> list[Anchor]:
-        return [a for a in self.anchors if is_telegraph_url(a.url)]
+        """Telegraph links from both hyperlinked text and bare URLs.
+
+        Authors usually hyperlink "Глава N", but a bare pasted telegraph URL
+        (a ``url`` entity → ``plain_links``) should count as a chapter too. Bare
+        links get an empty label, so the number/arc are read from the slug.
+        """
+        out: list[Anchor] = [a for a in self.anchors if is_telegraph_url(a.url)]
+        seen = {a.url for a in out}
+        for url in self.plain_links:
+            if is_telegraph_url(url) and url not in seen:
+                seen.add(url)
+                out.append(Anchor(url=url, label=""))
+        return out
 
 
 # ── small utilities ──────────────────────────────────────────────────────────

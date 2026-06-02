@@ -58,6 +58,7 @@ class BotApp:
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("id", self.cmd_id))
         app.add_handler(CommandHandler("health", self.cmd_health))
+        app.add_handler(CommandHandler("links", self.cmd_links))
         app.add_handler(CommandHandler("menu", self.cmd_menu))
         app.add_handler(CommandHandler("rebuild", self.cmd_rebuild))
         app.add_handler(CommandHandler("backfill", self.cmd_backfill))
@@ -133,6 +134,40 @@ class BotApp:
             return
         await update.message.reply_text(await self._health_text(),
                                         parse_mode=ParseMode.HTML)
+
+    async def cmd_links(self, update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._owner(update):
+            return
+        lines = ["<b>🔗 Telegraph-страницы</b>"]
+        root = await self.db.get_page_for("root", None)
+        if root:
+            lines.append(f"🏠 <b>Главная (закрепить в канале):</b>\n"
+                         f"https://telegra.ph/{root['path']}")
+        else:
+            lines.append("Главная ещё не собрана — пришлите пост с хэштегом "
+                         "или нажмите «Пересобрать всё».")
+        proj_pages = await self.db.fetchall(
+            "SELECT tp.path, p.canonical_name AS name, p.emoji "
+            "FROM telegraph_pages tp JOIN projects p ON p.id=tp.ref_id "
+            "WHERE tp.kind='project' ORDER BY p.sort_order")
+        if proj_pages:
+            lines.append("\n<b>Проекты:</b>")
+            for r in proj_pages:
+                lines.append(f"{r['emoji']} {r['name']}: "
+                             f"https://telegra.ph/{r['path']}")
+        sec_pages = await self.db.fetchall(
+            "SELECT tp.path, s.name, s.emoji FROM telegraph_pages tp "
+            "JOIN sections s ON s.id=tp.ref_id WHERE tp.kind='section' "
+            "ORDER BY s.sort_order")
+        if sec_pages:
+            lines.append("\n<b>Разделы:</b>")
+            for r in sec_pages:
+                lines.append(f"{r['emoji']} {r['name']}: "
+                             f"https://telegra.ph/{r['path']}")
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True)
 
     async def cmd_rebuild(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
