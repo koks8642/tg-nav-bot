@@ -228,16 +228,24 @@ class BotApp:
         if await self._owner(update):
             await self._send_menu(update.effective_message)
             return
+        bot = context.bot.username or "bot"
         await update.message.reply_text(
-            "👋 <b>Навигатор переводов RQM</b>\n\n"
-            "Просто пришлите запрос — найду мгновенно:\n"
-            "• <code>304</code> — все главы с номером 304\n"
-            "• <code>покровитель 305</code> — глава 305 проекта\n"
-            "• <code>турнир</code> — главы арки\n"
-            "• <code>башня</code> — проект\n\n"
-            "Можно искать в любом чате через <code>@{bot} запрос</code>.".format(
-                bot=(context.bot.username or "bot")),
-            parse_mode=ParseMode.HTML)
+            "👋 <b>Навигатор переводов RQM</b>\n"
+            "Я помогаю быстро найти любую главу, проект или материал команды.\n\n"
+            "🔎 <b>Как искать</b> — просто пришлите сообщение, ничего нажимать не нужно:\n\n"
+            "• <code>покровитель</code> — <b>карточка проекта</b>: все главы (по аркам), "
+            "арты, мемы, заметки и ссылки на площадки (RanobeLib и др.)\n"
+            "• <code>304</code> или <code>глава 304</code> — глава 304 во <b>всех</b> "
+            "тайтлах, где она есть\n"
+            "• <code>покровитель 304</code> — конкретная глава нужного проекта\n"
+            "• <code>арена</code> — поиск по <b>арке</b> (выдаст её главы)\n"
+            "• <code>мемы</code> — раздел целиком; можно искать и по названию арта/заметки\n\n"
+            "В результатах у каждой главы — кнопки <b>📖 Читать</b> (на Telegraph) и "
+            "<b>💬 Пост</b> (в канале).\n\n"
+            f"⚡️ <b>В любом чате:</b> наберите <code>@{bot} 304</code> — и отправьте "
+            "найденную главу другу, не выходя из переписки.\n\n"
+            "📌 Полная навигация по всем проектам также закреплена в канале.",
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
