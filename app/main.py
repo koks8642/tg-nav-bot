@@ -58,7 +58,7 @@ async def run() -> None:
     bot_app = BotApp(db, cfg)
     application = bot_app.build()
 
-    # HTTP server (API + static Mini App)
+    # HTTP health server (liveness probe for hosting platforms)
     api_app = build_api_app(db, cfg)
     runner = web.AppRunner(api_app)
     await runner.setup()

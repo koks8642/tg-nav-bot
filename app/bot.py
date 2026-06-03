@@ -56,6 +56,9 @@ class BotApp:
         self.db = db
         self.cfg = cfg
         self.application: Application | None = None
+        # cache of channel admin user ids (creator + administrators)
+        self._admin_ids: set[int] = set()
+        self._admin_ids_ts: float = 0.0
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -97,19 +100,40 @@ class BotApp:
         self.application = app
         return app
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-    def _owner(self, update: Update) -> bool:
+    # ── admin recognition (channel admins/owner + configured OWNER_USER_IDS) ──
+    async def _channel_admin_ids(self, force: bool = False) -> set[int]:
+        import time
+        if not force and self._admin_ids and (time.time() - self._admin_ids_ts) < 300:
+            return self._admin_ids
+        try:
+            admins = await self.application.bot.get_chat_administrators(
+                self.cfg.channel_chat_id)
+            self._admin_ids = {a.user.id for a in admins if not a.user.is_bot}
+            self._admin_ids_ts = time.time()
+        except Exception as e:  # noqa: BLE001
+            log.warning("get_chat_administrators failed: %s", e)
+        return self._admin_ids
+
+    async def is_admin(self, user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+        if user_id in self.cfg.owner_user_ids:
+            return True
+        return user_id in await self._channel_admin_ids()
+
+    async def _owner(self, update: Update) -> bool:
         u = update.effective_user
-        return bool(u and self.cfg.is_owner(u.id))
+        return bool(u and await self.is_admin(u.id))
 
     async def notify_owners(self, text: str) -> None:
         if not self.application:
             return
-        for uid in self.cfg.owner_user_ids:
+        targets = set(self.cfg.owner_user_ids) | await self._channel_admin_ids()
+        for uid in targets:
             try:
                 await self.application.bot.send_message(uid, text)
             except Exception as e:  # noqa: BLE001
-                log.warning("notify owner %s failed: %s", uid, e)
+                log.debug("notify %s skipped: %s", uid, e)
 
     async def _post_urls(self) -> dict[int, str]:
         rows = await self.db.fetchall("SELECT message_id, tg_url FROM posts")
@@ -141,7 +165,7 @@ class BotApp:
     # ── commands ─────────────────────────────────────────────────────────────
     async def cmd_start(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._owner(update):
+        if await self._owner(update):
             await self._send_menu(update.effective_message)
             return
         await update.message.reply_text(
@@ -163,7 +187,7 @@ class BotApp:
 
     async def cmd_menu(self, update: Update,
                        context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._owner(update):
+        if await self._owner(update):
             await self._send_menu(update.effective_message)
 
     async def cmd_search(self, update: Update,
@@ -177,13 +201,13 @@ class BotApp:
 
     async def cmd_health(self, update: Update,
                          context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._owner(update):
+        if await self._owner(update):
             await update.message.reply_text(await self._health_text(),
                                             parse_mode=ParseMode.HTML)
 
     async def cmd_links(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._owner(update):
+        if not await self._owner(update):
             return
         await update.message.reply_text(await self._links_text(),
                                         parse_mode=ParseMode.HTML,
@@ -191,7 +215,7 @@ class BotApp:
 
     async def cmd_rebuild(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._owner(update):
+        if not await self._owner(update):
             return
         from .rebuild import enqueue_full_rebuild
         await enqueue_full_rebuild(self.db)
@@ -199,7 +223,7 @@ class BotApp:
 
     async def cmd_backfill(self, update: Update,
                            context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._owner(update):
+        if not await self._owner(update):
             return
         await update.message.reply_text("⏳ Запускаю бэкафилл…")
         from .backfill import run_backfill
@@ -255,7 +279,7 @@ class BotApp:
         if not msg or not msg.text:
             return
         # owner mid-flow? consume as the awaited input
-        if self._owner(update) and context.user_data.get("await"):
+        if await self._owner(update) and context.user_data.get("await"):
             await self._handle_pending(update, context)
             return
         await self._do_search(msg, msg.text.strip())
@@ -349,7 +373,7 @@ class BotApp:
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
-        if not q or not self.cfg.is_owner(q.from_user.id):
+        if not q or not await self.is_admin(q.from_user.id):
             if q:
                 await q.answer("Нет доступа", show_alert=True)
             return

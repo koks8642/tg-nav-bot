@@ -1,7 +1,7 @@
 """SQLite data layer (aiosqlite) — the single source of truth.
 
-Both representations (Telegraph renderer and Mini App API) read from here; the
-bot pipeline and admin write here. The schema is created idempotently and
+The Telegraph renderer and the bot (search + admin) read from here; the bot
+pipeline and admin write here. The schema is created idempotently and
 versioned through ``PRAGMA user_version`` so redeploys never lose or corrupt
 data on a persistent volume.
 """
@@ -532,7 +532,7 @@ class Database:
     async def clear_done_builds(self) -> None:
         await self.execute("DELETE FROM build_queue WHERE status='done'")
 
-    # ── search (Mini App) ────────────────────────────────────────────────────
+    # ── smart search (bot + inline) ──────────────────────────────────────────
     async def search(self, query: str, limit: int = 40) -> dict[str, list[dict]]:
         """Smart search across projects / arcs / chapter numbers.
 

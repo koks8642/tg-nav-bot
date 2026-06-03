@@ -2,7 +2,7 @@
 #   fly launch --no-deploy        (or `fly apps create rqm-nav`)
 #   fly volume create rqm_data --size 1 --region fra
 #   fly secrets set BOT_TOKEN=... OWNER_USER_IDS=... TELEGRAPH_TOKEN=... \
-#       WEBAPP_URL=https://<app>.fly.dev CHANNEL_CHAT_ID=-1003131929652
+#       CHANNEL_CHAT_ID=-1003716400486
 #   fly deploy
 app = "rqm-nav"
 primary_region = "fra"

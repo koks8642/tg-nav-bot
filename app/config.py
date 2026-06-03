@@ -51,7 +51,6 @@ class Config:
     telegraph_token: str
     telegraph_author: str
     telegraph_author_url: str
-    webapp_url: str
     telegram_proxy: str
     reconcile_interval_min: int
     host: str
@@ -108,7 +107,6 @@ def load_config(*, require_bot: bool = True) -> Config:
         telegraph_token=os.environ.get("TELEGRAPH_TOKEN", "").strip(),
         telegraph_author=os.environ.get("TELEGRAPH_AUTHOR", "Переводы RQM"),
         telegraph_author_url=os.environ.get("TELEGRAPH_AUTHOR_URL", ""),
-        webapp_url=os.environ.get("WEBAPP_URL", "").rstrip("/"),
         telegram_proxy=os.environ.get("TELEGRAM_PROXY", "").strip(),
         reconcile_interval_min=int(os.environ.get("RECONCILE_INTERVAL_MIN", "30")),
         host=os.environ.get("HOST", "0.0.0.0"),

@@ -10,7 +10,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY webapp ./webapp
 COPY scripts ./scripts
 # the export is needed for the one-time backfill; harmless to ship
 COPY ChatExport/messages.html ./ChatExport/messages.html
