@@ -16,12 +16,24 @@ from typing import Any, Iterable, Sequence
 
 import aiosqlite
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    key            TEXT UNIQUE NOT NULL,
+    name           TEXT NOT NULL,
+    slug           TEXT NOT NULL,
+    emoji          TEXT DEFAULT '📚',
+    telegraph_path TEXT DEFAULT '',
+    sort_order     INTEGER DEFAULT 100,
+    hidden         INTEGER DEFAULT 0,
+    created_at     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS projects (
@@ -36,6 +48,7 @@ CREATE TABLE IF NOT EXISTS projects (
     mangalib_url   TEXT DEFAULT '',
     senkuro_url    TEXT DEFAULT '',
     boosty_url     TEXT DEFAULT '',
+    group_id       INTEGER,
     sort_order     INTEGER DEFAULT 100,
     hidden         INTEGER DEFAULT 0,
     created_at     TEXT
@@ -207,8 +220,15 @@ class Database:
         await self.conn.executescript(SCHEMA)
         cur = await self.conn.execute("PRAGMA user_version;")
         (version,) = await cur.fetchone()
+        if version < 2:
+            # v2: project groups. The groups table is created by SCHEMA above;
+            # existing DBs need the projects.group_id column added.
+            cols = [r[1] for r in await (
+                await self.conn.execute("PRAGMA table_info(projects)")).fetchall()]
+            if "group_id" not in cols:
+                await self.conn.execute(
+                    "ALTER TABLE projects ADD COLUMN group_id INTEGER")
         if version < SCHEMA_VERSION:
-            # future migrations branch on `version` here
             await self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION};")
         await self.conn.commit()
 
@@ -273,6 +293,58 @@ class Database:
             "INSERT INTO conflicts(ts,type,ref,detail,status) VALUES(?,?,?,?, 'open')",
             (_now(), ctype, ref, detail[:2000]),
         )
+
+    # ── groups (Манга / Манхва / Новеллы …) ──────────────────────────────────
+    async def get_group(self, group_id: int) -> aiosqlite.Row | None:
+        return await self.fetchone("SELECT * FROM groups WHERE id=?", (group_id,))
+
+    async def get_group_by_key(self, key: str) -> aiosqlite.Row | None:
+        return await self.fetchone("SELECT * FROM groups WHERE key=?", (key,))
+
+    async def list_groups(self, include_hidden: bool = False) -> list[aiosqlite.Row]:
+        sql = "SELECT * FROM groups"
+        if not include_hidden:
+            sql += " WHERE hidden=0"
+        sql += " ORDER BY sort_order, name"
+        return await self.fetchall(sql)
+
+    async def upsert_group(self, key: str, name: str, slug: str,
+                           emoji: str = "📚", sort_order: int = 100) -> int:
+        existing = await self.get_group_by_key(key)
+        if existing:
+            return existing["id"]
+        cur = await self.execute(
+            "INSERT INTO groups(key,name,slug,emoji,sort_order,created_at) "
+            "VALUES(?,?,?,?,?,?)", (key, name, slug, emoji, sort_order, _now()))
+        return cur.lastrowid
+
+    async def update_group(self, group_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        sets = ",".join(f"{k}=?" for k in fields)
+        await self.execute(f"UPDATE groups SET {sets} WHERE id=?",
+                           (*fields.values(), group_id))
+
+    async def delete_group(self, group_id: int) -> None:
+        await self.execute("UPDATE projects SET group_id=NULL WHERE group_id=?",
+                           (group_id,))
+        await self.execute("DELETE FROM hashtag_map WHERE kind='group' "
+                           "AND target_id=?", (group_id,))
+        await self.execute("DELETE FROM groups WHERE id=?", (group_id,))
+
+    async def projects_in_group(self, group_id: int | None,
+                                include_hidden: bool = False) -> list[aiosqlite.Row]:
+        sql = "SELECT * FROM projects WHERE group_id IS ?" if group_id is None \
+            else "SELECT * FROM projects WHERE group_id=?"
+        if not include_hidden:
+            sql += " AND hidden=0"
+        sql += " ORDER BY sort_order, canonical_name"
+        return await self.fetchall(sql, (group_id,))
+
+    async def count_projects_in_group(self, group_id: int) -> int:
+        row = await self.fetchone(
+            "SELECT COUNT(*) c FROM projects WHERE group_id=?", (group_id,))
+        return row["c"] if row else 0
 
     # ── projects ─────────────────────────────────────────────────────────────
     async def get_project_by_key(self, key: str) -> aiosqlite.Row | None:
@@ -642,10 +714,23 @@ class Database:
         params.append(limit)
         chapters = [dict(r) for r in await self.fetchall(sql, params)]
 
-        # ── sections + items (only for free-text queries) ─────────────────────
+        # ── groups + sections + items (only for free-text queries) ────────────
+        groups: list[dict] = []
         sections: list[dict] = []
         items: list[dict] = []
         if text:
+            grows = await self.fetchall(
+                "SELECT * FROM groups WHERE hidden=0 AND pylower(name) LIKE ? "
+                "ORDER BY sort_order LIMIT 10", (like,))
+            gids = {g["id"] for g in grows}
+            for w in words:  # a word may be a group hashtag
+                m = await self.get_hashtag(w)
+                if m and m["kind"] == "group" and m["target_id"] not in gids:
+                    g = await self.get_group(m["target_id"])
+                    if g and not g["hidden"]:
+                        grows = list(grows) + [g]
+                        gids.add(g["id"])
+            groups = [dict(r) for r in grows]
             sections = [dict(r) for r in await self.fetchall(
                 "SELECT * FROM sections WHERE hidden=0 AND pylower(name) LIKE ? "
                 "ORDER BY sort_order LIMIT 10", (like,))]
@@ -654,7 +739,7 @@ class Database:
                 "FROM items i LEFT JOIN sections s ON s.id=i.section_id "
                 "WHERE pylower(i.title) LIKE ? ORDER BY i.date DESC LIMIT ?",
                 (like, limit))]
-        return {"projects": projects, "chapters": chapters,
+        return {"projects": projects, "chapters": chapters, "groups": groups,
                 "sections": sections, "items": items}
 
     # ── project card helpers (bot) ────────────────────────────────────────────

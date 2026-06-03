@@ -61,22 +61,38 @@ def br() -> dict:
 
 def render_root(projects: list, sections: list,
                 project_paths: dict[int, str],
-                section_paths: dict[int, str]) -> list[dict]:
+                section_paths: dict[int, str],
+                groups: list | None = None) -> list[dict]:
     content: list[dict] = [
         p("Полная навигация по переводам команды RQM. "
           "Выберите проект или раздел."),
         hr(),
-        h3("📚 Проекты"),
     ]
-    proj_items = []
-    for proj in projects:
+
+    def proj_li(proj):
         path = project_paths.get(proj["id"])
         label = f"{proj['emoji']} {proj['canonical_name']}"
-        if path:
-            proj_items.append(li(a(label, f"https://telegra.ph/{path}")))
-        else:
-            proj_items.append(li(label))
-    content.append(ul(proj_items) if proj_items else p("— пока пусто —"))
+        return li(a(label, f"https://telegra.ph/{path}")) if path else li(label)
+
+    groups = groups or []
+    grouped_ids: set[int] = set()
+    # projects under their groups
+    for g in groups:
+        members = [pr for pr in projects if pr["group_id"] == g["id"]]
+        if not members:
+            continue
+        for pr in members:
+            grouped_ids.add(pr["id"])
+        content.append(h3(f"{g['emoji']} {g['name']}"))
+        content.append(ul([proj_li(pr) for pr in members]))
+
+    # ungrouped projects
+    rest = [pr for pr in projects if pr["id"] not in grouped_ids]
+    if rest:
+        content.append(h3("📚 Проекты" if groups else "📚 Проекты"))
+        content.append(ul([proj_li(pr) for pr in rest]))
+    if not projects:
+        content.append(p("— проектов пока нет —"))
 
     content.append(hr())
     content.append(h3("🗂 Разделы"))

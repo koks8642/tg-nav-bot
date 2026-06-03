@@ -53,9 +53,10 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
                              "chatter", None)
         return res
 
-    # ── resolve every hashtag → project (first one wins) / categories / unknown ─
+    # ── resolve every hashtag → project (first) / group / categories / unknown ─
     project_id: int | None = None
     project_tag: str | None = None
+    group_id: int | None = None              # group tag (#новелла, #манга …)
     categories: list[tuple[int, str]] = []   # (section_id, tag)
     unknown: list[str] = []
 
@@ -74,12 +75,22 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
         elif mapping["kind"] == "project":
             if project_id is None:
                 project_id, project_tag = mapping["target_id"], tag
+        elif mapping["kind"] == "group":
+            if group_id is None:
+                group_id = mapping["target_id"]
         else:  # category
             categories.append((mapping["target_id"], tag))
 
     res.project_id = project_id
     res.hashtag = project_tag or (tags[0] if tags else None)
     builds: set[tuple[str, int | None]] = set()
+
+    # a group tag (#новелла) assigns the post's project to that group
+    if project_id is not None and group_id is not None:
+        proj = await db.get_project(project_id)
+        if proj is not None and proj["group_id"] != group_id:
+            await db.update_project(project_id, group_id=group_id)
+            builds.add(("root", None))
 
     # ── chapters (only a project post with Telegraph links) ───────────────────
     chapters = extract_chapters(post) if project_id else []

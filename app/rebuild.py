@@ -143,6 +143,7 @@ class Rebuilder:
     async def build_root(self) -> str:
         projects = await self.db.list_projects()
         sections = await self.db.list_sections()
+        groups = await self.db.list_groups()
         project_paths: dict[int, str] = {}
         for proj in projects:
             page = await self.db.get_page_for("project", proj["id"])
@@ -153,7 +154,8 @@ class Rebuilder:
             page = await self.db.get_page_for("section", sec["id"])
             if page:
                 section_paths[sec["id"]] = page["path"]
-        content = render_root(projects, sections, project_paths, section_paths)
+        content = render_root(projects, sections, project_paths, section_paths,
+                              groups=groups)
         return await self._publish_tracked("root", None, "🏠 Навигация RQM", content)
 
     # ── orchestration ────────────────────────────────────────────────────────

@@ -191,11 +191,20 @@ class BotApp:
             cmds.append(BotCommand(name, f"📖 {p['canonical_name']}"[:256]))
         return cmds[:90]  # Telegram caps total commands at 100
 
-    def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
-        """Top-level reply keyboard: sections (Тайтлы) + help / admin.
+    async def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
+        """Top-level reply keyboard: group quick-buttons + Тайтлы + help / admin.
 
-        Future quick commands get added here as extra rows."""
-        rows: list[list[KeyboardButton]] = [[KeyboardButton(BTN_TITLES)]]
+        Tapping a group button sends its name → search → group card."""
+        rows: list[list[KeyboardButton]] = []
+        groups = await self.db.list_groups()
+        grow: list[KeyboardButton] = []
+        for g in groups:
+            grow.append(KeyboardButton(f"{g['emoji']} {g['name']}"))
+            if len(grow) == 2:
+                rows.append(grow); grow = []
+        if grow:
+            rows.append(grow)
+        rows.append([KeyboardButton(BTN_TITLES)])
         tail = [KeyboardButton(BTN_HELP)]
         if is_admin:
             tail.append(KeyboardButton(BTN_ADMIN))
@@ -342,7 +351,7 @@ class BotApp:
             text += "\n\n🛠 <b>Вы администратор.</b> Управление: /menu"
         await update.message.reply_text(
             text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-            reply_markup=self._main_keyboard(is_adm))
+            reply_markup=await self._main_keyboard(is_adm))
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -437,6 +446,17 @@ class BotApp:
                     "Нашёл несколько проектов — выберите:",
                     reply_markup=InlineKeyboardMarkup(kb))
                 return
+            # a group name (Манга/Новеллы…) → show its titles
+            if not self._has_number(query) and not res["projects"] and res.get("groups"):
+                if len(res["groups"]) == 1:
+                    await self._send_group_card(message, res["groups"][0]["id"])
+                    return
+                kb = [[InlineKeyboardButton(f"{g['emoji']} {g['name']}",
+                                            callback_data=f"gcard:{g['id']}")]
+                      for g in res["groups"][:8]]
+                await message.reply_text("Группы — выберите:",
+                                         reply_markup=InlineKeyboardMarkup(kb))
+                return
             # a section name (no project, no number) → show its items with direct
             # links to the channel posts
             if not self._has_number(query) and not res["projects"] and res["sections"]:
@@ -481,7 +501,7 @@ class BotApp:
         if text == BTN_BACK:
             await msg.reply_text(
                 "Главное меню 👇",
-                reply_markup=self._main_keyboard(await self.is_admin(
+                reply_markup=await self._main_keyboard(await self.is_admin(
                     update.effective_user.id)))
             return
         # owner mid-flow? consume as the awaited input
@@ -522,8 +542,9 @@ class BotApp:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📚 Проекты", callback_data="proj"),
              InlineKeyboardButton("🗂 Разделы", callback_data="sect")],
-            [InlineKeyboardButton("🏷 Хэштеги", callback_data="tags"),
-             InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts")],
+            [InlineKeyboardButton("🏬 Группы", callback_data="groups"),
+             InlineKeyboardButton("🏷 Хэштеги", callback_data="tags")],
+            [InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts")],
         ])
 
     async def _send_menu(self, message) -> None:
@@ -571,8 +592,8 @@ class BotApp:
         return "\n".join(lines)
 
     # ── callbacks router ────────────────────────────────────────────────────────
-    # callbacks anyone may use (the public project / section card navigation)
-    _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard"}
+    # callbacks anyone may use (the public project / section / group navigation)
+    _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard", "gcard"}
 
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -632,6 +653,11 @@ class BotApp:
             await self._show_project_category(q, int(parts[1]), int(parts[2]))
         elif head == "seccard":
             text, kb = await self._section_card_text_kb(int(parts[1]))
+            await q.edit_message_text(text, reply_markup=kb,
+                                      parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
+        elif head == "gcard":
+            text, kb = await self._group_card_text_kb(int(parts[1]))
             await q.edit_message_text(text, reply_markup=kb,
                                       parse_mode=ParseMode.HTML,
                                       disable_web_page_preview=True)
@@ -702,6 +728,26 @@ class BotApp:
 
     async def _send_section_card(self, message, sid: int) -> None:
         text, kb = await self._section_card_text_kb(sid)
+        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+
+    async def _group_card_text_kb(self, gid: int):
+        g = await self.db.get_group(gid)
+        if not g:
+            return "Группа не найдена.", None
+        projects = await self.db.projects_in_group(gid)
+        lines = [f"{g['emoji']} <b>{esc(g['name'])}</b>", f"Тайтлов: {len(projects)}"]
+        if projects:
+            lines.append("\nВыберите тайтл 👇")
+        else:
+            lines.append("\n— тайтлов пока нет —")
+        kb = [[InlineKeyboardButton(f"{p['emoji']} {p['canonical_name']}",
+                                    callback_data=f"card:{p['id']}")]
+              for p in projects]
+        return "\n".join(lines), (InlineKeyboardMarkup(kb) if kb else None)
+
+    async def _send_group_card(self, message, gid: int) -> None:
+        text, kb = await self._group_card_text_kb(gid)
         await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
 
@@ -836,6 +882,54 @@ class BotApp:
         elif head == "ptagdel":
             await self.db.delete_hashtag(parts[2])
             await self._show_project_tags(q, int(parts[1]))
+        # groups (admin)
+        elif head == "groups":
+            await self._show_groups(q)
+        elif head == "grp_add":
+            self._set_await(context, "group_create")
+            await q.edit_message_text(
+                "🏬 Пришлите название группы (можно с эмодзи, напр. «📗 Манхва»):",
+                reply_markup=self._back("groups"))
+        elif head == "grp":
+            await self._show_group(q, int(parts[1]))
+        elif head == "gren":
+            gid = int(parts[1])
+            prompts = {"name": "новое название группы", "emoji": "новый эмодзи",
+                       "order": "число порядка"}
+            self._set_await(context, f"g_{parts[2]}", gid=gid)
+            await q.edit_message_text(f"✏️ Пришлите {prompts[parts[2]]}:",
+                                      reply_markup=self._back(f"grp:{gid}"))
+        elif head == "gdel":
+            gid = int(parts[1])
+            g = await self.db.get_group(gid)
+            n = await self.db.count_projects_in_group(gid)
+            await q.edit_message_text(
+                f"🗑 Удалить группу «{esc(g['name'])}»? {n} проект(ов) останутся, "
+                f"но без группы. Хэштеги группы отвяжутся.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Да, удалить", callback_data=f"gdelyes:{gid}"),
+                    InlineKeyboardButton("Отмена", callback_data=f"grp:{gid}")]]))
+        elif head == "gdelyes":
+            await self.db.delete_group(int(parts[1]))
+            await self.db.enqueue_build("root", None)
+            await q.edit_message_text("🗑 Группа удалена.", reply_markup=self._back("groups"))
+        elif head == "gtags":
+            await self._show_group_tags(q, int(parts[1]))
+        elif head == "gtagadd":
+            self._set_await(context, "gtag_new", gid=int(parts[1]))
+            await q.edit_message_text(
+                "🏷 Пришлите хэштег (без #) для этой группы (напр. «новелла»):",
+                reply_markup=self._back(f"gtags:{parts[1]}"))
+        elif head == "gtagdel":
+            await self.db.delete_hashtag(parts[2])
+            await self._show_group_tags(q, int(parts[1]))
+        elif head == "pgrp":
+            await self._show_project_group_pick(q, int(parts[1]))
+        elif head == "pgset":
+            pid, gid = int(parts[1]), int(parts[2])
+            await self.db.update_project(pid, group_id=gid or None)
+            await self.db.enqueue_build("root", None)
+            await self._show_project(q, pid)
         # chapters & arcs (admin)
         elif head == "pchaps":
             await self._show_arc_admin(q, int(parts[1]))
@@ -972,9 +1066,11 @@ class BotApp:
         ext = {e["platform"]: e["url"] for e in await self.db.list_external_links(pid)}
         tags = [r["hashtag"] for r in await self.db.list_hashtags()
                 if r["kind"] == "project" and r["target_id"] == pid]
+        grp = await self.db.get_group(p["group_id"]) if p["group_id"] else None
         lines = [f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>",
                  f"Глав: {cnt} · Порядок: {p['sort_order']} · "
                  f"{'СКРЫТ' if p['hidden'] else 'виден'}",
+                 f"Группа: {esc(grp['name']) if grp else '—'}",
                  "Хэштеги: " + (", ".join("#" + t for t in tags) if tags else "—")]
         for _code, col, label in PLATFORMS:
             lines.append(f"{label}: {esc(ext.get(col, '—'))}")
@@ -989,6 +1085,7 @@ class BotApp:
              InlineKeyboardButton("🙈 Скрыть/Показать", callback_data=f"ptoggle:{pid}")],
             [InlineKeyboardButton("📖 Главы и арки", callback_data=f"pchaps:{pid}"),
              InlineKeyboardButton("🏷 Хэштеги проекта", callback_data=f"ptags:{pid}")],
+            [InlineKeyboardButton("🏬 Группа", callback_data=f"pgrp:{pid}")],
             [InlineKeyboardButton("🗑 Удалить проект", callback_data=f"pdel:{pid}"),
              InlineKeyboardButton("⬅️ К проектам", callback_data="proj")],
         ]
@@ -1048,6 +1145,76 @@ class BotApp:
         kb.append([InlineKeyboardButton("🆕 Добавить хэштег", callback_data=f"stagadd:{sid}")])
         kb.append([InlineKeyboardButton("⬅️ К разделу", callback_data=f"s:{sid}")])
         await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    # ── groups management (admin) ─────────────────────────────────────────────
+    async def _show_groups(self, q) -> None:
+        groups = await self.db.list_groups(include_hidden=True)
+        kb = []
+        for g in groups:
+            n = await self.db.count_projects_in_group(g["id"])
+            kb.append([InlineKeyboardButton(f"{g['emoji']} {g['name']} ({n})",
+                                            callback_data=f"grp:{g['id']}")])
+        kb.append([InlineKeyboardButton("🆕 Создать группу", callback_data="grp_add")])
+        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+        await q.edit_message_text(
+            "🏬 <b>Группы</b> (Манга / Манхва / Новеллы …)\n"
+            "Проект относится к группе через хэштег группы на посте "
+            "(напр. «#новелла #повелитель») или вручную в карточке проекта.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    async def _show_group(self, q, gid: int) -> None:
+        g = await self.db.get_group(gid)
+        if not g:
+            await q.edit_message_text("Группа не найдена.", reply_markup=self._back("groups"))
+            return
+        projects = await self.db.projects_in_group(gid, include_hidden=True)
+        tags = [r["hashtag"] for r in await self.db.list_hashtags()
+                if r["kind"] == "group" and r["target_id"] == gid]
+        lines = [f"{g['emoji']} <b>{esc(g['name'])}</b>",
+                 f"Тайтлов: {len(projects)} · Порядок: {g['sort_order']}",
+                 "Хэштеги: " + (", ".join("#" + t for t in tags) if tags else "—")]
+        kb = [
+            [InlineKeyboardButton("✏️ Имя", callback_data=f"gren:{gid}:name"),
+             InlineKeyboardButton("😀 Эмодзи", callback_data=f"gren:{gid}:emoji")],
+            [InlineKeyboardButton("↕️ Порядок", callback_data=f"gren:{gid}:order"),
+             InlineKeyboardButton("🏷 Хэштеги группы", callback_data=f"gtags:{gid}")],
+            [InlineKeyboardButton("🗑 Удалить группу", callback_data=f"gdel:{gid}"),
+             InlineKeyboardButton("⬅️ К группам", callback_data="groups")],
+        ]
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _show_group_tags(self, q, gid: int) -> None:
+        g = await self.db.get_group(gid)
+        rows = [r for r in await self.db.list_hashtags()
+                if r["kind"] == "group" and r["target_id"] == gid]
+        lines = [f"🏷 <b>Хэштеги группы</b> {g['emoji']} {esc(g['name'])}",
+                 "Пост «#тег_группы #тег_проекта» относит проект к этой группе."]
+        kb = []
+        if rows:
+            for r in rows:
+                lines.append(f"• #{esc(r['hashtag'])}")
+                kb.append([InlineKeyboardButton(
+                    f"🗑 #{r['hashtag']}", callback_data=f"gtagdel:{gid}:{r['hashtag']}")])
+        else:
+            lines.append("— тегов пока нет —")
+        kb.append([InlineKeyboardButton("🆕 Добавить хэштег", callback_data=f"gtagadd:{gid}")])
+        kb.append([InlineKeyboardButton("⬅️ К группе", callback_data=f"grp:{gid}")])
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _show_project_group_pick(self, q, pid: int) -> None:
+        groups = await self.db.list_groups(include_hidden=True)
+        kb = [[InlineKeyboardButton(f"{g['emoji']} {g['name']}",
+                                    callback_data=f"pgset:{pid}:{g['id']}")]
+              for g in groups]
+        kb.append([InlineKeyboardButton("— без группы —", callback_data=f"pgset:{pid}:0")])
+        kb.append([InlineKeyboardButton("⬅️ К проекту", callback_data=f"p:{pid}")])
+        await q.edit_message_text("🏬 Выберите группу для проекта:",
                                   reply_markup=InlineKeyboardMarkup(kb),
                                   parse_mode=ParseMode.HTML)
 
@@ -1247,6 +1414,9 @@ class BotApp:
             if r["kind"] == "project":
                 t = await self.db.get_project(r["target_id"])
                 name = t["canonical_name"] if t else "?"
+            elif r["kind"] == "group":
+                t = await self.db.get_group(r["target_id"])
+                name = t["name"] if t else "?"
             else:
                 t = await self.db.get_section(r["target_id"])
                 name = t["name"] if t else "?"
@@ -1268,6 +1438,9 @@ class BotApp:
         for s in await self.db.list_sections(include_hidden=True):
             kb.append([InlineKeyboardButton(f"🗂 {s['emoji']} {s['name']}",
                                             callback_data=f"tagbind:category:{s['id']}")])
+        for g in await self.db.list_groups(include_hidden=True):
+            kb.append([InlineKeyboardButton(f"🏬 {g['emoji']} {g['name']}",
+                                            callback_data=f"tagbind:group:{g['id']}")])
         kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
         tag = context.user_data.get("new_tag", "")
         await message.reply_text(
@@ -1387,6 +1560,39 @@ class BotApp:
                     reply_markup=self._back(f"ptags:{pid}"))
             else:
                 await msg.reply_text("Пустой хэштег.", reply_markup=self._back(f"ptags:{pid}"))
+
+        elif action == "group_create":
+            emoji, name = self._split_emoji_name(text, "🏬")
+            gid = await self.db.upsert_group(
+                key=f"grp_{slugify(name)}", name=name, slug=slugify(name), emoji=emoji)
+            await self.db.enqueue_build("root", None)
+            await msg.reply_text(
+                f"✅ Группа «{esc(name)}» создана. Привяжите к ней хэштег.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏷 Добавить хэштег", callback_data=f"gtagadd:{gid}"),
+                    InlineKeyboardButton("✏️ Открыть", callback_data=f"grp:{gid}")]]))
+
+        elif action.startswith("g_"):
+            gid = await_data["gid"]
+            field = action[2:]
+            if field == "name":
+                await self.db.update_group(gid, name=text)
+            elif field == "emoji":
+                await self.db.update_group(gid, emoji=text[:8])
+            elif field == "order":
+                await self.db.update_group(gid, sort_order=_int(text, 100))
+            await self.db.enqueue_build("root", None)
+            await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"grp:{gid}"))
+
+        elif action == "gtag_new":
+            gid = await_data["gid"]
+            tag = text.lstrip("#").lower().split()[0] if text.strip() else ""
+            if tag:
+                await self.db.set_hashtag(tag, "group", gid)
+                await msg.reply_text(f"✅ #{esc(tag)} привязан к группе.",
+                                     reply_markup=self._back(f"gtags:{gid}"))
+            else:
+                await msg.reply_text("Пустой хэштег.", reply_markup=self._back(f"gtags:{gid}"))
 
         elif action == "stag_new":
             sid = await_data["sid"]

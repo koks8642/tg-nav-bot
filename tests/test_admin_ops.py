@@ -62,6 +62,33 @@ def test_arc_rename_merge_split(tmp_path):
     asyncio.run(go())
 
 
+def test_group_autoassign_by_hashtag(tmp_path):
+    from app.util import slugify
+    async def go():
+        db, cfg = await _fresh(tmp_path / "g.db")
+        try:
+            gid = await db.upsert_group(
+                key="grp_novelly", name="Новеллы", slug=slugify("Новеллы"), emoji="📕")
+            await db.set_hashtag("новелла", "group", gid)
+            # urozhay is seeded with hashtag 'повелитель'
+            post = _post(900, "#новелла #повелитель\nГлава 1 «Старт»",
+                         [("https://telegra.ph/x-Glava-1-Start", "Глава 1")])
+            res = await process_post(db, cfg, post)
+            urozhay = await db.get_project_by_key("urozhay")
+            assert res.project_id == urozhay["id"]
+            # the group tag moved the project into the group
+            refreshed = await db.get_project(urozhay["id"])
+            assert refreshed["group_id"] == gid
+            members = await db.projects_in_group(gid)
+            assert any(p["id"] == urozhay["id"] for p in members)
+            # search finds the group
+            r = await db.search("новеллы")
+            assert any(g["id"] == gid for g in r["groups"])
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
 def test_item_update_and_delete(tmp_path):
     async def go():
         db, cfg = await _fresh(tmp_path / "i.db")
