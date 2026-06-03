@@ -731,9 +731,18 @@ class Database:
                         grows = list(grows) + [g]
                         gids.add(g["id"])
             groups = [dict(r) for r in grows]
-            sections = [dict(r) for r in await self.fetchall(
+            srows = await self.fetchall(
                 "SELECT * FROM sections WHERE hidden=0 AND pylower(name) LIKE ? "
-                "ORDER BY sort_order LIMIT 10", (like,))]
+                "ORDER BY sort_order LIMIT 10", (like,))
+            sids = {s["id"] for s in srows}
+            for w in words:  # a word may be a section (category) hashtag
+                m = await self.get_hashtag(w)
+                if m and m["kind"] == "category" and m["target_id"] not in sids:
+                    s = await self.get_section(m["target_id"])
+                    if s and not s["hidden"]:
+                        srows = list(srows) + [s]
+                        sids.add(s["id"])
+            sections = [dict(r) for r in srows]
             items = [dict(r) for r in await self.fetchall(
                 "SELECT i.*, s.name AS section_name, s.emoji AS section_emoji "
                 "FROM items i LEFT JOIN sections s ON s.id=i.section_id "

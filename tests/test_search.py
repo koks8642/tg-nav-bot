@@ -54,6 +54,11 @@ def test_search_variants(tmp_path):
             # project must still appear in results (so the bot shows its card)
             r6 = await db.search("покровитель")
             assert any(p["key"] == "pokrovitel" for p in r6["projects"])
+
+            # section HASHTAG match: 'заметки' is a hashtag of "Уголок
+            # переводчика" but not in its name → must still find the section
+            r7 = await db.search("заметки")
+            assert any(s["key"] == "zametki" for s in r7["sections"])
         finally:
             await db.close()
     asyncio.run(go())
