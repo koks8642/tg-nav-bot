@@ -49,7 +49,8 @@ log = logging.getLogger("bot")
 
 BTN_HELP = "ℹ️ Помощь"
 BTN_ADMIN = "🛠 Админка"
-BTN_TITLES = "📚 Тайтлы"
+BTN_WORKS = "📚 Произведения"
+BTN_ALL_TITLES = "📖 Все тайтлы"
 BTN_BACK = "🔙 Меню"
 BTN_MORE = "➡️ Ещё"
 BTN_PREV = "⬅️ Назад"
@@ -191,20 +192,9 @@ class BotApp:
             cmds.append(BotCommand(name, f"📖 {p['canonical_name']}"[:256]))
         return cmds[:90]  # Telegram caps total commands at 100
 
-    async def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
-        """Top-level reply keyboard: group quick-buttons + Тайтлы + help / admin.
-
-        Tapping a group button sends its name → search → group card."""
-        rows: list[list[KeyboardButton]] = []
-        groups = await self.db.list_groups()
-        grow: list[KeyboardButton] = []
-        for g in groups:
-            grow.append(KeyboardButton(f"{g['emoji']} {g['name']}"))
-            if len(grow) == 2:
-                rows.append(grow); grow = []
-        if grow:
-            rows.append(grow)
-        rows.append([KeyboardButton(BTN_TITLES)])
+    def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
+        """Top-level reply keyboard: Произведения + help / admin."""
+        rows: list[list[KeyboardButton]] = [[KeyboardButton(BTN_WORKS)]]
         tail = [KeyboardButton(BTN_HELP)]
         if is_admin:
             tail.append(KeyboardButton(BTN_ADMIN))
@@ -212,6 +202,20 @@ class BotApp:
         return ReplyKeyboardMarkup(
             rows, resize_keyboard=True,
             input_field_placeholder="Поиск: название, номер, арка…")
+
+    async def _kinds_keyboard(self) -> ReplyKeyboardMarkup:
+        """Second level: kinds of works (вид: Манга/Манхва/Новеллы) + all titles."""
+        rows: list[list[KeyboardButton]] = []
+        row: list[KeyboardButton] = []
+        for g in await self.db.list_groups():
+            row.append(KeyboardButton(f"{g['emoji']} {g['name']}"))
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        rows.append([KeyboardButton(BTN_ALL_TITLES)])
+        rows.append([KeyboardButton(BTN_BACK)])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
     async def _titles_keyboard(self, page: int) -> tuple[ReplyKeyboardMarkup, int]:
         """Paginated list of titles, one per row (long names read better)."""
@@ -345,13 +349,13 @@ class BotApp:
             "и отправьте найденную главу другу, не выходя из переписки.\n\n"
             "📌 Полная навигация по всем проектам закреплена в канале.\n\n"
             "Попробуйте прямо сейчас — пришлите название любого тайтла 👇")
-        text += ("\n\n👇 Меню под полем ввода: <b>📚 Тайтлы</b> — список всех "
-                 "проектов.")
+        text += ("\n\n👇 Меню под полем ввода: <b>📚 Произведения</b> → виды "
+                 "(манга / манхва / новеллы) → конкретные тайтлы.")
         if is_adm:
             text += "\n\n🛠 <b>Вы администратор.</b> Управление: /menu"
         await update.message.reply_text(
             text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-            reply_markup=await self._main_keyboard(is_adm))
+            reply_markup=self._main_keyboard(is_adm))
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -490,7 +494,15 @@ class BotApp:
             if await self._owner(update):
                 await self._send_menu(msg)
             return
-        if text == BTN_TITLES:
+        if text == BTN_WORKS:
+            # Произведения → виды (Манга/Манхва/Новеллы), либо сразу плоский список
+            if await self.db.list_groups():
+                await msg.reply_text("📚 Выберите вид произведения:",
+                                     reply_markup=await self._kinds_keyboard())
+            else:
+                await self._send_titles(msg, context, 0)
+            return
+        if text == BTN_ALL_TITLES:
             await self._send_titles(msg, context, 0)
             return
         if text in (BTN_MORE, BTN_PREV):
@@ -501,7 +513,7 @@ class BotApp:
         if text == BTN_BACK:
             await msg.reply_text(
                 "Главное меню 👇",
-                reply_markup=await self._main_keyboard(await self.is_admin(
+                reply_markup=self._main_keyboard(await self.is_admin(
                     update.effective_user.id)))
             return
         # owner mid-flow? consume as the awaited input
@@ -542,7 +554,7 @@ class BotApp:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📚 Проекты", callback_data="proj"),
              InlineKeyboardButton("🗂 Разделы", callback_data="sect")],
-            [InlineKeyboardButton("🏬 Группы", callback_data="groups"),
+            [InlineKeyboardButton("🏬 Виды произведений", callback_data="groups"),
              InlineKeyboardButton("🏷 Хэштеги", callback_data="tags")],
             [InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts")],
         ])
@@ -1159,9 +1171,9 @@ class BotApp:
         kb.append([InlineKeyboardButton("🆕 Создать группу", callback_data="grp_add")])
         kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
         await q.edit_message_text(
-            "🏬 <b>Группы</b> (Манга / Манхва / Новеллы …)\n"
-            "Проект относится к группе через хэштег группы на посте "
-            "(напр. «#новелла #повелитель») или вручную в карточке проекта.",
+            "🏬 <b>Виды произведений</b> (Манга / Манхва / Новеллы …)\n"
+            "Произведение попадает в вид через хэштег вида на посте "
+            "(напр. «#новелла #повелитель») или вручную в карточке произведения.",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
     async def _show_group(self, q, gid: int) -> None:

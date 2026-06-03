@@ -76,20 +76,22 @@ def render_root(projects: list, sections: list,
 
     groups = groups or []
     grouped_ids: set[int] = set()
-    # projects under their groups
+    content.append(h3("📚 Проекты"))
+    # works under their kind (вид произведения): Манга / Манхва / Новеллы …
     for g in groups:
         members = [pr for pr in projects if pr["group_id"] == g["id"]]
         if not members:
             continue
         for pr in members:
             grouped_ids.add(pr["id"])
-        content.append(h3(f"{g['emoji']} {g['name']}"))
+        content.append(h4(f"{g['emoji']} {g['name']}"))
         content.append(ul([proj_li(pr) for pr in members]))
 
-    # ungrouped projects
+    # works without a kind
     rest = [pr for pr in projects if pr["id"] not in grouped_ids]
     if rest:
-        content.append(h3("📚 Проекты" if groups else "📚 Проекты"))
+        if groups:
+            content.append(h4("📖 Прочее"))
         content.append(ul([proj_li(pr) for pr in rest]))
     if not projects:
         content.append(p("— проектов пока нет —"))
