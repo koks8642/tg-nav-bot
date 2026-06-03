@@ -58,7 +58,6 @@ ADMIN_COMMANDS = [
     BotCommand("links", "🔗 Ссылки на Telegraph-страницы"),
     BotCommand("health", "📊 Статус и счётчики"),
     BotCommand("rebuild", "♻️ Пересобрать все страницы"),
-    BotCommand("backfill", "📥 Импорт истории из экспорта"),
     BotCommand("id", "🆔 Мой user_id"),
     BotCommand("help", "🔎 Подсказка по поиску"),
 ]
@@ -110,7 +109,6 @@ class BotApp:
         app.add_handler(CommandHandler("menu", self.cmd_menu))
         app.add_handler(CommandHandler("search", self.cmd_search))
         app.add_handler(CommandHandler("rebuild", self.cmd_rebuild))
-        app.add_handler(CommandHandler("backfill", self.cmd_backfill))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(InlineQueryHandler(self.on_inline))
         # private free text → owner pending input, otherwise search (everyone)
@@ -285,17 +283,6 @@ class BotApp:
         await enqueue_full_rebuild(self.db)
         await update.message.reply_text("♻️ Полная пересборка поставлена в очередь.")
 
-    async def cmd_backfill(self, update: Update,
-                           context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._owner(update):
-            return
-        await update.message.reply_text("⏳ Запускаю бэкафилл…")
-        from .backfill import run_backfill
-        try:
-            report = await run_backfill(self.db, self.cfg)
-            await update.message.reply_text(f"✅ Готово:\n{report.summary()}")
-        except Exception as e:  # noqa: BLE001
-            await update.message.reply_text(f"❌ Ошибка: {e}")
 
     # ── search (everyone) ─────────────────────────────────────────────────────
     async def _search_html(self, query: str, limit: int = 20) -> str:
@@ -386,7 +373,6 @@ class BotApp:
              InlineKeyboardButton("📊 Health", callback_data="health")],
             [InlineKeyboardButton("🔗 Ссылки", callback_data="links_cb"),
              InlineKeyboardButton("♻️ Пересобрать", callback_data="rebuild_all")],
-            [InlineKeyboardButton("📥 Бэкафилл", callback_data="backfill_cb")],
         ])
 
     async def _send_menu(self, message) -> None:
@@ -470,15 +456,6 @@ class BotApp:
             await enqueue_full_rebuild(self.db)
             await q.edit_message_text("♻️ Пересборка поставлена в очередь.",
                                       reply_markup=self._back())
-        elif head == "backfill_cb":
-            from .backfill import run_backfill
-            await q.edit_message_text("⏳ Бэкафилл…")
-            try:
-                rep = await run_backfill(self.db, self.cfg)
-                await q.edit_message_text(f"✅ {esc(rep.summary())}",
-                                          reply_markup=self._back())
-            except Exception as e:  # noqa: BLE001
-                await q.edit_message_text(f"❌ {esc(e)}", reply_markup=self._back())
         elif head == "conflicts":
             await self._show_conflicts(q)
         elif head == "conf":
