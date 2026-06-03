@@ -43,7 +43,20 @@ class BotApp:
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
-        app = Application.builder().token(self.cfg.bot_token).build()
+        # Generous timeouts + optional proxy make the bot resilient on flaky
+        # networks (e.g. throttled api.telegram.org access from RU).
+        builder = (Application.builder()
+                   .token(self.cfg.bot_token)
+                   .connect_timeout(30.0)
+                   .read_timeout(30.0)
+                   .write_timeout(30.0)
+                   .pool_timeout(30.0)
+                   .get_updates_connect_timeout(30.0)
+                   .get_updates_read_timeout(30.0))
+        if self.cfg.telegram_proxy:
+            builder = (builder.proxy(self.cfg.telegram_proxy)
+                       .get_updates_proxy(self.cfg.telegram_proxy))
+        app = builder.build()
         app.bot_data["db"] = self.db
         app.bot_data["cfg"] = self.cfg
 

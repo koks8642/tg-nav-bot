@@ -84,8 +84,26 @@ async def run() -> None:
 
     worker_task = asyncio.create_task(worker())
 
-    # start the bot
-    await application.initialize()
+    # start the bot — retry init, since api.telegram.org can be slow/flaky
+    # (notably throttled from RU networks); give it several attempts.
+    for attempt in range(1, 8):
+        try:
+            await application.initialize()
+            break
+        except Exception as e:  # noqa: BLE001
+            wait = min(2 ** attempt, 30)
+            log.warning("bot init attempt %d/7 failed (%s) — retry in %ss",
+                        attempt, e, wait)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=wait)
+                return  # shutdown requested while retrying
+            except asyncio.TimeoutError:
+                pass
+    else:
+        log.error("Could not reach api.telegram.org after retries. "
+                  "If you are on a RU network, enable a VPN or set "
+                  "TELEGRAM_PROXY in .env (see README).")
+        raise SystemExit(1)
     await application.start()
     await application.updater.start_polling(
         allowed_updates=["channel_post", "edited_channel_post",
