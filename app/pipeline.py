@@ -89,7 +89,10 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
     if project_id is not None and group_id is not None:
         proj = await db.get_project(project_id)
         if proj is not None and proj["group_id"] != group_id:
+            if proj["group_id"]:
+                builds.add(("group", proj["group_id"]))  # rebuild old kind page
             await db.update_project(project_id, group_id=group_id)
+            builds.add(("group", group_id))
             builds.add(("root", None))
 
     # ── chapters (only a project post with Telegraph links) ───────────────────

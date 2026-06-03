@@ -63,12 +63,14 @@ def br() -> dict:
 def render_root(projects: list, sections: list,
                 project_paths: dict[int, str],
                 section_paths: dict[int, str],
-                groups: list | None = None) -> list[dict]:
+                groups: list | None = None,
+                group_paths: dict[int, str] | None = None) -> list[dict]:
     content: list[dict] = [
         p("Полная навигация по переводам команды RQM. "
           "Выберите проект или раздел."),
         hr(),
     ]
+    group_paths = group_paths or {}
 
     def proj_li(proj):
         path = project_paths.get(proj["id"])
@@ -78,20 +80,25 @@ def render_root(projects: list, sections: list,
     groups = groups or []
     grouped_ids: set[int] = set()
     content.append(h3("📚 Проекты"))
-    # works under their kind (вид произведения): Манга / Манхва / Новеллы …
+    # kinds (вид произведения) are LINKS to their own page
+    kind_items = []
     for g in groups:
         members = [pr for pr in projects if pr["group_id"] == g["id"]]
         if not members:
             continue
         for pr in members:
             grouped_ids.add(pr["id"])
-        content.append(h4(f"{g['emoji']} {g['name']}"))
-        content.append(ul([proj_li(pr) for pr in members]))
+        label = f"{g['emoji']} {g['name']} ({len(members)})"
+        gpath = group_paths.get(g["id"])
+        kind_items.append(li(a(label, f"https://telegra.ph/{gpath}")) if gpath
+                          else li(label))
+    if kind_items:
+        content.append(ul(kind_items))
 
-    # works without a kind
+    # works without a kind — listed directly
     rest = [pr for pr in projects if pr["id"] not in grouped_ids]
     if rest:
-        if groups:
+        if kind_items:
             content.append(h4("📖 Прочее"))
         content.append(ul([proj_li(pr) for pr in rest]))
     if not projects:
@@ -235,6 +242,26 @@ def render_project_index(project, external_links, part_paths: list[str],
 
 
 # ── section page ─────────────────────────────────────────────────────────────
+
+def render_group(group, projects: list, project_paths: dict[int, str],
+                 home_path: str | None = None) -> list[dict]:
+    """A 'вид произведения' page (Манга/Манхва/Новеллы) listing its works."""
+    content: list[dict] = [p(b(f"Произведений: {len(projects)}"))]
+    if not projects:
+        content.append(p("— пока пусто —"))
+    else:
+        lis = []
+        for pr in projects:
+            label = f"{pr['emoji']} {pr['canonical_name']}"
+            path = project_paths.get(pr["id"])
+            lis.append(li(a(label, f"https://telegra.ph/{path}")) if path
+                       else li(label))
+        content.append(ul(lis))
+    if home_path:
+        content.append(hr())
+        content.append(p(a("⬅️ На главную", f"https://telegra.ph/{home_path}")))
+    return content
+
 
 def render_section(section, items: list, post_urls: dict[int, str],
                    home_path: str | None = None) -> list[dict]:

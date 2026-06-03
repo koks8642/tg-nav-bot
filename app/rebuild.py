@@ -19,6 +19,7 @@ from .config import Config
 from .db import Database
 from .render import (
     paginate_project,
+    render_group,
     render_project,
     render_project_index,
     render_root,
@@ -39,6 +40,8 @@ async def enqueue_full_rebuild(db: Database) -> None:
     await db.enqueue_build("root", None)
     for proj in await db.list_projects(include_hidden=True):
         await db.enqueue_build("project", proj["id"])
+    for g in await db.list_groups(include_hidden=True):
+        await db.enqueue_build("group", g["id"])
     for sec in await db.list_sections(include_hidden=True):
         await db.enqueue_build("section", sec["id"])
 
@@ -140,10 +143,30 @@ class Rebuilder:
         content = render_section(section, items, post_urls, home)
         return await self._publish_tracked("section", section_id, title, content)
 
+    async def build_group(self, group_id: int) -> str | None:
+        group = await self.db.get_group(group_id)
+        if not group or group["hidden"]:
+            return None
+        projects = await self.db.projects_in_group(group_id)
+        project_paths: dict[int, str] = {}
+        for proj in projects:
+            page = await self.db.get_page_for("project", proj["id"])
+            if page:
+                project_paths[proj["id"]] = page["path"]
+        home = await self._home_path()
+        title = f"{group['emoji']} {group['name']}"
+        content = render_group(group, projects, project_paths, home)
+        return await self._publish_tracked("group", group_id, title, content)
+
     async def build_root(self) -> str:
         projects = await self.db.list_projects()
         sections = await self.db.list_sections()
         groups = await self.db.list_groups()
+        group_paths: dict[int, str] = {}
+        for g in groups:
+            page = await self.db.get_page_for("group", g["id"])
+            if page:
+                group_paths[g["id"]] = page["path"]
         project_paths: dict[int, str] = {}
         for proj in projects:
             page = await self.db.get_page_for("project", proj["id"])
@@ -155,7 +178,7 @@ class Rebuilder:
             if page:
                 section_paths[sec["id"]] = page["path"]
         content = render_root(projects, sections, project_paths, section_paths,
-                              groups=groups)
+                              groups=groups, group_paths=group_paths)
         return await self._publish_tracked("root", None, "🏠 Навигация RQM", content)
 
     # ── orchestration ────────────────────────────────────────────────────────
@@ -173,6 +196,11 @@ class Rebuilder:
             except Exception as e:  # noqa: BLE001
                 await self.db.log("ERROR", "rebuild",
                                   f"project {proj['id']}: {e}")
+        for g in await self.db.list_groups(include_hidden=True):
+            try:
+                await self.build_group(g["id"])
+            except Exception as e:  # noqa: BLE001
+                await self.db.log("ERROR", "rebuild", f"group {g['id']}: {e}")
         for sec in await self.db.list_sections(include_hidden=True):
             try:
                 await self.build_section(sec["id"])
@@ -192,6 +220,9 @@ class Rebuilder:
             try:
                 if entry["page_kind"] == "project":
                     await self.build_project(entry["page_ref"])
+                    root_dirty = True
+                elif entry["page_kind"] == "group":
+                    await self.build_group(entry["page_ref"])
                     root_dirty = True
                 elif entry["page_kind"] == "section":
                     await self.build_section(entry["page_ref"])

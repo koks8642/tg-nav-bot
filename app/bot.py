@@ -939,7 +939,12 @@ class BotApp:
             await self._show_project_group_pick(q, int(parts[1]))
         elif head == "pgset":
             pid, gid = int(parts[1]), int(parts[2])
+            old = await self.db.get_project(pid)
+            if old and old["group_id"]:
+                await self.db.enqueue_build("group", old["group_id"])
             await self.db.update_project(pid, group_id=gid or None)
+            if gid:
+                await self.db.enqueue_build("group", gid)
             await self.db.enqueue_build("root", None)
             await self._show_project(q, pid)
         # chapters & arcs (admin)
@@ -1577,6 +1582,7 @@ class BotApp:
             emoji, name = self._split_emoji_name(text, "🏬")
             gid = await self.db.upsert_group(
                 key=f"grp_{slugify(name)}", name=name, slug=slugify(name), emoji=emoji)
+            await self.db.enqueue_build("group", gid)
             await self.db.enqueue_build("root", None)
             await msg.reply_text(
                 f"✅ Группа «{esc(name)}» создана. Привяжите к ней хэштег.",
@@ -1593,6 +1599,7 @@ class BotApp:
                 await self.db.update_group(gid, emoji=text[:8])
             elif field == "order":
                 await self.db.update_group(gid, sort_order=_int(text, 100))
+            await self.db.enqueue_build("group", gid)
             await self.db.enqueue_build("root", None)
             await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"grp:{gid}"))
 
