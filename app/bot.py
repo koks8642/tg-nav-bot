@@ -13,6 +13,7 @@ that owner is consumed as the answer.
 from __future__ import annotations
 
 import logging
+import re
 from uuid import uuid4
 
 from telegram import (
@@ -23,6 +24,8 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ParseMode
@@ -43,6 +46,9 @@ from .pipeline import process_post
 from .util import slugify
 
 log = logging.getLogger("bot")
+
+BTN_HELP = "ℹ️ Помощь"
+BTN_ADMIN = "🛠 Админка"
 
 PLATFORMS = [("rl", "ranobelib", "RanobeLib"), ("ml", "mangalib", "MangaLib"),
              ("sk", "senkuro", "Senkuro"), ("bo", "boosty", "Boosty")]
@@ -75,6 +81,8 @@ class BotApp:
         self._admin_ids_ts: float = 0.0
         # users whose personal ≡ admin command menu we've already set
         self._cmd_admins: set[int] = set()
+        # ≡-menu project command name → project id
+        self._proj_commands_map: dict[str, int] = {}
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -113,9 +121,21 @@ class BotApp:
         app.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             self.on_text))
+        # any other /command → maybe a per-project quick command → its card
+        app.add_handler(MessageHandler(filters.COMMAND, self.on_project_command))
 
         self.application = app
         return app
+
+    async def on_project_command(self, update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return
+        cmd = msg.text[1:].split("@")[0].split()[0].lower()
+        pid = self._proj_commands_map.get(cmd)
+        if pid is not None:
+            await self._send_project_card(msg, pid)
 
     # ── command menu (≡ button under the input field) ────────────────────────
     async def _post_init(self, application: Application) -> None:
@@ -125,18 +145,57 @@ class BotApp:
         """Set the ≡ command menu: basic for everyone, full for each admin."""
         bot = self.application.bot
         try:
-            await bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+            proj_cmds = await self._project_commands()
+            await bot.set_my_commands(PUBLIC_COMMANDS + proj_cmds,
+                                      scope=BotCommandScopeDefault())
             admin_ids = set(self.cfg.owner_user_ids) | await self._channel_admin_ids(force=True)
             for uid in admin_ids:
                 try:
                     await bot.set_my_commands(
-                        ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
+                        ADMIN_COMMANDS + proj_cmds, scope=BotCommandScopeChat(chat_id=uid))
                     self._cmd_admins.add(uid)
                 except Exception as e:  # noqa: BLE001
                     log.debug("set admin commands for %s skipped: %s", uid, e)
-            log.info("command menus set (%d admins)", len(admin_ids))
+            log.info("command menus set (%d admins, %d projects)",
+                     len(admin_ids), len(proj_cmds))
         except Exception as e:  # noqa: BLE001
             log.warning("set_my_commands failed: %s", e)
+
+    @staticmethod
+    def _proj_cmd_name(key: str) -> str:
+        """A valid Telegram command (a-z0-9_, ≤32) for a project key."""
+        return re.sub(r"[^a-z0-9_]", "_", key.lower())[:32].strip("_") or "p"
+
+    async def _project_commands(self) -> list[BotCommand]:
+        """One ≡-menu command per project → opens its card. Also (re)builds the
+        command→project map used by the fallback handler."""
+        self._proj_commands_map = {}
+        cmds: list[BotCommand] = []
+        for p in await self.db.list_projects():
+            name = self._proj_cmd_name(p["key"])
+            if name in self._proj_commands_map:
+                continue
+            self._proj_commands_map[name] = p["id"]
+            cmds.append(BotCommand(name, f"📖 {p['canonical_name']}"[:256]))
+        return cmds[:90]  # Telegram caps total commands at 100
+
+    async def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
+        """Persistent reply keyboard: a button per project (taps → card) plus
+        help / admin entry."""
+        rows: list[list[KeyboardButton]] = []
+        row: list[KeyboardButton] = []
+        for p in await self.db.list_projects():
+            row.append(KeyboardButton(f"{p['emoji']} {p['canonical_name']}"))
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+        tail = [KeyboardButton(BTN_HELP)]
+        if is_admin:
+            tail.append(KeyboardButton(BTN_ADMIN))
+        rows.append(tail)
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True,
+                                   input_field_placeholder="Поиск: название, номер, арка…")
 
     # ── admin recognition (channel admins/owner + configured OWNER_USER_IDS) ──
     async def _channel_admin_ids(self, force: bool = False) -> set[int]:
@@ -247,10 +306,13 @@ class BotApp:
             "и отправьте найденную главу другу, не выходя из переписки.\n\n"
             "📌 Полная навигация по всем проектам закреплена в канале.\n\n"
             "Попробуйте прямо сейчас — пришлите название любого тайтла 👇")
+        text += ("\n\n👇 Кнопки тайтлов — под полем ввода (или в меню ≡ командой "
+                 "<code>/&lt;тайтл&gt;</code>).")
         if is_adm:
             text += "\n\n🛠 <b>Вы администратор.</b> Управление: /menu"
         await update.message.reply_text(
-            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            reply_markup=await self._main_keyboard(is_adm))
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -330,6 +392,8 @@ class BotApp:
         return f"🔎 Результаты по «{esc(query)}»:\n\n" + "\n".join(out)
 
     async def _do_search(self, message, query: str) -> None:
+        # strip a leading emoji/symbol (reply-keyboard buttons are "🌘 Имя")
+        query = re.sub(r"^\W+", "", query.strip())
         try:
             res = await self.db.search(query, limit=30)
             # a project name/hashtag with no chapter number → show its card
@@ -356,11 +420,20 @@ class BotApp:
         msg = update.effective_message
         if not msg or not msg.text:
             return
+        text = msg.text.strip()
+        # reply-keyboard shortcuts
+        if text == BTN_HELP:
+            await self.cmd_start(update, context)
+            return
+        if text == BTN_ADMIN:
+            if await self._owner(update):
+                await self._send_menu(msg)
+            return
         # owner mid-flow? consume as the awaited input
         if await self._owner(update) and context.user_data.get("await"):
             await self._handle_pending(update, context)
             return
-        await self._do_search(msg, msg.text.strip())
+        await self._do_search(msg, text)
 
     async def on_inline(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -662,6 +735,7 @@ class BotApp:
                                   "AND target_id=?", (pid,))
             await self.db.execute("DELETE FROM projects WHERE id=?", (pid,))
             await self.db.enqueue_build("root", None)
+            await self.setup_commands()  # refresh ≡ project commands
             await q.edit_message_text("🗑 Проект удалён.", reply_markup=self._back("proj"))
         elif head == "ptags":
             await self._show_project_tags(q, int(parts[1]))
@@ -1133,6 +1207,7 @@ class BotApp:
             field = action[2:]
             if field == "name":
                 await self.db.update_project(pid, canonical_name=text)
+                await self.setup_commands()  # refresh ≡ project commands
             elif field == "emoji":
                 await self.db.update_project(pid, emoji=text[:8])
             elif field == "order":
@@ -1167,6 +1242,7 @@ class BotApp:
             pid = await self.db.upsert_project(
                 key=key, canonical_name=name, slug=slugify(name), emoji=emoji)
             await self._enqueue_project(pid)
+            await self.setup_commands()  # refresh ≡ project commands
             await msg.reply_text(
                 f"✅ Проект «{esc(name)}» создан. Привяжите к нему хэштег.",
                 reply_markup=InlineKeyboardMarkup([[
