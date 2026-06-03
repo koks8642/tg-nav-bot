@@ -53,6 +53,7 @@ class Config:
     telegraph_author_url: str
     webapp_url: str
     telegram_proxy: str
+    reconcile_interval_min: int
     host: str
     port: int
     db_path: Path
@@ -109,6 +110,7 @@ def load_config(*, require_bot: bool = True) -> Config:
         telegraph_author_url=os.environ.get("TELEGRAPH_AUTHOR_URL", ""),
         webapp_url=os.environ.get("WEBAPP_URL", "").rstrip("/"),
         telegram_proxy=os.environ.get("TELEGRAM_PROXY", "").strip(),
+        reconcile_interval_min=int(os.environ.get("RECONCILE_INTERVAL_MIN", "30")),
         host=os.environ.get("HOST", "0.0.0.0"),
         port=int(os.environ.get("PORT", "8080")),
         db_path=db_path,

@@ -186,11 +186,8 @@ class BotApp:
                           context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._owner(update):
             return
-        await self.db.enqueue_build("root", None)
-        for proj in await self.db.list_projects(include_hidden=True):
-            await self.db.enqueue_build("project", proj["id"])
-        for sec in await self.db.list_sections(include_hidden=True):
-            await self.db.enqueue_build("section", sec["id"])
+        from .rebuild import enqueue_full_rebuild
+        await enqueue_full_rebuild(self.db)
         await update.message.reply_text(
             "♻️ Полная пересборка поставлена в очередь.")
 
@@ -258,11 +255,8 @@ class BotApp:
                                       reply_markup=self._menu_markup(),
                                       parse_mode=ParseMode.HTML)
         elif data == "rebuild_all":
-            await self.db.enqueue_build("root", None)
-            for proj in await self.db.list_projects(include_hidden=True):
-                await self.db.enqueue_build("project", proj["id"])
-            for sec in await self.db.list_sections(include_hidden=True):
-                await self.db.enqueue_build("section", sec["id"])
+            from .rebuild import enqueue_full_rebuild
+            await enqueue_full_rebuild(self.db)
             await q.edit_message_text("♻️ Полная пересборка поставлена в очередь.",
                                       reply_markup=self._menu_markup())
         elif data == "conflicts":

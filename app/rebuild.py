@@ -29,6 +29,20 @@ from .telegraph import TelegraphClient, TelegraphError
 log = logging.getLogger("rebuild")
 
 
+async def enqueue_full_rebuild(db: Database) -> None:
+    """Queue a rebuild of every page (root + all projects + all sections).
+
+    Used by manual /rebuild, the admin API and the periodic reconciler. The
+    worker drains the queue serially and content-hash dedup means unchanged
+    pages cost nothing.
+    """
+    await db.enqueue_build("root", None)
+    for proj in await db.list_projects(include_hidden=True):
+        await db.enqueue_build("project", proj["id"])
+    for sec in await db.list_sections(include_hidden=True):
+        await db.enqueue_build("section", sec["id"])
+
+
 def _hash(content: list[dict]) -> str:
     return hashlib.sha256(
         json.dumps(content, ensure_ascii=False, sort_keys=True).encode("utf-8")

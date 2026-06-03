@@ -294,11 +294,8 @@ async def admin_audit(request: web.Request):
 @require_owner
 async def admin_rebuild(request: web.Request):
     db: Database = request.app["db"]
-    await db.enqueue_build("root", None)
-    for proj in await db.list_projects(include_hidden=True):
-        await db.enqueue_build("project", proj["id"])
-    for sec in await db.list_sections(include_hidden=True):
-        await db.enqueue_build("section", sec["id"])
+    from .rebuild import enqueue_full_rebuild
+    await enqueue_full_rebuild(db)
     await db.audit(request["user_id"], "rebuild_all", "system", None, "")
     return _json({"ok": True})
 

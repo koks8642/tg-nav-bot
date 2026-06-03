@@ -16,7 +16,7 @@ from .api import build_api_app
 from .bot import BotApp
 from .config import load_config
 from .db import Database
-from .rebuild import Rebuilder
+from .rebuild import Rebuilder, enqueue_full_rebuild
 from .seed import seed_registry
 from .telegraph import TelegraphClient
 
@@ -84,6 +84,27 @@ async def run() -> None:
 
     worker_task = asyncio.create_task(worker())
 
+    async def reconciler() -> None:
+        """Periodic self-heal: re-enqueue a full rebuild so the published
+        Telegraph pages can't silently drift from the DB. Content-hash dedup
+        makes this a no-op (zero Telegraph calls) when nothing changed."""
+        interval = cfg.reconcile_interval_min * 60
+        if interval <= 0:
+            return
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await enqueue_full_rebuild(db)
+                log.info("periodic reconcile: full rebuild enqueued")
+            except Exception as e:  # noqa: BLE001
+                await db.log("ERROR", "reconcile", str(e))
+
+    reconciler_task = asyncio.create_task(reconciler())
+
     # start the bot — retry init, since api.telegram.org can be slow/flaky
     # (notably throttled from RU networks); give it several attempts.
     for attempt in range(1, 8):
@@ -133,6 +154,7 @@ async def run() -> None:
         log.info("Shutting down…")
         stop.set()
         worker_task.cancel()
+        reconciler_task.cancel()
         await application.updater.stop()
         await application.stop()
         await application.shutdown()
