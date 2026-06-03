@@ -673,6 +673,35 @@ class BotApp:
         elif head == "ptagdel":
             await self.db.delete_hashtag(parts[2])
             await self._show_project_tags(q, int(parts[1]))
+        # chapters & arcs (admin)
+        elif head == "pchaps":
+            await self._show_arc_admin(q, int(parts[1]))
+        elif head == "parc":
+            await self._show_arc_actions(q, int(parts[1]), int(parts[2]))
+        elif head == "pcharc":
+            await self._show_arc_chapters_admin(q, int(parts[1]), int(parts[2]))
+        elif head == "arcren":
+            await self._arc_prompt(q, context, int(parts[1]), int(parts[2]), "arc_rename",
+                                   "новое название арки:")
+        elif head == "arcsplit":
+            await self._arc_prompt(q, context, int(parts[1]), int(parts[2]), "arc_split",
+                                   "номер и название новой арки (напр. «320 Финал»): "
+                                   "главы с этим номером и дальше уйдут в новую арку")
+        elif head == "arcmrg":
+            await self._show_arc_merge(q, int(parts[1]), int(parts[2]))
+        elif head == "arcmrg2":
+            await self._do_arc_merge(q, int(parts[1]), int(parts[2]), int(parts[3]))
+        elif head == "c":
+            await self._show_chapter(q, int(parts[1]))
+        elif head == "ce":
+            await self._chapter_edit(q, context, int(parts[1]), parts[2])
+        # items (art/meme/note)
+        elif head == "sitems":
+            await self._show_items(q, int(parts[1]))
+        elif head == "item":
+            await self._show_item(q, int(parts[1]))
+        elif head == "ie":
+            await self._item_edit(q, context, int(parts[1]), parts[2])
         # sections
         elif head == "sect":
             await self._show_sections(q)
@@ -726,16 +755,6 @@ class BotApp:
             context.user_data.pop("new_tag", None)
             await q.edit_message_text(f"✅ #{esc(tag)} привязан.",
                                       reply_markup=self._back("tags"))
-        # chapters
-        elif head == "chap":
-            self._set_await(context, "ch_find")
-            await q.edit_message_text("📖 Пришлите запрос для поиска главы "
-                                      "(номер / арка / проект):",
-                                      reply_markup=self._back())
-        elif head == "c":
-            await self._show_chapter(q, int(parts[1]))
-        elif head == "ce":
-            await self._chapter_edit(q, context, int(parts[1]), parts[2])
 
     def _back(self, to: str = "menu") -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад",
@@ -784,7 +803,8 @@ class BotApp:
              InlineKeyboardButton("💎 Boosty", callback_data=f"pe:{pid}:bo")],
             [InlineKeyboardButton("↕️ Порядок", callback_data=f"pe:{pid}:order"),
              InlineKeyboardButton("🙈 Скрыть/Показать", callback_data=f"ptoggle:{pid}")],
-            [InlineKeyboardButton("🏷 Хэштеги проекта", callback_data=f"ptags:{pid}")],
+            [InlineKeyboardButton("📖 Главы и арки", callback_data=f"pchaps:{pid}"),
+             InlineKeyboardButton("🏷 Хэштеги проекта", callback_data=f"ptags:{pid}")],
             [InlineKeyboardButton("🗑 Удалить проект", callback_data=f"pdel:{pid}"),
              InlineKeyboardButton("⬅️ К проектам", callback_data="proj")],
         ]
@@ -827,6 +847,147 @@ class BotApp:
                                   reply_markup=InlineKeyboardMarkup(kb),
                                   parse_mode=ParseMode.HTML)
 
+    # ── chapters & arcs management (admin) ───────────────────────────────────
+    async def _show_arc_admin(self, q, pid: int) -> None:
+        arcs = await self.db.list_arcs(pid)
+        p = await self.db.get_project(pid)
+        if not arcs:
+            await q.edit_message_text("В проекте пока нет глав.",
+                                      reply_markup=self._back(f"p:{pid}"))
+            return
+        kb = [[InlineKeyboardButton(
+            f"📂 {a['arc']} ({a['first_num']}–{a['last_num']}, {a['n']})",
+            callback_data=f"parc:{pid}:{i}")] for i, a in enumerate(arcs)]
+        kb.append([InlineKeyboardButton("⬅️ К проекту", callback_data=f"p:{pid}")])
+        await q.edit_message_text(
+            f"📖 <b>Главы и арки</b> · {p['emoji']} {esc(p['canonical_name'])}\n"
+            "Выберите арку:", reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML)
+
+    async def _show_arc_actions(self, q, pid: int, idx: int) -> None:
+        arcs = await self.db.list_arcs(pid)
+        if idx >= len(arcs):
+            await self._show_arc_admin(q, pid)
+            return
+        a = arcs[idx]
+        kb = [
+            [InlineKeyboardButton("📖 Главы арки (править)",
+                                  callback_data=f"pcharc:{pid}:{idx}")],
+            [InlineKeyboardButton("✏️ Переименовать", callback_data=f"arcren:{pid}:{idx}"),
+             InlineKeyboardButton("✂️ Разбить", callback_data=f"arcsplit:{pid}:{idx}")],
+            [InlineKeyboardButton("🔗 Объединить с…", callback_data=f"arcmrg:{pid}:{idx}")],
+            [InlineKeyboardButton("⬅️ К аркам", callback_data=f"pchaps:{pid}")],
+        ]
+        await q.edit_message_text(
+            f"📂 <b>{esc(a['arc'])}</b>\nГлавы {a['first_num']}–{a['last_num']} · "
+            f"всего {a['n']}", reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML)
+
+    async def _show_arc_chapters_admin(self, q, pid: int, idx: int) -> None:
+        arcs = await self.db.list_arcs(pid)
+        if idx >= len(arcs):
+            await self._show_arc_admin(q, pid)
+            return
+        arc = arcs[idx]["arc"]
+        chapters = await self.db.chapters_in_arc(pid, arc)
+        kb = [[InlineKeyboardButton(
+            f"гл. {c['number']}" + (f" — {c['title']}" if c["title"] else ""),
+            callback_data=f"c:{c['id']}")] for c in chapters[:60]]
+        kb.append([InlineKeyboardButton("⬅️ К арке", callback_data=f"parc:{pid}:{idx}")])
+        await q.edit_message_text(f"📂 <b>{esc(arc)}</b> — выберите главу:",
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _arc_prompt(self, q, context, pid: int, idx: int, action: str,
+                          prompt: str) -> None:
+        arcs = await self.db.list_arcs(pid)
+        if idx >= len(arcs):
+            await self._show_arc_admin(q, pid)
+            return
+        self._set_await(context, action, pid=pid, arc=arcs[idx]["arc"])
+        await q.edit_message_text(f"✏️ Пришлите {prompt}",
+                                  reply_markup=self._back(f"parc:{pid}:{idx}"))
+
+    async def _show_arc_merge(self, q, pid: int, idx: int) -> None:
+        arcs = await self.db.list_arcs(pid)
+        if idx >= len(arcs):
+            await self._show_arc_admin(q, pid)
+            return
+        src = arcs[idx]["arc"]
+        kb = [[InlineKeyboardButton(f"→ {a['arc']}",
+                                    callback_data=f"arcmrg2:{pid}:{idx}:{j}")]
+              for j, a in enumerate(arcs) if j != idx]
+        kb.append([InlineKeyboardButton("⬅️ Отмена", callback_data=f"parc:{pid}:{idx}")])
+        await q.edit_message_text(
+            f"🔗 Объединить «{esc(src)}» с другой аркой — все её главы получат "
+            "выбранную арку. С какой?", reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML)
+
+    async def _do_arc_merge(self, q, pid: int, srcidx: int, dstidx: int) -> None:
+        arcs = await self.db.list_arcs(pid)
+        if srcidx >= len(arcs) or dstidx >= len(arcs):
+            await self._show_arc_admin(q, pid)
+            return
+        src, dst = arcs[srcidx]["arc"], arcs[dstidx]["arc"]
+        n = await self.db.rename_arc(pid, src, dst)
+        await self._enqueue_project(pid)
+        await q.edit_message_text(f"✅ Объединено: {n} глав → «{esc(dst)}».",
+                                  reply_markup=self._back(f"pchaps:{pid}"))
+
+    # ── items management (admin) ──────────────────────────────────────────────
+    async def _show_items(self, q, sid: int) -> None:
+        items = await self.db.list_items(section_id=sid)
+        s = await self.db.get_section(sid)
+        if not items:
+            await q.edit_message_text("В разделе пока нет записей.",
+                                      reply_markup=self._back(f"s:{sid}"))
+            return
+        kb = [[InlineKeyboardButton((it["title"] or "Без названия")[:45],
+                                    callback_data=f"item:{it['id']}")]
+              for it in items[:50]]
+        kb.append([InlineKeyboardButton("⬅️ К разделу", callback_data=f"s:{sid}")])
+        await q.edit_message_text(
+            f"{s['emoji']} <b>{esc(s['name'])}</b> — записи ({len(items)}):",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    async def _show_item(self, q, iid: int) -> None:
+        it = await self.db.get_item(iid)
+        if not it:
+            await q.edit_message_text("Запись не найдена.", reply_markup=self._back("sect"))
+            return
+        proj = await self.db.get_project(it["project_id"]) if it["project_id"] else None
+        lines = [f"📝 <b>{esc(it['title'] or 'Без названия')}</b>",
+                 f"Ссылка: {esc(it['url'] or '—')}"]
+        if proj:
+            lines.append(f"Проект: {esc(proj['canonical_name'])}")
+        kb = [
+            [InlineKeyboardButton("✏️ Заголовок", callback_data=f"ie:{iid}:title"),
+             InlineKeyboardButton("🔗 Ссылка", callback_data=f"ie:{iid}:url")],
+            [InlineKeyboardButton("🗑 Удалить запись", callback_data=f"ie:{iid}:del")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"sitems:{it['section_id']}")],
+        ]
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _item_edit(self, q, context, iid: int, field: str) -> None:
+        it = await self.db.get_item(iid)
+        if not it:
+            return
+        if field == "del":
+            sid = it["section_id"]
+            await self.db.delete_item(iid)
+            if sid:
+                await self.db.enqueue_build("section", sid)
+            await self.db.enqueue_build("root", None)
+            await q.edit_message_text("🗑 Запись удалена.",
+                                      reply_markup=self._back(f"sitems:{sid}" if sid else "sect"))
+            return
+        prompts = {"title": "новый заголовок", "url": "новую ссылку"}
+        self._set_await(context, f"it_{field}", iid=iid)
+        await q.edit_message_text(f"✏️ Пришлите {prompts[field]}:",
+                                  reply_markup=self._back(f"item:{iid}"))
+
     # ── sections CRUD ──────────────────────────────────────────────────────────
     async def _show_sections(self, q) -> None:
         secs = await self.db.list_sections(include_hidden=True)
@@ -847,8 +1008,9 @@ class BotApp:
         kb = [
             [InlineKeyboardButton("✏️ Имя", callback_data=f"se:{sid}:name"),
              InlineKeyboardButton("😀 Эмодзи", callback_data=f"se:{sid}:emoji")],
-            [InlineKeyboardButton("↕️ Порядок", callback_data=f"se:{sid}:order"),
-             InlineKeyboardButton("🗑 Удалить раздел", callback_data=f"sdel:{sid}")],
+            [InlineKeyboardButton("📝 Записи", callback_data=f"sitems:{sid}"),
+             InlineKeyboardButton("↕️ Порядок", callback_data=f"se:{sid}:order")],
+            [InlineKeyboardButton("🗑 Удалить раздел", callback_data=f"sdel:{sid}")],
             [InlineKeyboardButton("⬅️ К разделам", callback_data="sect")],
         ]
         tags = [r["hashtag"] for r in await self.db.list_hashtags()
@@ -1063,6 +1225,44 @@ class BotApp:
 
         elif action == "ch_find":
             await self._chapter_results(msg, text)
+
+        # arcs
+        elif action == "arc_rename":
+            pid, arc = await_data["pid"], await_data["arc"]
+            n = await self.db.rename_arc(pid, arc, text)
+            await self._enqueue_project(pid)
+            await msg.reply_text(f"✅ Арка переименована ({n} глав).",
+                                 reply_markup=self._back(f"pchaps:{pid}"))
+        elif action == "arc_split":
+            pid, arc = await_data["pid"], await_data["arc"]
+            first, _, rest = text.partition(" ")
+            try:
+                num = int(first)
+            except ValueError:
+                await msg.reply_text("Нужен формат: <номер> <название>.",
+                                     reply_markup=self._back(f"pchaps:{pid}"))
+                return
+            new_arc = rest.strip() or (f"{arc} · 2" if arc != "Без арки" else "Новая арка")
+            n = await self.db.split_arc(pid, arc, num, new_arc)
+            await self._enqueue_project(pid)
+            await msg.reply_text(f"✅ {n} глав (≥{num}) → «{esc(new_arc)}».",
+                                 reply_markup=self._back(f"pchaps:{pid}"))
+
+        # items
+        elif action in ("it_title", "it_url"):
+            iid = await_data["iid"]
+            it = await self.db.get_item(iid)
+            if not it:
+                await msg.reply_text("Запись пропала.")
+                return
+            if action == "it_title":
+                await self.db.update_item(iid, title=text)
+            else:
+                await self.db.update_item(iid, url=text)
+            if it["section_id"]:
+                await self.db.enqueue_build("section", it["section_id"])
+            await self.db.enqueue_build("root", None)
+            await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"item:{iid}"))
 
     async def _set_project_link(self, pid: int, platform: str, url: str) -> None:
         # external_links table drives the rendered "Читать на других площадках"

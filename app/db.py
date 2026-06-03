@@ -442,6 +442,35 @@ class Database:
     async def delete_chapter(self, chapter_id: int) -> None:
         await self.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
 
+    # ── arc operations (rename / merge / split) ──────────────────────────────
+    async def rename_arc(self, project_id: int, old_arc: str, new_arc: str) -> int:
+        """Rename an arc for all its chapters. Merging = rename onto an existing
+        arc. Returns the number of chapters affected."""
+        new = new_arc.strip() or None
+        if old_arc == "Без арки":
+            cur = await self.execute(
+                "UPDATE chapters SET arc=?, updated_at=? "
+                "WHERE project_id=? AND arc IS NULL", (new, _now(), project_id))
+        else:
+            cur = await self.execute(
+                "UPDATE chapters SET arc=?, updated_at=? "
+                "WHERE project_id=? AND arc=?", (new, _now(), project_id, old_arc))
+        return cur.rowcount
+
+    async def split_arc(self, project_id: int, arc: str, from_number: int,
+                        new_arc: str) -> int:
+        """Move chapters with number >= from_number out of `arc` into `new_arc`."""
+        new = new_arc.strip() or None
+        if arc == "Без арки":
+            cur = await self.execute(
+                "UPDATE chapters SET arc=?, updated_at=? WHERE project_id=? "
+                "AND arc IS NULL AND number>=?", (new, _now(), project_id, from_number))
+        else:
+            cur = await self.execute(
+                "UPDATE chapters SET arc=?, updated_at=? WHERE project_id=? "
+                "AND arc=? AND number>=?", (new, _now(), project_id, arc, from_number))
+        return cur.rowcount
+
     async def count_chapters(self, project_id: int) -> int:
         row = await self.fetchone(
             "SELECT COUNT(*) c FROM chapters WHERE project_id=?", (project_id,))
@@ -471,6 +500,19 @@ class Database:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY date DESC, id DESC"
         return await self.fetchall(sql, params)
+
+    async def get_item(self, item_id: int) -> aiosqlite.Row | None:
+        return await self.fetchone("SELECT * FROM items WHERE id=?", (item_id,))
+
+    async def update_item(self, item_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        sets = ",".join(f"{k}=?" for k in fields)
+        await self.execute(f"UPDATE items SET {sets} WHERE id=?",
+                           (*fields.values(), item_id))
+
+    async def delete_item(self, item_id: int) -> None:
+        await self.execute("DELETE FROM items WHERE id=?", (item_id,))
 
     # ── external links ───────────────────────────────────────────────────────
     async def add_external_link(self, project_id: int, platform: str, url: str,
