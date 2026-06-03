@@ -49,6 +49,11 @@ log = logging.getLogger("bot")
 
 BTN_HELP = "ℹ️ Помощь"
 BTN_ADMIN = "🛠 Админка"
+BTN_TITLES = "📚 Тайтлы"
+BTN_BACK = "🔙 Меню"
+BTN_MORE = "➡️ Ещё"
+BTN_PREV = "⬅️ Назад"
+TITLES_PER_PAGE = 8
 
 PLATFORMS = [("rl", "ranobelib", "RanobeLib"), ("ml", "mangalib", "MangaLib"),
              ("sk", "senkuro", "Senkuro"), ("bo", "boosty", "Boosty")]
@@ -179,23 +184,41 @@ class BotApp:
             cmds.append(BotCommand(name, f"📖 {p['canonical_name']}"[:256]))
         return cmds[:90]  # Telegram caps total commands at 100
 
-    async def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
-        """Persistent reply keyboard: a button per project (taps → card) plus
-        help / admin entry."""
-        rows: list[list[KeyboardButton]] = []
-        row: list[KeyboardButton] = []
-        for p in await self.db.list_projects():
-            row.append(KeyboardButton(f"{p['emoji']} {p['canonical_name']}"))
-            if len(row) == 2:
-                rows.append(row); row = []
-        if row:
-            rows.append(row)
+    def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
+        """Top-level reply keyboard: sections (Тайтлы) + help / admin.
+
+        Future quick commands get added here as extra rows."""
+        rows: list[list[KeyboardButton]] = [[KeyboardButton(BTN_TITLES)]]
         tail = [KeyboardButton(BTN_HELP)]
         if is_admin:
             tail.append(KeyboardButton(BTN_ADMIN))
         rows.append(tail)
-        return ReplyKeyboardMarkup(rows, resize_keyboard=True,
-                                   input_field_placeholder="Поиск: название, номер, арка…")
+        return ReplyKeyboardMarkup(
+            rows, resize_keyboard=True,
+            input_field_placeholder="Поиск: название, номер, арка…")
+
+    async def _titles_keyboard(self, page: int) -> tuple[ReplyKeyboardMarkup, int]:
+        """Paginated list of titles, one per row (long names read better)."""
+        projects = await self.db.list_projects()
+        total = len(projects)
+        pages = max(1, (total + TITLES_PER_PAGE - 1) // TITLES_PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        chunk = projects[page * TITLES_PER_PAGE:(page + 1) * TITLES_PER_PAGE]
+        rows = [[KeyboardButton(f"{p['emoji']} {p['canonical_name']}")] for p in chunk]
+        nav = []
+        if page > 0:
+            nav.append(KeyboardButton(BTN_PREV))
+        if (page + 1) * TITLES_PER_PAGE < total:
+            nav.append(KeyboardButton(BTN_MORE))
+        if nav:
+            rows.append(nav)
+        rows.append([KeyboardButton(BTN_BACK)])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True), page
+
+    async def _send_titles(self, message, context, page: int) -> None:
+        kb, page = await self._titles_keyboard(page)
+        context.user_data["tpage"] = page
+        await message.reply_text("📚 Выберите тайтл:", reply_markup=kb)
 
     # ── admin recognition (channel admins/owner + configured OWNER_USER_IDS) ──
     async def _channel_admin_ids(self, force: bool = False) -> set[int]:
@@ -306,13 +329,14 @@ class BotApp:
             "и отправьте найденную главу другу, не выходя из переписки.\n\n"
             "📌 Полная навигация по всем проектам закреплена в канале.\n\n"
             "Попробуйте прямо сейчас — пришлите название любого тайтла 👇")
-        text += ("\n\n👇 Кнопки тайтлов — под полем ввода (или в меню ≡ командой "
-                 "<code>/&lt;тайтл&gt;</code>).")
+        text += ("\n\n👇 Меню под полем ввода: <b>📚 Тайтлы</b> — список всех "
+                 "проектов. Тайтл также можно открыть командой <code>/&lt;тайтл&gt;</code> "
+                 "из меню ≡.")
         if is_adm:
             text += "\n\n🛠 <b>Вы администратор.</b> Управление: /menu"
         await update.message.reply_text(
             text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-            reply_markup=await self._main_keyboard(is_adm))
+            reply_markup=self._main_keyboard(is_adm))
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -421,13 +445,27 @@ class BotApp:
         if not msg or not msg.text:
             return
         text = msg.text.strip()
-        # reply-keyboard shortcuts
+        # reply-keyboard navigation
         if text == BTN_HELP:
             await self.cmd_start(update, context)
             return
         if text == BTN_ADMIN:
             if await self._owner(update):
                 await self._send_menu(msg)
+            return
+        if text == BTN_TITLES:
+            await self._send_titles(msg, context, 0)
+            return
+        if text in (BTN_MORE, BTN_PREV):
+            page = context.user_data.get("tpage", 0)
+            await self._send_titles(msg, context,
+                                    page + 1 if text == BTN_MORE else page - 1)
+            return
+        if text == BTN_BACK:
+            await msg.reply_text(
+                "Главное меню 👇",
+                reply_markup=self._main_keyboard(await self.is_admin(
+                    update.effective_user.id)))
             return
         # owner mid-flow? consume as the awaited input
         if await self._owner(update) and context.user_data.get("await"):
