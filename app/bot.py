@@ -432,6 +432,18 @@ class BotApp:
                     "Нашёл несколько проектов — выберите:",
                     reply_markup=InlineKeyboardMarkup(kb))
                 return
+            # a section name (no project, no number) → show its items with direct
+            # links to the channel posts
+            if not self._has_number(query) and not res["projects"] and res["sections"]:
+                if len(res["sections"]) == 1:
+                    await self._send_section_card(message, res["sections"][0]["id"])
+                    return
+                kb = [[InlineKeyboardButton(f"{s['emoji']} {s['name']}",
+                                            callback_data=f"seccard:{s['id']}")]
+                      for s in res["sections"][:8]]
+                await message.reply_text("Разделы — выберите:",
+                                         reply_markup=InlineKeyboardMarkup(kb))
+                return
             html = await self._search_html(res, query)
         except Exception as e:  # noqa: BLE001
             log.exception("search failed")
@@ -554,8 +566,8 @@ class BotApp:
         return "\n".join(lines)
 
     # ── callbacks router ────────────────────────────────────────────────────────
-    # callbacks anyone may use (the public project card navigation)
-    _PUBLIC_CB = {"card", "arcs", "arc", "pcat"}
+    # callbacks anyone may use (the public project / section card navigation)
+    _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard"}
 
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -613,6 +625,11 @@ class BotApp:
             await self._show_arc_chapters(q, int(parts[1]), int(parts[2]))
         elif head == "pcat":
             await self._show_project_category(q, int(parts[1]), int(parts[2]))
+        elif head == "seccard":
+            text, kb = await self._section_card_text_kb(int(parts[1]))
+            await q.edit_message_text(text, reply_markup=kb,
+                                      parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
 
     async def _card_text_kb(self, pid: int):
         p = await self.db.get_project(pid)
@@ -651,6 +668,35 @@ class BotApp:
 
     async def _send_project_card(self, message, pid: int) -> None:
         text, kb = await self._card_text_kb(pid)
+        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+
+    async def _section_card_text_kb(self, sid: int):
+        sec = await self.db.get_section(sid)
+        if not sec:
+            return "Раздел не найден.", None
+        items = await self.db.list_items(section_id=sid)
+        posts = await self._post_urls()
+        lines = [f"{sec['emoji']} <b>{esc(sec['name'])}</b>",
+                 f"Записей: {len(items)}", ""]
+        if not items:
+            lines.append("— пока пусто —")
+        for it in items[:30]:
+            url = it["url"] or posts.get(it["post_id"], "")
+            title = esc(it["title"] or "Без названия")
+            lines.append(f'• <a href="{esc(url)}">{title}</a>' if url else f"• {title}")
+        if len(items) > 30:
+            lines.append(f"…и ещё {len(items) - 30}")
+        kb = []
+        page = await self.db.get_page_for("section", sid)
+        if page:
+            kb.append([InlineKeyboardButton(
+                "🌐 Открыть раздел в навигации",
+                url=f"https://telegra.ph/{page['path']}")])
+        return "\n".join(lines), (InlineKeyboardMarkup(kb) if kb else None)
+
+    async def _send_section_card(self, message, sid: int) -> None:
+        text, kb = await self._section_card_text_kb(sid)
         await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
 
