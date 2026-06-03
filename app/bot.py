@@ -649,6 +649,25 @@ class BotApp:
             await self._show_section(q, int(parts[1]))
         elif head == "se":
             await self._section_edit(q, context, int(parts[1]), parts[2])
+        elif head == "sdel":
+            sid = int(parts[1])
+            s = await self.db.get_section(sid)
+            n = await self.db.count_items(section_id=sid)
+            await q.edit_message_text(
+                f"🗑 Удалить раздел «{esc(s['name'])}»? Будут удалены {n} запись(ей) "
+                f"и отвязаны его хэштеги. Это необратимо.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Да, удалить", callback_data=f"sdelyes:{sid}"),
+                    InlineKeyboardButton("Отмена", callback_data=f"s:{sid}")]]))
+        elif head == "sdelyes":
+            sid = int(parts[1])
+            await self.db.execute("DELETE FROM hashtag_map WHERE kind='category' "
+                                  "AND target_id=?", (sid,))
+            await self.db.execute("DELETE FROM items WHERE section_id=?", (sid,))
+            await self.db.execute("DELETE FROM sections WHERE id=?", (sid,))
+            await self.db.enqueue_build("root", None)
+            await q.edit_message_text("🗑 Раздел удалён (с хэштегами и записями).",
+                                      reply_markup=self._back("sect"))
         # hashtags
         elif head == "tags":
             await self._show_tags(q)
@@ -712,9 +731,12 @@ class BotApp:
             return
         cnt = await self.db.count_chapters(pid)
         ext = {e["platform"]: e["url"] for e in await self.db.list_external_links(pid)}
+        tags = [r["hashtag"] for r in await self.db.list_hashtags()
+                if r["kind"] == "project" and r["target_id"] == pid]
         lines = [f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>",
                  f"Глав: {cnt} · Порядок: {p['sort_order']} · "
-                 f"{'СКРЫТ' if p['hidden'] else 'виден'}"]
+                 f"{'СКРЫТ' if p['hidden'] else 'виден'}",
+                 "Хэштеги: " + (", ".join("#" + t for t in tags) if tags else "—")]
         for _code, col, label in PLATFORMS:
             lines.append(f"{label}: {esc(ext.get(col, '—'))}")
         kb = [
@@ -790,12 +812,15 @@ class BotApp:
             [InlineKeyboardButton("✏️ Имя", callback_data=f"se:{sid}:name"),
              InlineKeyboardButton("😀 Эмодзи", callback_data=f"se:{sid}:emoji")],
             [InlineKeyboardButton("↕️ Порядок", callback_data=f"se:{sid}:order"),
-             InlineKeyboardButton("🗑 Удалить", callback_data=f"se:{sid}:del")],
+             InlineKeyboardButton("🗑 Удалить раздел", callback_data=f"sdel:{sid}")],
             [InlineKeyboardButton("⬅️ К разделам", callback_data="sect")],
         ]
+        tags = [r["hashtag"] for r in await self.db.list_hashtags()
+                if r["kind"] == "category" and r["target_id"] == sid]
+        tag_line = ("\nХэштеги: " + ", ".join("#" + t for t in tags)) if tags else ""
         await q.edit_message_text(
             f"{s['emoji']} <b>{esc(s['name'])}</b>\nЗаписей: {len(items)} · "
-            f"Порядок: {s['sort_order']}",
+            f"Порядок: {s['sort_order']}{tag_line}",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
     async def _section_edit(self, q, context, sid: int, field: str) -> None:
