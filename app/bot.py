@@ -76,6 +76,12 @@ def esc(s) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def clip(s: str | None, n: int = 60) -> str:
+    """Shorten a title for list display: first line, trimmed to n chars + …."""
+    s = (s or "Без названия").splitlines()[0].strip()
+    return s if len(s) <= n else s[:n].rstrip() + "…"
+
+
 class BotApp:
     def __init__(self, db: Database, cfg: Config):
         self.db = db
@@ -409,8 +415,7 @@ class BotApp:
                 out.append(f'{s["emoji"]} <b>{esc(s["name"])}</b>')
         for it in res.get("items", [])[:12]:
             emoji = it.get("section_emoji") or "•"
-            out.append(f'{emoji} <a href="{esc(it["url"])}">'
-                       f'{esc(it["title"] or "Без названия")}</a>')
+            out.append(f'{emoji} <a href="{esc(it["url"])}">{esc(clip(it["title"]))}</a>')
         if not out:
             return "Ничего не найдено. Попробуйте номер главы, арку или название."
         return f"🔎 Результаты по «{esc(query)}»:\n\n" + "\n".join(out)
@@ -683,7 +688,7 @@ class BotApp:
             lines.append("— пока пусто —")
         for it in items[:30]:
             url = it["url"] or posts.get(it["post_id"], "")
-            title = esc(it["title"] or "Без названия")
+            title = esc(clip(it["title"]))
             lines.append(f'• <a href="{esc(url)}">{title}</a>' if url else f"• {title}")
         if len(items) > 30:
             lines.append(f"…и ещё {len(items) - 30}")
@@ -746,7 +751,7 @@ class BotApp:
         if not items:
             lines.append("— пока пусто —")
         for it in items:
-            lines.append(f'• <a href="{esc(it["url"])}">{esc(it["title"] or "Без названия")}</a>')
+            lines.append(f'• <a href="{esc(it["url"])}">{esc(clip(it["title"]))}</a>')
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🏠 К проекту", callback_data=f"card:{pid}")]])
         await q.edit_message_text("\n".join(lines), reply_markup=kb,
@@ -1141,7 +1146,7 @@ class BotApp:
             await q.edit_message_text("В разделе пока нет записей.",
                                       reply_markup=self._back(f"s:{sid}"))
             return
-        kb = [[InlineKeyboardButton((it["title"] or "Без названия")[:45],
+        kb = [[InlineKeyboardButton(clip(it["title"], 45),
                                     callback_data=f"item:{it['id']}")]
               for it in items[:50]]
         kb.append([InlineKeyboardButton("⬅️ К разделу", callback_data=f"s:{sid}")])
