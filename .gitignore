@@ -29,3 +29,6 @@ Thumbs.db
 /ChatExport/video_files/
 /ChatExport/images/
 /ChatExport/stickers/
+
+# generated migration artifact
+migration_kimchi.txt
