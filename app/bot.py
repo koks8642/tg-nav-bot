@@ -115,11 +115,19 @@ class BotApp:
         return self._admin_ids
 
     async def is_admin(self, user_id: int | None) -> bool:
+        import time
         if user_id is None:
             return False
         if user_id in self.cfg.owner_user_ids:
             return True
-        return user_id in await self._channel_admin_ids()
+        ids = await self._channel_admin_ids()
+        if user_id in ids:
+            return True
+        # possibly a just-promoted admin not yet in the 5-min cache: refresh
+        # once (throttled to ~20s so random searchers don't spam the API)
+        if time.time() - self._admin_ids_ts > 20:
+            ids = await self._channel_admin_ids(force=True)
+        return user_id in ids
 
     async def _owner(self, update: Update) -> bool:
         u = update.effective_user
