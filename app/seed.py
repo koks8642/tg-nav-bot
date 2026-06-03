@@ -1,7 +1,8 @@
-"""Seed the DB with the project / section / hashtag registry on first run.
+"""Seed the DB with the project / section / hashtag registry — ONCE, ever.
 
-Idempotent: existing rows are left untouched (admin edits win). Only missing
-seeds are inserted, so re-running never overwrites manual changes.
+After the first run a ``seeded`` flag is stored in ``meta``; subsequent starts
+skip seeding entirely. This is critical: otherwise deleting a default project or
+section in the admin would have it resurrected on the next restart.
 """
 from __future__ import annotations
 
@@ -11,6 +12,14 @@ from .util import slugify
 
 
 async def seed_registry(db: Database) -> None:
+    # run only on the very first start; never resurrect deleted defaults
+    if await db.meta_get("seeded"):
+        return
+    await _seed(db)
+    await db.meta_set("seeded", "1")
+
+
+async def _seed(db: Database) -> None:
     for sp in SEED_PROJECTS:
         existing = await db.get_project_by_key(sp.key)
         if existing:
