@@ -225,11 +225,12 @@ class BotApp:
     # ── commands ─────────────────────────────────────────────────────────────
     async def cmd_start(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
-        if await self._owner(update):
-            await self._send_menu(update.effective_message)
-            return
+        # /start and /help always show the user guide (for everyone). The admin
+        # panel is opened only by /menu. is_admin() here also primes the admin's
+        # ≡ command menu.
+        is_adm = await self._owner(update)
         bot = context.bot.username or "bot"
-        await update.message.reply_text(
+        text = (
             "👋 <b>Навигатор переводов RQM</b>\n"
             "Здесь можно мгновенно находить главы новелл и манги, а также арты, "
             "мемы и заметки команды.\n\n"
@@ -245,8 +246,11 @@ class BotApp:
             f"⚡️ <b>Поиск в любом чате.</b> Наберите <code>@{bot}</code> и запрос — "
             "и отправьте найденную главу другу, не выходя из переписки.\n\n"
             "📌 Полная навигация по всем проектам закреплена в канале.\n\n"
-            "Попробуйте прямо сейчас — пришлите название любого тайтла 👇",
-            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            "Попробуйте прямо сейчас — пришлите название любого тайтла 👇")
+        if is_adm:
+            text += "\n\n🛠 <b>Вы администратор.</b> Управление: /menu"
+        await update.message.reply_text(
+            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
