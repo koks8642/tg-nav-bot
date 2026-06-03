@@ -16,6 +16,9 @@ import logging
 from uuid import uuid4
 
 from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -45,6 +48,21 @@ PLATFORMS = [("rl", "ranobelib", "RanobeLib"), ("ml", "mangalib", "MangaLib"),
              ("sk", "senkuro", "Senkuro"), ("bo", "boosty", "Boosty")]
 PLATFORM_BY_CODE = {code: (col, label) for code, col, label in PLATFORMS}
 
+# Commands shown in the ≡ menu under the input field.
+PUBLIC_COMMANDS = [
+    BotCommand("start", "О боте и как искать 🔎"),
+    BotCommand("help", "Подсказка по поиску"),
+]
+ADMIN_COMMANDS = [
+    BotCommand("menu", "🛠 Админка (проекты, разделы, теги, главы)"),
+    BotCommand("links", "🔗 Ссылки на Telegraph-страницы"),
+    BotCommand("health", "📊 Статус и счётчики"),
+    BotCommand("rebuild", "♻️ Пересобрать все страницы"),
+    BotCommand("backfill", "📥 Импорт истории из экспорта"),
+    BotCommand("id", "🆔 Мой user_id"),
+    BotCommand("help", "🔎 Подсказка по поиску"),
+]
+
 
 def esc(s) -> str:
     s = "" if s is None else str(s)
@@ -59,6 +77,8 @@ class BotApp:
         # cache of channel admin user ids (creator + administrators)
         self._admin_ids: set[int] = set()
         self._admin_ids_ts: float = 0.0
+        # users whose personal ≡ admin command menu we've already set
+        self._cmd_admins: set[int] = set()
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -67,7 +87,8 @@ class BotApp:
                    .connect_timeout(30.0).read_timeout(30.0)
                    .write_timeout(30.0).pool_timeout(30.0)
                    .get_updates_connect_timeout(30.0)
-                   .get_updates_read_timeout(30.0))
+                   .get_updates_read_timeout(30.0)
+                   .post_init(self._post_init))
         if self.cfg.telegram_proxy:
             builder = (builder.proxy(self.cfg.telegram_proxy)
                        .get_updates_proxy(self.cfg.telegram_proxy))
@@ -100,6 +121,27 @@ class BotApp:
         self.application = app
         return app
 
+    # ── command menu (≡ button under the input field) ────────────────────────
+    async def _post_init(self, application: Application) -> None:
+        await self.setup_commands()
+
+    async def setup_commands(self) -> None:
+        """Set the ≡ command menu: basic for everyone, full for each admin."""
+        bot = self.application.bot
+        try:
+            await bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+            admin_ids = set(self.cfg.owner_user_ids) | await self._channel_admin_ids(force=True)
+            for uid in admin_ids:
+                try:
+                    await bot.set_my_commands(
+                        ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
+                    self._cmd_admins.add(uid)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("set admin commands for %s skipped: %s", uid, e)
+            log.info("command menus set (%d admins)", len(admin_ids))
+        except Exception as e:  # noqa: BLE001
+            log.warning("set_my_commands failed: %s", e)
+
     # ── admin recognition (channel admins/owner + configured OWNER_USER_IDS) ──
     async def _channel_admin_ids(self, force: bool = False) -> set[int]:
         import time
@@ -131,7 +173,21 @@ class BotApp:
 
     async def _owner(self, update: Update) -> bool:
         u = update.effective_user
-        return bool(u and await self.is_admin(u.id))
+        if not u or not await self.is_admin(u.id):
+            return False
+        await self._ensure_admin_commands(u.id)
+        return True
+
+    async def _ensure_admin_commands(self, uid: int) -> None:
+        """Lazily give a recognised admin their personal ≡ command menu."""
+        if uid in self._cmd_admins:
+            return
+        try:
+            await self.application.bot.set_my_commands(
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
+            self._cmd_admins.add(uid)
+        except Exception as e:  # noqa: BLE001
+            log.debug("ensure admin commands for %s: %s", uid, e)
 
     async def notify_owners(self, text: str) -> None:
         if not self.application:
