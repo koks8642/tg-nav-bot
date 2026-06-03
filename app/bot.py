@@ -108,6 +108,7 @@ class BotApp:
         app.add_handler(CommandHandler("rebuild", self.cmd_rebuild))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(InlineQueryHandler(self.on_inline))
+        app.add_error_handler(self._on_error)
         # private free text → owner pending input, otherwise search (everyone)
         app.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
@@ -440,22 +441,38 @@ class BotApp:
         data = q.data or ""
         head = data.split(":")[0]
         if head in self._PUBLIC_CB:
-            await q.answer()
+            await self._safe_answer(q)
             try:
                 await self._route_public(q, data)
             except Exception as e:  # noqa: BLE001
                 log.exception("public callback failed")
-                await q.answer(f"Ошибка: {e}", show_alert=True)
+                await self._safe_answer(q, f"Ошибка: {e}", show_alert=True)
             return
         if not await self.is_admin(q.from_user.id):
-            await q.answer("Нет доступа", show_alert=True)
+            await self._safe_answer(q, "Нет доступа", show_alert=True)
             return
-        await q.answer()
+        await self._safe_answer(q)
         try:
             await self._route(q, context, data)
         except Exception as e:  # noqa: BLE001
             log.exception("callback failed")
             await q.message.reply_text(f"Ошибка: {esc(e)}")
+
+    @staticmethod
+    async def _safe_answer(q, text: str | None = None, show_alert: bool = False) -> None:
+        """answerCallbackQuery that ignores stale/expired query ids (e.g. a
+        button tapped while the bot was restarting)."""
+        try:
+            await q.answer(text, show_alert=show_alert)
+        except Exception as e:  # noqa: BLE001
+            log.debug("callback answer skipped: %s", e)
+
+    async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        log.warning("update error: %s", context.error)
+        try:
+            await self.db.log("WARNING", "bot", str(context.error)[:500])
+        except Exception:  # noqa: BLE001
+            pass
 
     # ── public project card + arc navigation (everyone) ───────────────────────
     async def _route_public(self, q, data: str) -> None:
