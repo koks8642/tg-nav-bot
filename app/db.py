@@ -544,7 +544,11 @@ class Database:
 
         tokens = q.split()
         number = next((int(t) for t in tokens if t.isdigit()), None)
-        words = [t.lower() for t in tokens if not t.isdigit()]
+        # drop noise words so "глава 304" / "глава 304 покровитель" search cleanly
+        noise = {"глава", "главу", "главы", "глав", "главе", "главой",
+                 "chapter", "ch", "том", "арка", "ссылка", "ссылки"}
+        words = [t.lower() for t in tokens
+                 if not t.isdigit() and t.lower() not in noise]
         text = " ".join(words).strip()
         like = f"%{text}%"
 

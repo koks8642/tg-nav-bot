@@ -1,21 +1,26 @@
-"""Telegram bot: channel watcher + owner admin menu (python-telegram-bot v21).
+"""Telegram bot: channel watcher + instant search (everyone) + full admin CRUD.
 
-The watcher feeds every channel post through :mod:`app.pipeline`, which writes
-to the DB and enqueues page rebuilds. A separate worker (see :mod:`app.main`)
-drains that queue, so the handler returns instantly and bursts are debounced.
+* Channel watcher → :mod:`app.pipeline` (writes DB, enqueues rebuilds).
+* Anyone can search by sending a number / title / arc ("304", "глава 304",
+  "покровитель 305", "турнир"), or via inline mode (@bot 304) in any chat.
+* Owners get a full CRUD menu: projects, hashtags, sections, chapters,
+  conflicts, manual ops — all through inline keyboards + short text prompts.
 
-The admin menu offers quick mobile actions (health, conflicts, manual rebuild /
-backfill / rescan, hashtag binding). The full CRUD UI lives in the Mini App.
+The "awaiting input" pattern: a menu action that needs free text stores what it
+expects in ``context.user_data['await']``; the next private text message from
+that owner is consumed as the answer.
 """
 from __future__ import annotations
 
 import logging
+from uuid import uuid4
 
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Update,
-    WebAppInfo,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -23,6 +28,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -31,8 +37,18 @@ from .config import Config
 from .db import Database
 from .parser import parsed_post_from_message
 from .pipeline import process_post
+from .util import slugify
 
 log = logging.getLogger("bot")
+
+PLATFORMS = [("rl", "ranobelib", "RanobeLib"), ("ml", "mangalib", "MangaLib"),
+             ("sk", "senkuro", "Senkuro"), ("bo", "boosty", "Boosty")]
+PLATFORM_BY_CODE = {code: (col, label) for code, col, label in PLATFORMS}
+
+
+def esc(s) -> str:
+    s = "" if s is None else str(s)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 class BotApp:
@@ -43,14 +59,10 @@ class BotApp:
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
-        # Generous timeouts + optional proxy make the bot resilient on flaky
-        # networks (e.g. throttled api.telegram.org access from RU).
         builder = (Application.builder()
                    .token(self.cfg.bot_token)
-                   .connect_timeout(30.0)
-                   .read_timeout(30.0)
-                   .write_timeout(30.0)
-                   .pool_timeout(30.0)
+                   .connect_timeout(30.0).read_timeout(30.0)
+                   .write_timeout(30.0).pool_timeout(30.0)
                    .get_updates_connect_timeout(30.0)
                    .get_updates_read_timeout(30.0))
         if self.cfg.telegram_proxy:
@@ -60,30 +72,35 @@ class BotApp:
         app.bot_data["db"] = self.db
         app.bot_data["cfg"] = self.cfg
 
-        # channel watcher
         chan = filters.Chat(self.cfg.channel_chat_id)
         app.add_handler(MessageHandler(
             filters.UpdateType.CHANNEL_POST & chan, self.on_channel_post))
         app.add_handler(MessageHandler(
             filters.UpdateType.EDITED_CHANNEL_POST & chan, self.on_channel_post))
 
-        # owner commands (private chat)
         app.add_handler(CommandHandler("start", self.cmd_start))
+        app.add_handler(CommandHandler("help", self.cmd_start))
         app.add_handler(CommandHandler("id", self.cmd_id))
         app.add_handler(CommandHandler("health", self.cmd_health))
         app.add_handler(CommandHandler("links", self.cmd_links))
         app.add_handler(CommandHandler("menu", self.cmd_menu))
+        app.add_handler(CommandHandler("search", self.cmd_search))
         app.add_handler(CommandHandler("rebuild", self.cmd_rebuild))
         app.add_handler(CommandHandler("backfill", self.cmd_backfill))
         app.add_handler(CallbackQueryHandler(self.on_callback))
+        app.add_handler(InlineQueryHandler(self.on_inline))
+        # private free text → owner pending input, otherwise search (everyone)
+        app.add_handler(MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            self.on_text))
 
         self.application = app
         return app
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _owner(self, update: Update) -> bool:
-        user = update.effective_user
-        return bool(user and self.cfg.is_owner(user.id))
+        u = update.effective_user
+        return bool(u and self.cfg.is_owner(u.id))
 
     async def notify_owners(self, text: str) -> None:
         if not self.application:
@@ -94,6 +111,10 @@ class BotApp:
             except Exception as e:  # noqa: BLE001
                 log.warning("notify owner %s failed: %s", uid, e)
 
+    async def _post_urls(self) -> dict[int, str]:
+        rows = await self.db.fetchall("SELECT message_id, tg_url FROM posts")
+        return {r["message_id"]: r["tg_url"] for r in rows}
+
     # ── channel watcher ──────────────────────────────────────────────────────
     async def on_channel_post(self, update: Update,
                               context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -102,8 +123,7 @@ class BotApp:
             return
         text = msg.text or msg.caption or ""
         entities = list(msg.entities or []) + list(msg.caption_entities or [])
-        post = parsed_post_from_message(
-            msg.message_id, text, entities, msg.date)
+        post = parsed_post_from_message(msg.message_id, text, entities, msg.date)
         is_edit = update.edited_channel_post is not None
         try:
             result = await process_post(self.db, self.cfg, post, is_edit=is_edit)
@@ -111,76 +131,63 @@ class BotApp:
             await self.db.log("ERROR", "watcher", f"msg {msg.message_id}: {e}")
             await self.notify_owners(f"⚠️ Ошибка обработки поста {msg.message_id}: {e}")
             return
-
         if result.notify:
             await self.notify_owners(result.notify)
         if result.action != "ignored":
-            await self.db.log(
-                "INFO", "watcher",
-                f"msg {msg.message_id} {result.action} "
-                f"chapters={result.chapters} items={result.items}")
+            await self.db.log("INFO", "watcher",
+                              f"msg {msg.message_id} {result.action} "
+                              f"chapters={result.chapters} items={result.items}")
 
     # ── commands ─────────────────────────────────────────────────────────────
     async def cmd_start(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._owner(update):
-            await update.message.reply_text(
-                "Это служебный бот навигации канала RQM.")
+        if self._owner(update):
+            await self._send_menu(update.effective_message)
             return
-        await self._send_menu(update)
+        await update.message.reply_text(
+            "👋 <b>Навигатор переводов RQM</b>\n\n"
+            "Просто пришлите запрос — найду мгновенно:\n"
+            "• <code>304</code> — все главы с номером 304\n"
+            "• <code>покровитель 305</code> — глава 305 проекта\n"
+            "• <code>турнир</code> — главы арки\n"
+            "• <code>башня</code> — проект\n\n"
+            "Можно искать в любом чате через <code>@{bot} запрос</code>.".format(
+                bot=(context.bot.username or "bot")),
+            parse_mode=ParseMode.HTML)
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
-        u = update.effective_user
-        c = update.effective_chat
+        u, c = update.effective_user, update.effective_chat
         await update.message.reply_text(
             f"user_id: `{u.id}`\nchat_id: `{c.id}`", parse_mode=ParseMode.MARKDOWN)
 
     async def cmd_menu(self, update: Update,
                        context: ContextTypes.DEFAULT_TYPE) -> None:
         if self._owner(update):
-            await self._send_menu(update)
+            await self._send_menu(update.effective_message)
+
+    async def cmd_search(self, update: Update,
+                         context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = " ".join(context.args) if context.args else ""
+        if not query:
+            await update.message.reply_text("Напишите запрос после /search, "
+                                            "или просто пришлите его сообщением.")
+            return
+        await self._do_search(update.effective_message, query)
 
     async def cmd_health(self, update: Update,
                          context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._owner(update):
-            return
-        await update.message.reply_text(await self._health_text(),
-                                        parse_mode=ParseMode.HTML)
+        if self._owner(update):
+            await update.message.reply_text(await self._health_text(),
+                                            parse_mode=ParseMode.HTML)
 
     async def cmd_links(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._owner(update):
             return
-        lines = ["<b>🔗 Telegraph-страницы</b>"]
-        root = await self.db.get_page_for("root", None)
-        if root:
-            lines.append(f"🏠 <b>Главная (закрепить в канале):</b>\n"
-                         f"https://telegra.ph/{root['path']}")
-        else:
-            lines.append("Главная ещё не собрана — пришлите пост с хэштегом "
-                         "или нажмите «Пересобрать всё».")
-        proj_pages = await self.db.fetchall(
-            "SELECT tp.path, p.canonical_name AS name, p.emoji "
-            "FROM telegraph_pages tp JOIN projects p ON p.id=tp.ref_id "
-            "WHERE tp.kind='project' ORDER BY p.sort_order")
-        if proj_pages:
-            lines.append("\n<b>Проекты:</b>")
-            for r in proj_pages:
-                lines.append(f"{r['emoji']} {r['name']}: "
-                             f"https://telegra.ph/{r['path']}")
-        sec_pages = await self.db.fetchall(
-            "SELECT tp.path, s.name, s.emoji FROM telegraph_pages tp "
-            "JOIN sections s ON s.id=tp.ref_id WHERE tp.kind='section' "
-            "ORDER BY s.sort_order")
-        if sec_pages:
-            lines.append("\n<b>Разделы:</b>")
-            for r in sec_pages:
-                lines.append(f"{r['emoji']} {r['name']}: "
-                             f"https://telegra.ph/{r['path']}")
-        await update.message.reply_text(
-            "\n".join(lines), parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True)
+        await update.message.reply_text(await self._links_text(),
+                                        parse_mode=ParseMode.HTML,
+                                        disable_web_page_preview=True)
 
     async def cmd_rebuild(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -188,58 +195,157 @@ class BotApp:
             return
         from .rebuild import enqueue_full_rebuild
         await enqueue_full_rebuild(self.db)
-        await update.message.reply_text(
-            "♻️ Полная пересборка поставлена в очередь.")
+        await update.message.reply_text("♻️ Полная пересборка поставлена в очередь.")
 
     async def cmd_backfill(self, update: Update,
                            context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._owner(update):
             return
-        await update.message.reply_text("⏳ Запускаю бэкафилл из экспорта…")
+        await update.message.reply_text("⏳ Запускаю бэкафилл…")
         from .backfill import run_backfill
         try:
             report = await run_backfill(self.db, self.cfg)
-            await update.message.reply_text(f"✅ Бэкафилл готов:\n{report.summary()}")
+            await update.message.reply_text(f"✅ Готово:\n{report.summary()}")
         except Exception as e:  # noqa: BLE001
-            await update.message.reply_text(f"❌ Ошибка бэкафилла: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}")
 
-    # ── menu / callbacks ─────────────────────────────────────────────────────
+    # ── search (everyone) ─────────────────────────────────────────────────────
+    async def _search_html(self, query: str, limit: int = 20) -> str:
+        res = await self.db.search(query, limit=limit)
+        posts = await self._post_urls()
+        out: list[str] = []
+        for p in res["projects"][:6]:
+            page = await self.db.get_page_for("project", p["id"])
+            if page:
+                out.append(f"{p['emoji']} <a href=\"https://telegra.ph/"
+                           f"{page['path']}\">{esc(p['canonical_name'])}</a>")
+            else:
+                out.append(f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>")
+        chapters = res["chapters"]
+        if chapters:
+            if out:
+                out.append("")
+            for c in chapters:
+                head = (f"{c['project_emoji']} <b>{esc(c['project_name'])}</b> "
+                        f"гл. {c['number']}")
+                if c["arc"]:
+                    head += f" · {esc(c['arc'])}"
+                links = [f"<a href=\"{esc(c['telegraph_url'])}\">📖 Читать</a>"]
+                purl = posts.get(c["post_id"])
+                if purl:
+                    links.append(f"<a href=\"{esc(purl)}\">💬 Пост</a>")
+                out.append(head + "\n   " + " · ".join(links))
+        if not out:
+            return "Ничего не найдено. Попробуйте номер главы или название."
+        header = f"🔎 Результаты по «{esc(query)}»:\n\n"
+        return header + "\n".join(out)
+
+    async def _do_search(self, message, query: str) -> None:
+        try:
+            html = await self._search_html(query)
+        except Exception as e:  # noqa: BLE001
+            log.exception("search failed")
+            html = f"Ошибка поиска: {esc(e)}"
+        await message.reply_text(html, parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+
+    async def on_text(self, update: Update,
+                      context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return
+        # owner mid-flow? consume as the awaited input
+        if self._owner(update) and context.user_data.get("await"):
+            await self._handle_pending(update, context)
+            return
+        await self._do_search(msg, msg.text.strip())
+
+    async def on_inline(self, update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+        iq = update.inline_query
+        query = (iq.query or "").strip()
+        if not query:
+            await iq.answer([], cache_time=5)
+            return
+        res = await self.db.search(query, limit=25)
+        posts = await self._post_urls()
+        results = []
+        for c in res["chapters"][:25]:
+            title = f"{c['project_name']} — гл. {c['number']}"
+            desc = c["arc"] or ""
+            body = f"<b>{esc(c['project_name'])}</b> гл. {c['number']}"
+            if c["arc"]:
+                body += f" · {esc(c['arc'])}"
+            body += f"\n<a href=\"{esc(c['telegraph_url'])}\">📖 Читать в Telegraph</a>"
+            purl = posts.get(c["post_id"])
+            if purl:
+                body += f"\n<a href=\"{esc(purl)}\">💬 Пост в канале</a>"
+            results.append(InlineQueryResultArticle(
+                id=str(uuid4()), title=title, description=desc,
+                input_message_content=InputTextMessageContent(
+                    body, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True)))
+        await iq.answer(results, cache_time=5, is_personal=False)
+
+    # ── owner menu ─────────────────────────────────────────────────────────────
     def _menu_markup(self) -> InlineKeyboardMarkup:
-        rows = [
-            [InlineKeyboardButton("📊 Health", callback_data="health"),
-             InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts")],
-            [InlineKeyboardButton("📚 Проекты", callback_data="projects"),
-             InlineKeyboardButton("🏷 Хэштеги", callback_data="hashtags")],
-            [InlineKeyboardButton("♻️ Пересобрать всё", callback_data="rebuild_all")],
-        ]
-        if self.cfg.webapp_url:
-            rows.insert(0, [InlineKeyboardButton(
-                "🛠 Открыть админ-панель (Mini App)",
-                web_app=WebAppInfo(url=f"{self.cfg.webapp_url}/?admin=1"))])
-        return InlineKeyboardMarkup(rows)
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 Проекты", callback_data="proj"),
+             InlineKeyboardButton("🗂 Разделы", callback_data="sect")],
+            [InlineKeyboardButton("🏷 Хэштеги", callback_data="tags"),
+             InlineKeyboardButton("📖 Главы", callback_data="chap")],
+            [InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts"),
+             InlineKeyboardButton("📊 Health", callback_data="health")],
+            [InlineKeyboardButton("🔗 Ссылки", callback_data="links_cb"),
+             InlineKeyboardButton("♻️ Пересобрать", callback_data="rebuild_all")],
+            [InlineKeyboardButton("📥 Бэкафилл", callback_data="backfill_cb")],
+        ])
 
-    async def _send_menu(self, update: Update) -> None:
-        await update.message.reply_text(
-            "🛠 <b>Админ-панель RQM</b>\nВыберите действие:",
+    async def _send_menu(self, message) -> None:
+        await message.reply_text(
+            "🛠 <b>Админка RQM</b>\nВыберите раздел. "
+            "Поиск работает в любой момент — просто пришлите запрос.",
             reply_markup=self._menu_markup(), parse_mode=ParseMode.HTML)
 
     async def _health_text(self) -> str:
         s = await self.db.stats()
         errors = await self.db.recent_errors(5)
-        lines = [
-            "<b>📊 Health</b>",
-            f"Проекты: {s['projects']} · Главы: {s['chapters']} · "
-            f"Айтемы: {s['items']}",
-            f"Разделы: {s['sections']} · Внешние ссылки: {s['external_links']}",
-            f"Очередь пересборки: {s['pending_builds']} · "
-            f"Конфликты: {s['open_conflicts']}",
-        ]
+        lines = ["<b>📊 Health</b>",
+                 f"Проекты: {s['projects']} · Главы: {s['chapters']} · "
+                 f"Айтемы: {s['items']}",
+                 f"Разделы: {s['sections']} · Внешние ссылки: {s['external_links']}",
+                 f"Очередь: {s['pending_builds']} · Конфликты: {s['open_conflicts']}"]
         if errors:
             lines.append("\n<b>Последние ошибки:</b>")
             for e in errors:
-                lines.append(f"• {e['ts']} [{e['level']}] {e['message'][:120]}")
+                lines.append(f"• {esc(e['ts'])} [{e['level']}] {esc(e['message'][:100])}")
         return "\n".join(lines)
 
+    async def _links_text(self) -> str:
+        lines = ["<b>🔗 Telegraph-страницы</b>"]
+        root = await self.db.get_page_for("root", None)
+        if root:
+            lines.append(f"🏠 <b>Главная (закрепить):</b> "
+                         f"https://telegra.ph/{root['path']}")
+        proj = await self.db.fetchall(
+            "SELECT tp.path, p.canonical_name AS name, p.emoji FROM telegraph_pages tp "
+            "JOIN projects p ON p.id=tp.ref_id WHERE tp.kind='project' "
+            "ORDER BY p.sort_order")
+        if proj:
+            lines.append("\n<b>Проекты:</b>")
+            for r in proj:
+                lines.append(f"{r['emoji']} {esc(r['name'])}: https://telegra.ph/{r['path']}")
+        sec = await self.db.fetchall(
+            "SELECT tp.path, s.name, s.emoji FROM telegraph_pages tp "
+            "JOIN sections s ON s.id=tp.ref_id WHERE tp.kind='section' "
+            "ORDER BY s.sort_order")
+        if sec:
+            lines.append("\n<b>Разделы:</b>")
+            for r in sec:
+                lines.append(f"{r['emoji']} {esc(r['name'])}: https://telegra.ph/{r['path']}")
+        return "\n".join(lines)
+
+    # ── callbacks router ────────────────────────────────────────────────────────
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
@@ -249,77 +355,410 @@ class BotApp:
             return
         await q.answer()
         data = q.data or ""
+        try:
+            await self._route(q, context, data)
+        except Exception as e:  # noqa: BLE001
+            log.exception("callback failed")
+            await q.message.reply_text(f"Ошибка: {esc(e)}")
 
-        if data == "health":
+    async def _route(self, q, context, data: str) -> None:
+        parts = data.split(":")
+        head = parts[0]
+
+        if head == "menu":
+            await q.edit_message_text(
+                "🛠 <b>Админка RQM</b>\nВыберите раздел.",
+                reply_markup=self._menu_markup(), parse_mode=ParseMode.HTML)
+        elif head == "health":
             await q.edit_message_text(await self._health_text(),
-                                      reply_markup=self._menu_markup(),
-                                      parse_mode=ParseMode.HTML)
-        elif data == "rebuild_all":
+                                      reply_markup=self._back(), parse_mode=ParseMode.HTML)
+        elif head == "links_cb":
+            await q.edit_message_text(await self._links_text(),
+                                      reply_markup=self._back(),
+                                      parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
+        elif head == "rebuild_all":
             from .rebuild import enqueue_full_rebuild
             await enqueue_full_rebuild(self.db)
-            await q.edit_message_text("♻️ Полная пересборка поставлена в очередь.",
-                                      reply_markup=self._menu_markup())
-        elif data == "conflicts":
+            await q.edit_message_text("♻️ Пересборка поставлена в очередь.",
+                                      reply_markup=self._back())
+        elif head == "backfill_cb":
+            from .backfill import run_backfill
+            await q.edit_message_text("⏳ Бэкафилл…")
+            try:
+                rep = await run_backfill(self.db, self.cfg)
+                await q.edit_message_text(f"✅ {esc(rep.summary())}",
+                                          reply_markup=self._back())
+            except Exception as e:  # noqa: BLE001
+                await q.edit_message_text(f"❌ {esc(e)}", reply_markup=self._back())
+        elif head == "conflicts":
             await self._show_conflicts(q)
-        elif data == "projects":
+        elif head == "conf":
+            await self.db.execute("UPDATE conflicts SET status='resolved' WHERE id=?",
+                                  (int(parts[1]),))
+            await self._show_conflicts(q)
+        # projects
+        elif head == "proj":
             await self._show_projects(q)
-        elif data == "hashtags":
-            await self._show_hashtags(q)
-        elif data.startswith("conf_resolve:"):
-            cid = int(data.split(":")[1])
-            await self.db.execute(
-                "UPDATE conflicts SET status='resolved' WHERE id=?", (cid,))
-            await self._show_conflicts(q)
-        elif data == "menu":
-            await q.edit_message_text(
-                "🛠 <b>Админ-панель RQM</b>\nВыберите действие:",
-                reply_markup=self._menu_markup(), parse_mode=ParseMode.HTML)
+        elif head == "p":
+            await self._show_project(q, int(parts[1]))
+        elif head == "pe":
+            await self._project_edit(q, context, int(parts[1]), parts[2])
+        elif head == "ptoggle":
+            pid = int(parts[1])
+            pr = await self.db.get_project(pid)
+            await self.db.update_project(pid, hidden=0 if pr["hidden"] else 1)
+            await self._enqueue_project(pid)
+            await self._show_project(q, pid)
+        # sections
+        elif head == "sect":
+            await self._show_sections(q)
+        elif head == "sect_add":
+            self._set_await(context, "sec_create")
+            await q.edit_message_text("🆕 Пришлите название нового раздела "
+                                      "(можно с эмодзи в начале, напр. «🎬 Видео»):",
+                                      reply_markup=self._back("sect"))
+        elif head == "s":
+            await self._show_section(q, int(parts[1]))
+        elif head == "se":
+            await self._section_edit(q, context, int(parts[1]), parts[2])
+        # hashtags
+        elif head == "tags":
+            await self._show_tags(q)
+        elif head == "tag_add":
+            self._set_await(context, "tag_new")
+            await q.edit_message_text("🏷 Пришлите хэштег (без #), напр. <code>спойлеры</code>:",
+                                      reply_markup=self._back("tags"),
+                                      parse_mode=ParseMode.HTML)
+        elif head == "tagdel":
+            await self.db.delete_hashtag(parts[1])
+            await self._show_tags(q)
+        elif head == "tagbind":
+            # tagbind:<kind>:<target_id> — uses tag stored in user_data
+            tag = context.user_data.get("new_tag")
+            if not tag:
+                await q.edit_message_text("Сессия истекла, начните заново.",
+                                          reply_markup=self._back("tags"))
+                return
+            await self.db.set_hashtag(tag, parts[1], int(parts[2]))
+            context.user_data.pop("new_tag", None)
+            await q.edit_message_text(f"✅ #{esc(tag)} привязан.",
+                                      reply_markup=self._back("tags"))
+        # chapters
+        elif head == "chap":
+            self._set_await(context, "ch_find")
+            await q.edit_message_text("📖 Пришлите запрос для поиска главы "
+                                      "(номер / арка / проект):",
+                                      reply_markup=self._back())
+        elif head == "c":
+            await self._show_chapter(q, int(parts[1]))
+        elif head == "ce":
+            await self._chapter_edit(q, context, int(parts[1]), parts[2])
 
+    def _back(self, to: str = "menu") -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад",
+                                                           callback_data=to)]])
+
+    def _set_await(self, context, action: str, **kw) -> None:
+        context.user_data["await"] = {"a": action, **kw}
+
+    # ── projects CRUD ────────────────────────────────────────────────────────
+    async def _show_projects(self, q) -> None:
+        projects = await self.db.list_projects(include_hidden=True)
+        kb = []
+        for p in projects:
+            cnt = await self.db.count_chapters(p["id"])
+            tag = " 🙈" if p["hidden"] else ""
+            kb.append([InlineKeyboardButton(
+                f"{p['emoji']} {p['canonical_name']} ({cnt}){tag}",
+                callback_data=f"p:{p['id']}")])
+        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+        await q.edit_message_text("📚 <b>Проекты</b> — выберите для редактирования:",
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _show_project(self, q, pid: int) -> None:
+        p = await self.db.get_project(pid)
+        if not p:
+            await q.edit_message_text("Проект не найден.", reply_markup=self._back("proj"))
+            return
+        cnt = await self.db.count_chapters(pid)
+        ext = {e["platform"]: e["url"] for e in await self.db.list_external_links(pid)}
+        lines = [f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>",
+                 f"Глав: {cnt} · Порядок: {p['sort_order']} · "
+                 f"{'СКРЫТ' if p['hidden'] else 'виден'}"]
+        for _code, col, label in PLATFORMS:
+            lines.append(f"{label}: {esc(ext.get(col, '—'))}")
+        kb = [
+            [InlineKeyboardButton("✏️ Имя", callback_data=f"pe:{pid}:name"),
+             InlineKeyboardButton("😀 Эмодзи", callback_data=f"pe:{pid}:emoji")],
+            [InlineKeyboardButton("📚 RanobeLib", callback_data=f"pe:{pid}:rl"),
+             InlineKeyboardButton("🖼 MangaLib", callback_data=f"pe:{pid}:ml")],
+            [InlineKeyboardButton("🌸 Senkuro", callback_data=f"pe:{pid}:sk"),
+             InlineKeyboardButton("💎 Boosty", callback_data=f"pe:{pid}:bo")],
+            [InlineKeyboardButton("↕️ Порядок", callback_data=f"pe:{pid}:order"),
+             InlineKeyboardButton("🙈 Скрыть/Показать", callback_data=f"ptoggle:{pid}")],
+            [InlineKeyboardButton("⬅️ К проектам", callback_data="proj")],
+        ]
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _project_edit(self, q, context, pid: int, field: str) -> None:
+        prompts = {"name": "новое название", "emoji": "новый эмодзи",
+                   "order": "число порядка (меньше = выше)",
+                   "rl": "ссылку RanobeLib (или «-» чтобы удалить)",
+                   "ml": "ссылку MangaLib (или «-»)",
+                   "sk": "ссылку Senkuro (или «-»)",
+                   "bo": "ссылку Boosty (или «-»)"}
+        self._set_await(context, f"p_{field}", pid=pid)
+        await q.edit_message_text(f"✏️ Пришлите {prompts.get(field, field)}:",
+                                  reply_markup=self._back(f"p:{pid}"))
+
+    async def _enqueue_project(self, pid: int) -> None:
+        await self.db.enqueue_build("project", pid)
+        await self.db.enqueue_build("root", None)
+
+    # ── sections CRUD ──────────────────────────────────────────────────────────
+    async def _show_sections(self, q) -> None:
+        secs = await self.db.list_sections(include_hidden=True)
+        kb = [[InlineKeyboardButton(f"{s['emoji']} {s['name']}",
+                                    callback_data=f"s:{s['id']}")] for s in secs]
+        kb.append([InlineKeyboardButton("🆕 Создать раздел", callback_data="sect_add")])
+        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+        await q.edit_message_text("🗂 <b>Разделы</b>:",
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _show_section(self, q, sid: int) -> None:
+        s = await self.db.get_section(sid)
+        if not s:
+            await q.edit_message_text("Раздел не найден.", reply_markup=self._back("sect"))
+            return
+        items = await self.db.list_items(section_id=sid)
+        kb = [
+            [InlineKeyboardButton("✏️ Имя", callback_data=f"se:{sid}:name"),
+             InlineKeyboardButton("😀 Эмодзи", callback_data=f"se:{sid}:emoji")],
+            [InlineKeyboardButton("↕️ Порядок", callback_data=f"se:{sid}:order"),
+             InlineKeyboardButton("🗑 Удалить", callback_data=f"se:{sid}:del")],
+            [InlineKeyboardButton("⬅️ К разделам", callback_data="sect")],
+        ]
+        await q.edit_message_text(
+            f"{s['emoji']} <b>{esc(s['name'])}</b>\nЗаписей: {len(items)} · "
+            f"Порядок: {s['sort_order']}",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    async def _section_edit(self, q, context, sid: int, field: str) -> None:
+        if field == "del":
+            await self.db.execute("DELETE FROM sections WHERE id=?", (sid,))
+            await self.db.enqueue_build("root", None)
+            await q.edit_message_text("🗑 Раздел удалён.", reply_markup=self._back("sect"))
+            return
+        prompts = {"name": "новое название", "emoji": "новый эмодзи",
+                   "order": "число порядка"}
+        self._set_await(context, f"s_{field}", sid=sid)
+        await q.edit_message_text(f"✏️ Пришлите {prompts.get(field, field)}:",
+                                  reply_markup=self._back(f"s:{sid}"))
+
+    # ── hashtags CRUD ──────────────────────────────────────────────────────────
+    async def _show_tags(self, q) -> None:
+        rows = await self.db.list_hashtags()
+        lines = ["🏷 <b>Хэштеги</b> (нажмите 🗑 чтобы удалить):"]
+        kb = []
+        for r in rows:
+            if r["kind"] == "project":
+                t = await self.db.get_project(r["target_id"])
+                name = t["canonical_name"] if t else "?"
+            else:
+                t = await self.db.get_section(r["target_id"])
+                name = t["name"] if t else "?"
+            lines.append(f"• #{esc(r['hashtag'])} → [{r['kind']}] {esc(name)}")
+            kb.append([InlineKeyboardButton(f"🗑 #{r['hashtag']}",
+                                            callback_data=f"tagdel:{r['hashtag']}")])
+        kb.append([InlineKeyboardButton("🆕 Добавить хэштег", callback_data="tag_add")])
+        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _tag_pick_target(self, message, context) -> None:
+        """After receiving a new tag, show projects+sections to bind it to."""
+        kb = []
+        for p in await self.db.list_projects(include_hidden=True):
+            kb.append([InlineKeyboardButton(f"📚 {p['emoji']} {p['canonical_name']}",
+                                            callback_data=f"tagbind:project:{p['id']}")])
+        for s in await self.db.list_sections(include_hidden=True):
+            kb.append([InlineKeyboardButton(f"🗂 {s['emoji']} {s['name']}",
+                                            callback_data=f"tagbind:category:{s['id']}")])
+        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+        tag = context.user_data.get("new_tag", "")
+        await message.reply_text(
+            f"К чему привязать #{esc(tag)}?",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    # ── chapters CRUD ──────────────────────────────────────────────────────────
+    async def _chapter_results(self, message, query: str) -> None:
+        res = await self.db.search(query, limit=20)
+        chapters = res["chapters"]
+        if not chapters:
+            await message.reply_text("Глав не найдено.", reply_markup=self._back())
+            return
+        kb = [[InlineKeyboardButton(
+            f"{c['project_emoji']} гл.{c['number']} {('· '+c['arc']) if c['arc'] else ''}",
+            callback_data=f"c:{c['id']}")] for c in chapters[:20]]
+        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+        await message.reply_text("Выберите главу для редактирования:",
+                                 reply_markup=InlineKeyboardMarkup(kb))
+
+    async def _show_chapter(self, q, cid: int) -> None:
+        c = await self.db.get_chapter(cid)
+        if not c:
+            await q.edit_message_text("Глава не найдена.", reply_markup=self._back())
+            return
+        proj = await self.db.get_project(c["project_id"])
+        lines = [f"📖 <b>{esc(proj['canonical_name'])}</b> гл. {c['number']}",
+                 f"Арка: {esc(c['arc'] or '—')}",
+                 f"Заголовок: {esc(c['title'] or '—')}",
+                 f"Telegraph: {esc(c['telegraph_url'])}"]
+        kb = [
+            [InlineKeyboardButton("№ Номер", callback_data=f"ce:{cid}:num"),
+             InlineKeyboardButton("📂 Арка", callback_data=f"ce:{cid}:arc")],
+            [InlineKeyboardButton("✏️ Заголовок", callback_data=f"ce:{cid}:title"),
+             InlineKeyboardButton("🔗 URL", callback_data=f"ce:{cid}:url")],
+            [InlineKeyboardButton("🗑 Удалить главу", callback_data=f"ce:{cid}:del")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+        ]
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _chapter_edit(self, q, context, cid: int, field: str) -> None:
+        c = await self.db.get_chapter(cid)
+        if not c:
+            return
+        if field == "del":
+            await self.db.delete_chapter(cid)
+            await self._enqueue_project(c["project_id"])
+            await q.edit_message_text("🗑 Глава удалена.", reply_markup=self._back())
+            return
+        prompts = {"num": "новый номер главы", "arc": "новую арку",
+                   "title": "новый заголовок", "url": "новый Telegraph URL"}
+        self._set_await(context, f"ch_{field}", cid=cid)
+        await q.edit_message_text(f"✏️ Пришлите {prompts[field]}:",
+                                  reply_markup=self._back(f"c:{cid}"))
+
+    # ── pending free-text input ──────────────────────────────────────────────
+    async def _handle_pending(self, update: Update, context) -> None:
+        await_data = context.user_data.pop("await")
+        action = await_data["a"]
+        text = update.effective_message.text.strip()
+        msg = update.effective_message
+
+        # projects
+        if action.startswith("p_"):
+            pid = await_data["pid"]
+            field = action[2:]
+            if field == "name":
+                await self.db.update_project(pid, canonical_name=text)
+            elif field == "emoji":
+                await self.db.update_project(pid, emoji=text[:8])
+            elif field == "order":
+                await self.db.update_project(pid, sort_order=_int(text, 100))
+            elif field in ("rl", "ml", "sk", "bo"):
+                col, _label = PLATFORM_BY_CODE[field]
+                await self._set_project_link(pid, col, "" if text == "-" else text)
+            await self._enqueue_project(pid)
+            await msg.reply_text("✅ Сохранено. Страница пересобирается.",
+                                 reply_markup=self._back(f"p:{pid}"))
+
+        # sections
+        elif action.startswith("s_"):
+            sid = await_data["sid"]
+            field = action[2:]
+            if field == "name":
+                await self.db.update_section(sid, name=text)
+            elif field == "emoji":
+                await self.db.update_section(sid, emoji=text[:8])
+            elif field == "order":
+                await self.db.update_section(sid, sort_order=_int(text, 100))
+            await self.db.enqueue_build("section", sid)
+            await self.db.enqueue_build("root", None)
+            await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"s:{sid}"))
+
+        elif action == "sec_create":
+            emoji, _, name = text.partition(" ")
+            if not name:
+                emoji, name = "📁", text
+            sid = await self.db.upsert_section(
+                key=f"sec_{slugify(name)}", name=name.strip(),
+                slug=slugify(name), emoji=emoji)
+            await self.db.enqueue_build("root", None)
+            await msg.reply_text(f"✅ Раздел «{esc(name)}» создан.",
+                                 reply_markup=self._back("sect"))
+
+        # hashtag add: got the tag, now ask for target
+        elif action == "tag_new":
+            tag = text.lstrip("#").lower().split()[0]
+            context.user_data["new_tag"] = tag
+            await self._tag_pick_target(msg, context)
+
+        # chapters
+        elif action.startswith("ch_"):
+            cid = await_data["cid"]
+            field = action[3:]
+            c = await self.db.get_chapter(cid)
+            if not c:
+                await msg.reply_text("Глава пропала.")
+                return
+            try:
+                if field == "num":
+                    await self.db.update_chapter(cid, number=int(text))
+                elif field == "arc":
+                    await self.db.update_chapter(cid, arc=text)
+                elif field == "title":
+                    await self.db.update_chapter(cid, title=text)
+                elif field == "url":
+                    await self.db.update_chapter(cid, telegraph_url=text)
+                await self._enqueue_project(c["project_id"])
+                await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"c:{cid}"))
+            except Exception as e:  # noqa: BLE001
+                await msg.reply_text(f"❌ {esc(e)}", reply_markup=self._back(f"c:{cid}"))
+
+        elif action == "ch_find":
+            await self._chapter_results(msg, text)
+
+    async def _set_project_link(self, pid: int, platform: str, url: str) -> None:
+        # external_links table drives the rendered "Читать на других площадках"
+        await self.db.execute(
+            "DELETE FROM external_links WHERE project_id=? AND platform=?",
+            (pid, platform))
+        if url:
+            await self.db.add_external_link(pid, platform, url, manual=1)
+        # keep the projects.<platform>_url column in sync for the API
+        await self.db.update_project(pid, **{f"{platform}_url": url})
+
+    # ── conflicts ──────────────────────────────────────────────────────────────
     async def _show_conflicts(self, q) -> None:
         rows = await self.db.fetchall(
             "SELECT * FROM conflicts WHERE status='open' ORDER BY id DESC LIMIT 8")
         if not rows:
-            text = "✅ Открытых конфликтов нет."
-            kb = [[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]]
-        else:
-            lines = ["<b>⚠️ Открытые конфликты:</b>"]
-            kb = []
-            for r in rows:
-                lines.append(f"• #{r['id']} [{r['type']}] {r['detail'][:80]}")
-                kb.append([InlineKeyboardButton(
-                    f"✓ Решить #{r['id']}", callback_data=f"conf_resolve:{r['id']}")])
-            kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
-            text = "\n".join(lines)
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb),
-                                  parse_mode=ParseMode.HTML)
-
-    async def _show_projects(self, q) -> None:
-        projects = await self.db.list_projects(include_hidden=True)
-        lines = ["<b>📚 Проекты:</b>"]
-        for p in projects:
-            cnt = await self.db.count_chapters(p["id"])
-            vis = "" if not p["hidden"] else " (скрыт)"
-            lines.append(f"• {p['emoji']} {p['canonical_name']} — {cnt} глав{vis}")
-        lines.append("\nПолное редактирование — в Mini App админке.")
-        kb = [[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]]
-        await q.edit_message_text("\n".join(lines),
-                                  reply_markup=InlineKeyboardMarkup(kb),
-                                  parse_mode=ParseMode.HTML)
-
-    async def _show_hashtags(self, q) -> None:
-        rows = await self.db.list_hashtags()
-        lines = ["<b>🏷 Хэштеги:</b>"]
+            await q.edit_message_text("✅ Открытых конфликтов нет.",
+                                      reply_markup=self._back())
+            return
+        lines = ["<b>⚠️ Конфликты:</b>"]
+        kb = []
         for r in rows:
-            target = r["target_id"]
-            if r["kind"] == "project":
-                proj = await self.db.get_project(target)
-                name = proj["canonical_name"] if proj else f"#{target}"
-            else:
-                sec = await self.db.get_section(target)
-                name = sec["name"] if sec else f"#{target}"
-            lines.append(f"• #{r['hashtag']} → [{r['kind']}] {name}")
-        lines.append("\nПривязка/правка хэштегов — в Mini App админке.")
-        kb = [[InlineKeyboardButton("⬅️ Меню", callback_data="menu")]]
+            lines.append(f"• #{r['id']} [{esc(r['type'])}] {esc(r['detail'][:70])}")
+            kb.append([InlineKeyboardButton(f"✓ Решить #{r['id']}",
+                                            callback_data=f"conf:{r['id']}")])
+        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
         await q.edit_message_text("\n".join(lines),
                                   reply_markup=InlineKeyboardMarkup(kb),
                                   parse_mode=ParseMode.HTML)
+
+
+def _int(s: str, default: int) -> int:
+    try:
+        return int(s)
+    except ValueError:
+        return default
