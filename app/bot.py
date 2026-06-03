@@ -150,19 +150,20 @@ class BotApp:
         """Set the ≡ command menu: basic for everyone, full for each admin."""
         bot = self.application.bot
         try:
-            proj_cmds = await self._project_commands()
-            await bot.set_my_commands(PUBLIC_COMMANDS + proj_cmds,
-                                      scope=BotCommandScopeDefault())
+            # build the command→project map (so /<key> still works if typed) but
+            # DON'T clutter the ≡ menu with one command per project — quick title
+            # access is the "📚 Тайтлы" reply button, which scales to dozens.
+            await self._project_commands()
+            await bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
             admin_ids = set(self.cfg.owner_user_ids) | await self._channel_admin_ids(force=True)
             for uid in admin_ids:
                 try:
                     await bot.set_my_commands(
-                        ADMIN_COMMANDS + proj_cmds, scope=BotCommandScopeChat(chat_id=uid))
+                        ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
                     self._cmd_admins.add(uid)
                 except Exception as e:  # noqa: BLE001
                     log.debug("set admin commands for %s skipped: %s", uid, e)
-            log.info("command menus set (%d admins, %d projects)",
-                     len(admin_ids), len(proj_cmds))
+            log.info("command menus set (%d admins)", len(admin_ids))
         except Exception as e:  # noqa: BLE001
             log.warning("set_my_commands failed: %s", e)
 
@@ -330,8 +331,7 @@ class BotApp:
             "📌 Полная навигация по всем проектам закреплена в канале.\n\n"
             "Попробуйте прямо сейчас — пришлите название любого тайтла 👇")
         text += ("\n\n👇 Меню под полем ввода: <b>📚 Тайтлы</b> — список всех "
-                 "проектов. Тайтл также можно открыть командой <code>/&lt;тайтл&gt;</code> "
-                 "из меню ≡.")
+                 "проектов.")
         if is_adm:
             text += "\n\n🛠 <b>Вы администратор.</b> Управление: /menu"
         await update.message.reply_text(
@@ -872,6 +872,16 @@ class BotApp:
             await self._show_section(q, int(parts[1]))
         elif head == "se":
             await self._section_edit(q, context, int(parts[1]), parts[2])
+        elif head == "stags":
+            await self._show_section_tags(q, int(parts[1]))
+        elif head == "stagadd":
+            self._set_await(context, "stag_new", sid=int(parts[1]))
+            await q.edit_message_text(
+                "🏷 Пришлите хэштег (без #), который привязать к этому разделу:",
+                reply_markup=self._back(f"stags:{parts[1]}"))
+        elif head == "stagdel":
+            await self.db.delete_hashtag(parts[2])
+            await self._show_section_tags(q, int(parts[1]))
         elif head == "sdel":
             sid = int(parts[1])
             s = await self.db.get_section(sid)
@@ -920,6 +930,17 @@ class BotApp:
 
     def _set_await(self, context, action: str, **kw) -> None:
         context.user_data["await"] = {"a": action, **kw}
+
+    @staticmethod
+    def _split_emoji_name(text: str, default_emoji: str) -> tuple[str, str]:
+        """Parse "🌘 Имя" → (emoji, name). The first token is treated as an
+        emoji ONLY if it has no word characters; otherwise the whole text is the
+        name (so "Стал Покровителем Злодеев" is not split)."""
+        text = text.strip()
+        first, _, rest = text.partition(" ")
+        if rest and first and not re.search(r"\w", first):
+            return first, rest.strip()
+        return default_emoji, text
 
     # ── projects CRUD ────────────────────────────────────────────────────────
     async def _show_projects(self, q) -> None:
@@ -1001,6 +1022,26 @@ class BotApp:
             lines.append("— тегов пока нет —")
         kb.append([InlineKeyboardButton("🆕 Добавить хэштег", callback_data=f"ptagadd:{pid}")])
         kb.append([InlineKeyboardButton("⬅️ К проекту", callback_data=f"p:{pid}")])
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
+
+    async def _show_section_tags(self, q, sid: int) -> None:
+        s = await self.db.get_section(sid)
+        rows = [r for r in await self.db.list_hashtags()
+                if r["kind"] == "category" and r["target_id"] == sid]
+        lines = [f"🏷 <b>Хэштеги раздела</b> {s['emoji']} {esc(s['name'])}",
+                 "Посты с этими тегами попадают в этот раздел."]
+        kb = []
+        if rows:
+            for r in rows:
+                lines.append(f"• #{esc(r['hashtag'])}")
+                kb.append([InlineKeyboardButton(
+                    f"🗑 #{r['hashtag']}", callback_data=f"stagdel:{sid}:{r['hashtag']}")])
+        else:
+            lines.append("— тегов пока нет —")
+        kb.append([InlineKeyboardButton("🆕 Добавить хэштег", callback_data=f"stagadd:{sid}")])
+        kb.append([InlineKeyboardButton("⬅️ К разделу", callback_data=f"s:{sid}")])
         await q.edit_message_text("\n".join(lines),
                                   reply_markup=InlineKeyboardMarkup(kb),
                                   parse_mode=ParseMode.HTML)
@@ -1167,8 +1208,9 @@ class BotApp:
             [InlineKeyboardButton("✏️ Имя", callback_data=f"se:{sid}:name"),
              InlineKeyboardButton("😀 Эмодзи", callback_data=f"se:{sid}:emoji")],
             [InlineKeyboardButton("📝 Записи", callback_data=f"sitems:{sid}"),
-             InlineKeyboardButton("↕️ Порядок", callback_data=f"se:{sid}:order")],
-            [InlineKeyboardButton("🗑 Удалить раздел", callback_data=f"sdel:{sid}")],
+             InlineKeyboardButton("🏷 Хэштеги раздела", callback_data=f"stags:{sid}")],
+            [InlineKeyboardButton("↕️ Порядок", callback_data=f"se:{sid}:order"),
+             InlineKeyboardButton("🗑 Удалить раздел", callback_data=f"sdel:{sid}")],
             [InlineKeyboardButton("⬅️ К разделам", callback_data="sect")],
         ]
         tags = [r["hashtag"] for r in await self.db.list_hashtags()
@@ -1318,10 +1360,7 @@ class BotApp:
             await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"s:{sid}"))
 
         elif action == "proj_create":
-            emoji, _, name = text.partition(" ")
-            if not name:
-                emoji, name = "📖", text
-            name = name.strip()
+            emoji, name = self._split_emoji_name(text, "📖")
             key = f"proj_{slugify(name)}"
             pid = await self.db.upsert_project(
                 key=key, canonical_name=name, slug=slugify(name), emoji=emoji)
@@ -1344,12 +1383,21 @@ class BotApp:
             else:
                 await msg.reply_text("Пустой хэштег.", reply_markup=self._back(f"ptags:{pid}"))
 
+        elif action == "stag_new":
+            sid = await_data["sid"]
+            tag = text.lstrip("#").lower().split()[0] if text.strip() else ""
+            if tag:
+                await self.db.set_hashtag(tag, "category", sid)
+                await self.db.enqueue_build("section", sid)
+                await msg.reply_text(f"✅ #{esc(tag)} привязан к разделу.",
+                                     reply_markup=self._back(f"stags:{sid}"))
+            else:
+                await msg.reply_text("Пустой хэштег.", reply_markup=self._back(f"stags:{sid}"))
+
         elif action == "sec_create":
-            emoji, _, name = text.partition(" ")
-            if not name:
-                emoji, name = "📁", text
+            emoji, name = self._split_emoji_name(text, "📁")
             sid = await self.db.upsert_section(
-                key=f"sec_{slugify(name)}", name=name.strip(),
+                key=f"sec_{slugify(name)}", name=name,
                 slug=slugify(name), emoji=emoji)
             await self.db.enqueue_build("root", None)
             await msg.reply_text(f"✅ Раздел «{esc(name)}» создан.",

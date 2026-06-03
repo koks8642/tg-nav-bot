@@ -77,10 +77,12 @@ class Rebuilder:
 
     async def _publish_tracked(self, kind: str, ref_id: int | None, title: str,
                                content: list[dict]) -> str:
-        """Publish a tracked page; skip the API call if content is unchanged."""
+        """Publish a tracked page; skip the API call only if BOTH the content
+        and the title are unchanged (the title carries the section/project name
+        and emoji, which Telegraph renders separately from the content)."""
         page = await self.db.get_page_for(kind, ref_id)
         new_hash = _hash(content)
-        if page and page["content_hash"] == new_hash:
+        if page and page["content_hash"] == new_hash and page["title"] == title:
             return page["path"]
         path = await self._publish(page["path"] if page else None, title, content)
         await self.db.save_page(path, kind, ref_id, title, new_hash)
