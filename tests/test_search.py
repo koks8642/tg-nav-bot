@@ -48,6 +48,12 @@ def test_search_variants(tmp_path):
             # project name match
             r5 = await db.search("покровител")
             assert any(p["key"] == "pokrovitel" for p in r5["projects"])
+
+            # project HASHTAG match: "покровитель" isn't a substring of the
+            # canonical name ("…Покровителем…") but is a bound hashtag → the
+            # project must still appear in results (so the bot shows its card)
+            r6 = await db.search("покровитель")
+            assert any(p["key"] == "pokrovitel" for p in r6["projects"])
         finally:
             await db.close()
     asyncio.run(go())

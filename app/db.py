@@ -561,12 +561,21 @@ class Database:
                 "ORDER BY sort_order LIMIT 10", (like,))
             projects = [dict(r) for r in rows]
             scope_ids = [p["id"] for p in projects]
-            # each word might be a hashtag synonym pointing at a project
+            proj_ids = {p["id"] for p in projects}
+            # a word may be a project hashtag (e.g. "покровитель") even when it is
+            # not a substring of the canonical name ("…Покровителем…") — surface
+            # that project too, so a name query shows the project card.
             for w in words:
                 mapping = await self.get_hashtag(w)
                 if mapping and mapping["kind"] == "project":
-                    if mapping["target_id"] not in scope_ids:
-                        scope_ids.append(mapping["target_id"])
+                    pid = mapping["target_id"]
+                    if pid not in proj_ids:
+                        pr = await self.get_project(pid)
+                        if pr and not pr["hidden"]:
+                            projects.append(dict(pr))
+                            proj_ids.add(pid)
+                    if pid not in scope_ids:
+                        scope_ids.append(pid)
 
         # ── chapters ──────────────────────────────────────────────────────────
         conds, params = ["1=1"], []

@@ -508,16 +508,22 @@ class BotApp:
         if not p:
             return "Проект не найден.", None
         cnt = await self.db.count_chapters(pid)
+        arcs = await self.db.list_arcs(pid)
+        cats = await self.db.project_sections_with_items(pid)
         ext = {e["platform"]: e["url"] for e in await self.db.list_external_links(pid)}
-        lines = [f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>",
-                 f"📚 Глав: {cnt}"]
-        plat = " · ".join(
+        lines = [f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>", ""]
+        stats = [f"📖 Глав: <b>{cnt}</b>"]
+        if arcs:
+            stats.append(f"арок: {len(arcs)}")
+        lines.append(" · ".join(stats))
+        plat = "  ".join(
             f'<a href="{esc(ext[col])}">{label}</a>'
             for _code, col, label in PLATFORMS if ext.get(col))
         if plat:
-            lines.append("🌐 " + plat)
+            lines.append(f"🌐 Читать на: {plat}")
+        lines.append("")
+        lines.append("Выберите, что открыть 👇")
         kb = [[InlineKeyboardButton("📖 Главы", callback_data=f"arcs:{pid}")]]
-        cats = await self.db.project_sections_with_items(pid)
         row = []
         for s in cats:
             row.append(InlineKeyboardButton(f"{s['emoji']} {s['name']} ({s['n']})",
