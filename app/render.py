@@ -141,10 +141,8 @@ def _group_by_arc(chapters: list) -> list[tuple[str, list]]:
 
 
 def render_project_header(project, external_links, chapter_count: int) -> list[dict]:
-    content: list[dict] = [
-        h3(f"{project['emoji']} {project['canonical_name']}"),
-        p(b(f"Всего глав: {chapter_count}")),
-    ]
+    # Telegraph renders the page title itself, so we don't repeat the name here.
+    content: list[dict] = [p(b(f"Всего глав: {chapter_count}"))]
     content += _external_block(external_links)
     return content
 
@@ -221,7 +219,8 @@ def render_project_index(project, external_links, part_paths: list[str],
 
 def render_section(section, items: list, post_urls: dict[int, str],
                    home_path: str | None = None) -> list[dict]:
-    content: list[dict] = [h3(f"{section['emoji']} {section['name']}")]
+    # Telegraph renders the page title itself — no repeated heading here.
+    content: list[dict] = []
     if not items:
         content.append(p("— пока пусто —"))
     else:

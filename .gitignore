@@ -19,6 +19,7 @@ venv/
 
 # Claude / editor local
 .claude/
+.tools/
 .DS_Store
 Thumbs.db
 .idea/
