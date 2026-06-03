@@ -19,6 +19,12 @@ def transliterate(text: str) -> str:
     return "".join(out)
 
 
+def clip(text: str | None, max_len: int = 80) -> str:
+    """First line of a title, trimmed to max_len chars + … (for list display)."""
+    s = (text or "Без названия").splitlines()[0].strip()
+    return s if len(s) <= max_len else s[:max_len].rstrip() + "…"
+
+
 def slugify(text: str, max_len: int = 60) -> str:
     s = transliterate(text or "")
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")

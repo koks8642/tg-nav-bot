@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from .telegraph import MAX_CONTENT_BYTES, content_size
+from .util import clip
 
 PLATFORM_LABELS = {
     "ranobelib": "📚 RanobeLib",
@@ -244,8 +245,8 @@ def render_section(section, items: list, post_urls: dict[int, str],
     else:
         lis = []
         for it in items:
-            title = it["title"] or "Без названия"
-            # the content is the post itself → link the title straight to it
+            # the content is the post itself → link the (clipped) title to it
+            title = clip(it["title"])
             url = it["url"] or post_urls.get(it["post_id"], "")
             lis.append(li(a(title, url)) if url else li(title))
         content.append(ul(lis))
