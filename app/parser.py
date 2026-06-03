@@ -176,6 +176,12 @@ def _header_arc(text: str) -> str | None:
         if not s:
             continue
         if _BARE_CHAPTER_LINE_RE.match(s):
+            # the chapter line itself may carry the arc, e.g.
+            # "Глава 58 «Возвращение»" (single-chapter live format)
+            for m in _HEADER_ARC_RE.finditer(s):
+                cand = m.group(1).strip()
+                if not _looks_like_project_name(cand):
+                    return cand
             break
         header_lines.append(s)
         if len(header_lines) >= 10:

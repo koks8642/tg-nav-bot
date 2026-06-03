@@ -108,6 +108,32 @@ def test_pack_arc_from_label_beats_header():
     assert [c.arc for c in chapters] == ["Арена", "Арена"]
 
 
+def test_single_chapter_arc_on_chapter_line():
+    # live single-chapter format with arc on the same line as "Глава N",
+    # plus a bare telegraph URL (no parseable label)
+    post = _post(
+        text="#гений\nГлава 58 «Возвращение»",
+        plain=["https://telegra.ph/x-Glava-58-Vozvrashchenie-06-03"],
+    )
+    chapters = extract_chapters(post)
+    assert len(chapters) == 1
+    assert chapters[0].number == 58
+    assert chapters[0].arc == "Возвращение"
+
+
+def test_hashtag_and_arc_with_trailing_tag():
+    # hashtag on its own line at the END must still be detected, and the arc
+    # «Финал» from the header must still parse (pack format, bare URLs)
+    post = _post(
+        text="🎁 Новые главы 🎁\nГлавы 305-307 «Финал»\n#покровитель",
+        plain=[f"https://telegra.ph/x-Glava-{n}-Final-06-03" for n in (305, 306, 307)],
+    )
+    assert post.hashtags == ["покровитель"]
+    chapters = extract_chapters(post)
+    assert [c.number for c in chapters] == [305, 306, 307]
+    assert all(c.arc == "Финал" for c in chapters)
+
+
 def test_prologue_normalised():
     post = _post(anchors=[(
         "https://telegra.ph/x-Glava-0-Prolog-10-25", "Глава 0 (пролог)")])

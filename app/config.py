@@ -61,11 +61,16 @@ class Config:
 
     @property
     def channel_internal_id(self) -> str:
-        return CHANNEL_INTERNAL_ID
+        """Internal channel id (for t.me/c/ links), derived from the Bot API
+        chat_id by stripping the -100 supergroup/channel prefix."""
+        s = str(self.channel_chat_id)
+        if s.startswith("-100"):
+            return s[4:]
+        return s.lstrip("-")
 
     def post_url(self, message_id: int) -> str:
-        """Build a link to a post inside the private channel."""
-        return f"https://t.me/c/{CHANNEL_INTERNAL_ID}/{message_id}"
+        """Build a link to a post inside the (private) channel."""
+        return f"https://t.me/c/{self.channel_internal_id}/{message_id}"
 
     def is_owner(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.owner_user_ids
