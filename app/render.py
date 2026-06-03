@@ -227,16 +227,10 @@ def render_section(section, items: list, post_urls: dict[int, str],
     else:
         lis = []
         for it in items:
-            children: list[Any] = []
             title = it["title"] or "Без названия"
-            if it["url"]:
-                children.append(a(title, it["url"]))
-            else:
-                children.append(title)
-            post_url = post_urls.get(it["post_id"])
-            if post_url:
-                children += ["  •  ", a("💬 Пост", post_url)]
-            lis.append(li(*children))
+            # the content is the post itself → link the title straight to it
+            url = it["url"] or post_urls.get(it["post_id"], "")
+            lis.append(li(a(title, url)) if url else li(title))
         content.append(ul(lis))
     if home_path:
         content.append(hr())

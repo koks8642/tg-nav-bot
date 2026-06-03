@@ -10,6 +10,7 @@ guessing from the title text.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from .config import Config
@@ -128,23 +129,23 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
     return res
 
 
+_TITLE_HASHTAG_RE = re.compile(r"#[0-9A-Za-zЀ-ӿ_]+")
+
+
 async def _store_category_item(db: Database, post: ParsedPost, section_id: int,
                                project_id: int | None, tg_url: str,
                                date: str | None) -> None:
-    # title = first non-empty line of the post (without the hashtag noise)
+    """Category content (art/meme/note/announce) lives in the Telegram post
+    itself (image + text), not on Telegraph. So the navigation entry is just the
+    post's first meaningful line + a link to the post in the channel.
+    """
     title = ""
     for line in post.text.splitlines():
-        s = line.strip()
-        if s and not s.startswith("#"):
-            title = s[:200]
+        cleaned = _TITLE_HASHTAG_RE.sub("", line).strip()
+        if cleaned:
+            title = cleaned[:200]
             break
-    # prefer a content url (telegraph or first link) over the post link
-    url = ""
-    if post.telegraph_anchors:
-        url = post.telegraph_anchors[0].url
-    elif post.all_urls:
-        url = post.all_urls[0]
-    await db.add_item(section_id, project_id, title or "Без названия", url or tg_url,
+    await db.add_item(section_id, project_id, title or "Без названия", tg_url,
                       post.message_id, date)
 
 

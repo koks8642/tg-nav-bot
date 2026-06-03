@@ -89,14 +89,15 @@ def test_category_hashtag_creates_item(tmp_path):
     async def go():
         db, cfg = await _fresh_db(tmp_path / "c.db")
         try:
-            post = _post(3, "Крутой арт по проекту #арты",
-                         anchors=[("https://telegra.ph/art-page", "Смотреть")])
+            post = _post(3, "Крутой арт главного героя\n#арты")
             res = await process_post(db, cfg, post)
             assert res.action == "category"
             sec = await db.get_section_by_key("arty")
             items = await db.list_items(section_id=sec["id"])
             assert len(items) == 1
-            assert items[0]["url"] == "https://telegra.ph/art-page"
+            # title = first line without the hashtag; url = link to the post itself
+            assert items[0]["title"] == "Крутой арт главного героя"
+            assert items[0]["url"] == cfg.post_url(3)
         finally:
             await db.close()
     asyncio.run(go())
