@@ -590,7 +590,57 @@ class Database:
         )
         params.append(limit)
         chapters = [dict(r) for r in await self.fetchall(sql, params)]
-        return {"projects": projects, "chapters": chapters}
+
+        # ── sections + items (only for free-text queries) ─────────────────────
+        sections: list[dict] = []
+        items: list[dict] = []
+        if text:
+            sections = [dict(r) for r in await self.fetchall(
+                "SELECT * FROM sections WHERE hidden=0 AND pylower(name) LIKE ? "
+                "ORDER BY sort_order LIMIT 10", (like,))]
+            items = [dict(r) for r in await self.fetchall(
+                "SELECT i.*, s.name AS section_name, s.emoji AS section_emoji "
+                "FROM items i LEFT JOIN sections s ON s.id=i.section_id "
+                "WHERE pylower(i.title) LIKE ? ORDER BY i.date DESC LIMIT ?",
+                (like, limit))]
+        return {"projects": projects, "chapters": chapters,
+                "sections": sections, "items": items}
+
+    # ── project card helpers (bot) ────────────────────────────────────────────
+    async def list_arcs(self, project_id: int) -> list[aiosqlite.Row]:
+        """Arcs of a project ordered by their first chapter number."""
+        return await self.fetchall(
+            "SELECT COALESCE(arc,'Без арки') AS arc, COUNT(*) AS n, "
+            "MIN(number) AS first_num, MAX(number) AS last_num "
+            "FROM chapters WHERE project_id=? GROUP BY COALESCE(arc,'Без арки') "
+            "ORDER BY first_num", (project_id,))
+
+    async def chapters_in_arc(self, project_id: int, arc: str) -> list[aiosqlite.Row]:
+        if arc == "Без арки":
+            return await self.fetchall(
+                "SELECT * FROM chapters WHERE project_id=? AND arc IS NULL "
+                "ORDER BY number", (project_id,))
+        return await self.fetchall(
+            "SELECT * FROM chapters WHERE project_id=? AND arc=? ORDER BY number",
+            (project_id, arc))
+
+    async def project_sections_with_items(self, project_id: int) -> list[aiosqlite.Row]:
+        """Sections that have at least one item tied to this project."""
+        return await self.fetchall(
+            "SELECT s.id, s.name, s.emoji, COUNT(i.id) AS n "
+            "FROM items i JOIN sections s ON s.id=i.section_id "
+            "WHERE i.project_id=? GROUP BY s.id ORDER BY s.sort_order", (project_id,))
+
+    async def count_items(self, project_id: int | None = None,
+                          section_id: int | None = None) -> int:
+        conds, params = [], []
+        if project_id is not None:
+            conds.append("project_id=?"); params.append(project_id)
+        if section_id is not None:
+            conds.append("section_id=?"); params.append(section_id)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        row = await self.fetchone("SELECT COUNT(*) c FROM items" + where, params)
+        return row["c"] if row else 0
 
     # ── stats / health ───────────────────────────────────────────────────────
     async def stats(self) -> dict[str, int]:

@@ -54,13 +54,10 @@ PUBLIC_COMMANDS = [
     BotCommand("help", "Подсказка по поиску"),
 ]
 ADMIN_COMMANDS = [
-    BotCommand("menu", "🛠 Админка (проекты, разделы, теги, главы)"),
-    BotCommand("links", "🔗 Ссылки на Telegraph-страницы"),
-    BotCommand("health", "📊 Статус и счётчики"),
-    BotCommand("rebuild", "♻️ Пересобрать все страницы"),
-    BotCommand("id", "🆔 Мой user_id"),
+    BotCommand("menu", "🛠 Админка (проекты, разделы, хэштеги, конфликты)"),
     BotCommand("help", "🔎 Подсказка по поиску"),
 ]
+# /links, /health, /rebuild stay registered but hidden from the menu.
 
 
 def esc(s) -> str:
@@ -285,39 +282,55 @@ class BotApp:
 
 
     # ── search (everyone) ─────────────────────────────────────────────────────
-    async def _search_html(self, query: str, limit: int = 20) -> str:
-        res = await self.db.search(query, limit=limit)
+    @staticmethod
+    def _has_number(query: str) -> bool:
+        return any(t.isdigit() for t in query.split())
+
+    async def _search_html(self, res: dict, query: str) -> str:
+        """Compact text results for chapters / sections / items."""
         posts = await self._post_urls()
         out: list[str] = []
-        for p in res["projects"][:6]:
-            page = await self.db.get_page_for("project", p["id"])
+        for c in res["chapters"][:25]:
+            head = (f"{c['project_emoji']} <b>{esc(c['project_name'])}</b> "
+                    f"гл. {c['number']}")
+            if c["arc"]:
+                head += f" · {esc(c['arc'])}"
+            links = [f'<a href="{esc(c["telegraph_url"])}">📖 Читать</a>']
+            purl = posts.get(c["post_id"])
+            if purl:
+                links.append(f'<a href="{esc(purl)}">💬 Пост</a>')
+            out.append(head + "\n   " + " · ".join(links))
+        for s in res.get("sections", [])[:6]:
+            page = await self.db.get_page_for("section", s["id"])
             if page:
-                out.append(f"{p['emoji']} <a href=\"https://telegra.ph/"
-                           f"{page['path']}\">{esc(p['canonical_name'])}</a>")
+                out.append(f'{s["emoji"]} <a href="https://telegra.ph/'
+                           f'{page["path"]}">{esc(s["name"])}</a>')
             else:
-                out.append(f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>")
-        chapters = res["chapters"]
-        if chapters:
-            if out:
-                out.append("")
-            for c in chapters:
-                head = (f"{c['project_emoji']} <b>{esc(c['project_name'])}</b> "
-                        f"гл. {c['number']}")
-                if c["arc"]:
-                    head += f" · {esc(c['arc'])}"
-                links = [f"<a href=\"{esc(c['telegraph_url'])}\">📖 Читать</a>"]
-                purl = posts.get(c["post_id"])
-                if purl:
-                    links.append(f"<a href=\"{esc(purl)}\">💬 Пост</a>")
-                out.append(head + "\n   " + " · ".join(links))
+                out.append(f'{s["emoji"]} <b>{esc(s["name"])}</b>')
+        for it in res.get("items", [])[:12]:
+            emoji = it.get("section_emoji") or "•"
+            out.append(f'{emoji} <a href="{esc(it["url"])}">'
+                       f'{esc(it["title"] or "Без названия")}</a>')
         if not out:
-            return "Ничего не найдено. Попробуйте номер главы или название."
-        header = f"🔎 Результаты по «{esc(query)}»:\n\n"
-        return header + "\n".join(out)
+            return "Ничего не найдено. Попробуйте номер главы, арку или название."
+        return f"🔎 Результаты по «{esc(query)}»:\n\n" + "\n".join(out)
 
     async def _do_search(self, message, query: str) -> None:
         try:
-            html = await self._search_html(query)
+            res = await self.db.search(query, limit=30)
+            # a project name/hashtag with no chapter number → show its card
+            if not self._has_number(query) and res["projects"]:
+                if len(res["projects"]) == 1:
+                    await self._send_project_card(message, res["projects"][0]["id"])
+                    return
+                kb = [[InlineKeyboardButton(f"{p['emoji']} {p['canonical_name']}",
+                                            callback_data=f"card:{p['id']}")]
+                      for p in res["projects"][:8]]
+                await message.reply_text(
+                    "Нашёл несколько проектов — выберите:",
+                    reply_markup=InlineKeyboardMarkup(kb))
+                return
+            html = await self._search_html(res, query)
         except Exception as e:  # noqa: BLE001
             log.exception("search failed")
             html = f"Ошибка поиска: {esc(e)}"
@@ -368,11 +381,7 @@ class BotApp:
             [InlineKeyboardButton("📚 Проекты", callback_data="proj"),
              InlineKeyboardButton("🗂 Разделы", callback_data="sect")],
             [InlineKeyboardButton("🏷 Хэштеги", callback_data="tags"),
-             InlineKeyboardButton("📖 Главы", callback_data="chap")],
-            [InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts"),
-             InlineKeyboardButton("📊 Health", callback_data="health")],
-            [InlineKeyboardButton("🔗 Ссылки", callback_data="links_cb"),
-             InlineKeyboardButton("♻️ Пересобрать", callback_data="rebuild_all")],
+             InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts")],
         ])
 
     async def _send_menu(self, message) -> None:
@@ -420,20 +429,136 @@ class BotApp:
         return "\n".join(lines)
 
     # ── callbacks router ────────────────────────────────────────────────────────
+    # callbacks anyone may use (the public project card navigation)
+    _PUBLIC_CB = {"card", "arcs", "arc", "pcat"}
+
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
-        if not q or not await self.is_admin(q.from_user.id):
-            if q:
-                await q.answer("Нет доступа", show_alert=True)
+        if not q:
+            return
+        data = q.data or ""
+        head = data.split(":")[0]
+        if head in self._PUBLIC_CB:
+            await q.answer()
+            try:
+                await self._route_public(q, data)
+            except Exception as e:  # noqa: BLE001
+                log.exception("public callback failed")
+                await q.answer(f"Ошибка: {e}", show_alert=True)
+            return
+        if not await self.is_admin(q.from_user.id):
+            await q.answer("Нет доступа", show_alert=True)
             return
         await q.answer()
-        data = q.data or ""
         try:
             await self._route(q, context, data)
         except Exception as e:  # noqa: BLE001
             log.exception("callback failed")
             await q.message.reply_text(f"Ошибка: {esc(e)}")
+
+    # ── public project card + arc navigation (everyone) ───────────────────────
+    async def _route_public(self, q, data: str) -> None:
+        parts = data.split(":")
+        head = parts[0]
+        if head == "card":
+            text, kb = await self._card_text_kb(int(parts[1]))
+            await q.edit_message_text(text, reply_markup=kb,
+                                      parse_mode=ParseMode.HTML,
+                                      disable_web_page_preview=True)
+        elif head == "arcs":
+            await self._show_arcs(q, int(parts[1]))
+        elif head == "arc":
+            await self._show_arc_chapters(q, int(parts[1]), int(parts[2]))
+        elif head == "pcat":
+            await self._show_project_category(q, int(parts[1]), int(parts[2]))
+
+    async def _card_text_kb(self, pid: int):
+        p = await self.db.get_project(pid)
+        if not p:
+            return "Проект не найден.", None
+        cnt = await self.db.count_chapters(pid)
+        ext = {e["platform"]: e["url"] for e in await self.db.list_external_links(pid)}
+        lines = [f"{p['emoji']} <b>{esc(p['canonical_name'])}</b>",
+                 f"📚 Глав: {cnt}"]
+        plat = " · ".join(
+            f'<a href="{esc(ext[col])}">{label}</a>'
+            for _code, col, label in PLATFORMS if ext.get(col))
+        if plat:
+            lines.append("🌐 " + plat)
+        kb = [[InlineKeyboardButton("📖 Главы", callback_data=f"arcs:{pid}")]]
+        cats = await self.db.project_sections_with_items(pid)
+        row = []
+        for s in cats:
+            row.append(InlineKeyboardButton(f"{s['emoji']} {s['name']} ({s['n']})",
+                                            callback_data=f"pcat:{pid}:{s['id']}"))
+            if len(row) == 2:
+                kb.append(row); row = []
+        if row:
+            kb.append(row)
+        page = await self.db.get_page_for("project", pid)
+        if page:
+            kb.append([InlineKeyboardButton(
+                "🌐 Открыть навигацию", url=f"https://telegra.ph/{page['path']}")])
+        return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+    async def _send_project_card(self, message, pid: int) -> None:
+        text, kb = await self._card_text_kb(pid)
+        await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+
+    async def _show_arcs(self, q, pid: int) -> None:
+        arcs = await self.db.list_arcs(pid)
+        p = await self.db.get_project(pid)
+        if not arcs:
+            await q.edit_message_text("В этом проекте пока нет глав.",
+                                      reply_markup=InlineKeyboardMarkup([[
+                                          InlineKeyboardButton("⬅️ Назад", callback_data=f"card:{pid}")]]))
+            return
+        kb = [[InlineKeyboardButton(
+            f"📂 {a['arc']} ({a['first_num']}–{a['last_num']}, {a['n']})",
+            callback_data=f"arc:{pid}:{i}")] for i, a in enumerate(arcs)]
+        kb.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"card:{pid}")])
+        await q.edit_message_text(
+            f"{p['emoji']} <b>{esc(p['canonical_name'])}</b> — выберите арку:",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+    async def _show_arc_chapters(self, q, pid: int, idx: int) -> None:
+        arcs = await self.db.list_arcs(pid)
+        if idx >= len(arcs):
+            await self._show_arcs(q, pid)
+            return
+        arc = arcs[idx]["arc"]
+        chapters = await self.db.chapters_in_arc(pid, arc)
+        posts = await self._post_urls()
+        lines = [f"📂 <b>{esc(arc)}</b>"]
+        for c in chapters:
+            links = [f'<a href="{esc(c["telegraph_url"])}">📖 Читать</a>']
+            purl = posts.get(c["post_id"])
+            if purl:
+                links.append(f'<a href="{esc(purl)}">💬 Пост</a>')
+            ttl = f" — {esc(c['title'])}" if c["title"] else ""
+            lines.append(f"гл. {c['number']}{ttl}\n   " + " · ".join(links))
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ К аркам", callback_data=f"arcs:{pid}"),
+            InlineKeyboardButton("🏠 К проекту", callback_data=f"card:{pid}")]])
+        await q.edit_message_text("\n".join(lines), reply_markup=kb,
+                                  parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
+
+    async def _show_project_category(self, q, pid: int, sid: int) -> None:
+        items = await self.db.list_items(section_id=sid, project_id=pid)
+        sec = await self.db.get_section(sid)
+        lines = [f"{sec['emoji']} <b>{esc(sec['name'])}</b>"]
+        if not items:
+            lines.append("— пока пусто —")
+        for it in items:
+            lines.append(f'• <a href="{esc(it["url"])}">{esc(it["title"] or "Без названия")}</a>')
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 К проекту", callback_data=f"card:{pid}")]])
+        await q.edit_message_text("\n".join(lines), reply_markup=kb,
+                                  parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
 
     async def _route(self, q, context, data: str) -> None:
         parts = data.split(":")
@@ -462,6 +587,10 @@ class BotApp:
             await self.db.execute("UPDATE conflicts SET status='resolved' WHERE id=?",
                                   (int(parts[1]),))
             await self._show_conflicts(q)
+        elif head == "confx":
+            await self.db.execute("UPDATE conflicts SET status='ignored' WHERE id=?",
+                                  (int(parts[1]),))
+            await self._show_conflicts(q)
         # projects
         elif head == "proj":
             await self._show_projects(q)
@@ -475,6 +604,39 @@ class BotApp:
             await self.db.update_project(pid, hidden=0 if pr["hidden"] else 1)
             await self._enqueue_project(pid)
             await self._show_project(q, pid)
+        elif head == "padd":
+            self._set_await(context, "proj_create")
+            await q.edit_message_text(
+                "🆕 Пришлите название нового проекта "
+                "(можно с эмодзи в начале, напр. «🐉 Теневой Дракон»):",
+                reply_markup=self._back("proj"))
+        elif head == "pdel":
+            pid = int(parts[1])
+            pr = await self.db.get_project(pid)
+            cnt = await self.db.count_chapters(pid)
+            await q.edit_message_text(
+                f"🗑 Удалить «{esc(pr['canonical_name'])}»? Будут удалены {cnt} "
+                f"глав(ы) и привязки. Это необратимо.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Да, удалить", callback_data=f"pdelyes:{pid}"),
+                    InlineKeyboardButton("Отмена", callback_data=f"p:{pid}")]]))
+        elif head == "pdelyes":
+            pid = int(parts[1])
+            await self.db.execute("DELETE FROM hashtag_map WHERE kind='project' "
+                                  "AND target_id=?", (pid,))
+            await self.db.execute("DELETE FROM projects WHERE id=?", (pid,))
+            await self.db.enqueue_build("root", None)
+            await q.edit_message_text("🗑 Проект удалён.", reply_markup=self._back("proj"))
+        elif head == "ptags":
+            await self._show_project_tags(q, int(parts[1]))
+        elif head == "ptagadd":
+            self._set_await(context, "ptag_new", pid=int(parts[1]))
+            await q.edit_message_text(
+                "🏷 Пришлите хэштег (без #), который привязать к этому проекту:",
+                reply_markup=self._back(f"ptags:{parts[1]}"))
+        elif head == "ptagdel":
+            await self.db.delete_hashtag(parts[2])
+            await self._show_project_tags(q, int(parts[1]))
         # sections
         elif head == "sect":
             await self._show_sections(q)
@@ -537,6 +699,7 @@ class BotApp:
             kb.append([InlineKeyboardButton(
                 f"{p['emoji']} {p['canonical_name']} ({cnt}){tag}",
                 callback_data=f"p:{p['id']}")])
+        kb.append([InlineKeyboardButton("🆕 Создать проект", callback_data="padd")])
         kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
         await q.edit_message_text("📚 <b>Проекты</b> — выберите для редактирования:",
                                   reply_markup=InlineKeyboardMarkup(kb),
@@ -563,7 +726,9 @@ class BotApp:
              InlineKeyboardButton("💎 Boosty", callback_data=f"pe:{pid}:bo")],
             [InlineKeyboardButton("↕️ Порядок", callback_data=f"pe:{pid}:order"),
              InlineKeyboardButton("🙈 Скрыть/Показать", callback_data=f"ptoggle:{pid}")],
-            [InlineKeyboardButton("⬅️ К проектам", callback_data="proj")],
+            [InlineKeyboardButton("🏷 Хэштеги проекта", callback_data=f"ptags:{pid}")],
+            [InlineKeyboardButton("🗑 Удалить проект", callback_data=f"pdel:{pid}"),
+             InlineKeyboardButton("⬅️ К проектам", callback_data="proj")],
         ]
         await q.edit_message_text("\n".join(lines),
                                   reply_markup=InlineKeyboardMarkup(kb),
@@ -583,6 +748,26 @@ class BotApp:
     async def _enqueue_project(self, pid: int) -> None:
         await self.db.enqueue_build("project", pid)
         await self.db.enqueue_build("root", None)
+
+    async def _show_project_tags(self, q, pid: int) -> None:
+        p = await self.db.get_project(pid)
+        rows = [r for r in await self.db.list_hashtags()
+                if r["kind"] == "project" and r["target_id"] == pid]
+        lines = [f"🏷 <b>Хэштеги проекта</b> {p['emoji']} {esc(p['canonical_name'])}",
+                 "Посты с этими тегами относятся к проекту."]
+        kb = []
+        if rows:
+            for r in rows:
+                lines.append(f"• #{esc(r['hashtag'])}")
+                kb.append([InlineKeyboardButton(
+                    f"🗑 #{r['hashtag']}", callback_data=f"ptagdel:{pid}:{r['hashtag']}")])
+        else:
+            lines.append("— тегов пока нет —")
+        kb.append([InlineKeyboardButton("🆕 Добавить хэштег", callback_data=f"ptagadd:{pid}")])
+        kb.append([InlineKeyboardButton("⬅️ К проекту", callback_data=f"p:{pid}")])
+        await q.edit_message_text("\n".join(lines),
+                                  reply_markup=InlineKeyboardMarkup(kb),
+                                  parse_mode=ParseMode.HTML)
 
     # ── sections CRUD ──────────────────────────────────────────────────────────
     async def _show_sections(self, q) -> None:
@@ -750,6 +935,32 @@ class BotApp:
             await self.db.enqueue_build("root", None)
             await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"s:{sid}"))
 
+        elif action == "proj_create":
+            emoji, _, name = text.partition(" ")
+            if not name:
+                emoji, name = "📖", text
+            name = name.strip()
+            key = f"proj_{slugify(name)}"
+            pid = await self.db.upsert_project(
+                key=key, canonical_name=name, slug=slugify(name), emoji=emoji)
+            await self._enqueue_project(pid)
+            await msg.reply_text(
+                f"✅ Проект «{esc(name)}» создан. Привяжите к нему хэштег.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🏷 Добавить хэштег", callback_data=f"ptagadd:{pid}"),
+                    InlineKeyboardButton("✏️ Открыть", callback_data=f"p:{pid}")]]))
+
+        elif action == "ptag_new":
+            pid = await_data["pid"]
+            tag = text.lstrip("#").lower().split()[0] if text.strip() else ""
+            if tag:
+                await self.db.set_hashtag(tag, "project", pid)
+                await msg.reply_text(
+                    f"✅ #{esc(tag)} привязан к проекту.",
+                    reply_markup=self._back(f"ptags:{pid}"))
+            else:
+                await msg.reply_text("Пустой хэштег.", reply_markup=self._back(f"ptags:{pid}"))
+
         elif action == "sec_create":
             emoji, _, name = text.partition(" ")
             if not name:
@@ -814,8 +1025,11 @@ class BotApp:
         kb = []
         for r in rows:
             lines.append(f"• #{r['id']} [{esc(r['type'])}] {esc(r['detail'][:70])}")
-            kb.append([InlineKeyboardButton(f"✓ Решить #{r['id']}",
-                                            callback_data=f"conf:{r['id']}")])
+            kb.append([
+                InlineKeyboardButton(f"✓ Решить #{r['id']}",
+                                     callback_data=f"conf:{r['id']}"),
+                InlineKeyboardButton("🚫 Отклонить",
+                                     callback_data=f"confx:{r['id']}")])
         kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
         await q.edit_message_text("\n".join(lines),
                                   reply_markup=InlineKeyboardMarkup(kb),

@@ -103,6 +103,45 @@ def test_category_hashtag_creates_item(tmp_path):
     asyncio.run(go())
 
 
+def test_multi_hashtag_links_category_to_project(tmp_path):
+    async def go():
+        db, cfg = await _fresh_db(tmp_path / "m.db")
+        try:
+            # a meme about Покровитель: project tag + category tags, no chapters
+            post = _post(800, "Мем про Алона 😂\n#покровитель #мемы")
+            res = await process_post(db, cfg, post)
+            assert res.action == "category"
+            proj = await db.get_project_by_key("pokrovitel")
+            sec = await db.get_section_by_key("memy")
+            items = await db.list_items(section_id=sec["id"])
+            assert len(items) == 1
+            # item is filed under Мемы AND tied to the project
+            assert items[0]["project_id"] == proj["id"]
+            assert items[0]["title"] == "Мем про Алона 😂"
+            # surfaced by the project-card helper
+            cats = await db.project_sections_with_items(proj["id"])
+            assert any(c["id"] == sec["id"] for c in cats)
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
+def test_multiple_categories_create_multiple_items(tmp_path):
+    async def go():
+        db, cfg = await _fresh_db(tmp_path / "mc.db")
+        try:
+            post = _post(801, "Стикерпак и мемы!\n#покровитель #мемы #стикерпак")
+            res = await process_post(db, cfg, post)
+            # мемы (known) + стикерпак (unknown→auto-section) = 2 items
+            assert res.items == 2
+            assert res.action == "unknown_hashtag"  # стикерпак was unknown
+            sticker = await db.get_section_by_key("tag_stikerpak")
+            assert sticker is not None
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
 def test_edit_updates_same_chapter(tmp_path):
     async def go():
         db, cfg = await _fresh_db(tmp_path / "e.db")
