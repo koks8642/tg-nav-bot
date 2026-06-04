@@ -43,6 +43,14 @@ from .config import Config
 from .db import Database
 from .parser import parsed_post_from_message
 from .pipeline import process_post
+from .quote import (
+    QuoteError,
+    build_messages,
+    fetch_paragraphs,
+    parse_quote,
+    preview_text,
+    select,
+)
 from .util import clip, slugify
 
 log = logging.getLogger("bot")
@@ -78,9 +86,10 @@ def esc(s) -> str:
 
 
 class BotApp:
-    def __init__(self, db: Database, cfg: Config):
+    def __init__(self, db: Database, cfg: Config, telegraph=None):
         self.db = db
         self.cfg = cfg
+        self.tg = telegraph          # TelegraphClient, for reading chapter text
         self.application: Application | None = None
         # cache of channel admin user ids (creator + administrators)
         self._admin_ids: set[int] = set()
@@ -120,6 +129,7 @@ class BotApp:
         app.add_handler(CommandHandler("menu", self.cmd_menu))
         app.add_handler(CommandHandler("search", self.cmd_search))
         app.add_handler(CommandHandler("rebuild", self.cmd_rebuild))
+        app.add_handler(CommandHandler("quote", self.cmd_quote))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(InlineQueryHandler(self.on_inline))
         app.add_error_handler(self._on_error)
@@ -127,6 +137,10 @@ class BotApp:
         app.add_handler(MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             self.on_text))
+        # group messages that mention the bot → quote command (privacy off)
+        app.add_handler(MessageHandler(
+            filters.ChatType.GROUPS & filters.TEXT & filters.Entity("mention"),
+            self.on_group_mention))
         # any other /command → maybe a per-project quick command → its card
         app.add_handler(MessageHandler(filters.COMMAND, self.on_project_command))
 
@@ -510,6 +524,11 @@ class BotApp:
                 reply_markup=self._main_keyboard(await self.is_admin(
                     update.effective_user.id)))
             return
+        # quote flow (any user, started from a project card)
+        if context.user_data.get("quote_pid"):
+            pid = context.user_data.pop("quote_pid")
+            await self._quote_from_text(msg, text, pid=pid)
+            return
         # owner mid-flow? consume as the awaited input
         if await self._owner(update) and context.user_data.get("await"):
             await self._handle_pending(update, context)
@@ -542,6 +561,80 @@ class BotApp:
                     body, parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True)))
         await iq.answer(results, cache_time=5, is_personal=False)
+
+    # ── chapter quoting (DM + groups) ─────────────────────────────────────────
+    async def cmd_quote(self, update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+        args = " ".join(context.args) if context.args else ""
+        if not args:
+            await update.effective_message.reply_text(
+                "📄 Цитирование главы:\n"
+                "• /quote <тайтл> глава N абзацы A-B\n"
+                '• /quote <тайтл> глава N от "фраза" до "фраза"\n'
+                "• /quote <тайтл> глава N — покажу нумерованные абзацы для выбора")
+            return
+        await self._quote_from_text(update.effective_message, args)
+
+    async def on_group_mention(self, update: Update,
+                               context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        uname = (context.bot.username or "").lower()
+        text = (msg.text or "").strip()
+        if not uname or not text.lower().startswith("@" + uname):
+            return
+        rest = text[len("@" + uname):].strip()
+        if rest:
+            await self._quote_from_text(msg, rest)
+
+    async def _quote_from_text(self, message, text: str, *, pid: int | None = None) -> None:
+        if self.tg is None:
+            await message.reply_text("Цитирование временно недоступно.")
+            return
+        req = parse_quote(text if pid is None else f"_ {text}")
+        if not req:
+            await message.reply_text(
+                "Не понял запрос. Пример: «покровитель глава 150 абзацы 1-5».")
+            return
+        if pid is not None:
+            proj = await self.db.get_project(pid)
+        else:
+            res = await self.db.search(req.project_query)
+            proj = res["projects"][0] if res["projects"] else None
+        if not proj:
+            await message.reply_text("Тайтл не найден.")
+            return
+        ch = await self.db.fetchone(
+            "SELECT * FROM chapters WHERE project_id=? AND number=?",
+            (proj["id"], req.number))
+        if not ch:
+            await message.reply_text(
+                f"У «{proj['canonical_name']}» нет главы {req.number}.")
+            return
+        try:
+            paras = await fetch_paragraphs(self.db, self.tg, ch["telegraph_url"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("quote fetch failed: %s", e)
+            await message.reply_text("Не удалось получить текст главы с Telegraph.")
+            return
+        if not paras:
+            await message.reply_text("Текст главы пуст или недоступен.")
+            return
+
+        if req.mode == "preview":
+            header = (f"📄 {proj['canonical_name']} — Глава {req.number}\n"
+                      f"Абзацев: {len(paras)}. Укажите диапазон, напр.: "
+                      f"«{proj['canonical_name']} глава {req.number} абзацы 1-5».")
+            for m in build_messages(header, [preview_text(paras)]):
+                await message.reply_text(m, disable_web_page_preview=True)
+            return
+        try:
+            sel, a, b = select(paras, req)
+        except QuoteError as e:
+            await message.reply_text(f"⚠️ {e}")
+            return
+        header = f"📄 {proj['canonical_name']} — Глава {req.number}, абзацы {a}–{b}:"
+        for m in build_messages(header, sel):
+            await message.reply_text(m, disable_web_page_preview=True)
 
     # ── owner menu ─────────────────────────────────────────────────────────────
     def _menu_markup(self) -> InlineKeyboardMarkup:
@@ -598,7 +691,7 @@ class BotApp:
 
     # ── callbacks router ────────────────────────────────────────────────────────
     # callbacks anyone may use (the public project / section / group navigation)
-    _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard", "gcard"}
+    _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard", "gcard", "quote"}
 
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -610,7 +703,7 @@ class BotApp:
         if head in self._PUBLIC_CB:
             await self._safe_answer(q)
             try:
-                await self._route_public(q, data)
+                await self._route_public(q, context, data)
             except Exception as e:  # noqa: BLE001
                 log.exception("public callback failed")
                 await self._safe_answer(q, f"Ошибка: {e}", show_alert=True)
@@ -642,9 +735,18 @@ class BotApp:
             pass
 
     # ── public project card + arc navigation (everyone) ───────────────────────
-    async def _route_public(self, q, data: str) -> None:
+    async def _route_public(self, q, context, data: str) -> None:
         parts = data.split(":")
         head = parts[0]
+        if head == "quote":
+            context.user_data["quote_pid"] = int(parts[1])
+            await q.message.reply_text(
+                "📄 Пришлите номер главы и (опц.) диапазон:\n"
+                "• <code>5</code> — покажу нумерованные абзацы\n"
+                "• <code>5 абзацы 3-10</code>\n"
+                "• <code>5 от \"фраза\" до \"фраза\"</code>",
+                parse_mode=ParseMode.HTML)
+            return
         if head == "card":
             text, kb = await self._card_text_kb(int(parts[1]))
             await q.edit_message_text(text, reply_markup=kb,
@@ -696,6 +798,7 @@ class BotApp:
                 kb.append(row); row = []
         if row:
             kb.append(row)
+        kb.append([InlineKeyboardButton("📄 Цитировать главу", callback_data=f"quote:{pid}")])
         page = await self.db.get_page_for("project", pid)
         if page:
             kb.append([InlineKeyboardButton(

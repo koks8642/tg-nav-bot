@@ -98,6 +98,11 @@ class TelegraphClient:
     async def get_page(self, path: str) -> dict:
         return await self._call("getPage", path=path, return_content="false")
 
+    async def get_page_content(self, path: str) -> list:
+        """Return a page's content nodes (for reading/quoting the chapter text)."""
+        result = await self._call("getPage", path=path, return_content="true")
+        return result.get("content", [])
+
 
 def content_size(content: list[dict]) -> int:
     return len(json.dumps(content, ensure_ascii=False).encode("utf-8"))

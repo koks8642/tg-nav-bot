@@ -55,7 +55,7 @@ async def run() -> None:
     await _ensure_telegraph_token(db, tg, cfg)
     rebuilder = Rebuilder(db, tg, cfg)
 
-    bot_app = BotApp(db, cfg)
+    bot_app = BotApp(db, cfg, telegraph=tg)
     application = bot_app.build()
 
     # HTTP health server (liveness probe for hosting platforms)

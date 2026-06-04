@@ -7,6 +7,7 @@ data on a persistent volume.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import time
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from typing import Any, Sequence
 
 import aiosqlite
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -168,6 +169,12 @@ CREATE TABLE IF NOT EXISTS conflicts (
     ref         TEXT,
     detail      TEXT,
     status      TEXT DEFAULT 'open'     -- open|resolved|ignored
+);
+
+CREATE TABLE IF NOT EXISTS chapter_cache (
+    telegraph_url TEXT PRIMARY KEY,
+    paragraphs    TEXT,                  -- JSON list of plain-text paragraphs
+    fetched_at    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_chapters_project ON chapters(project_id, number);
@@ -515,6 +522,24 @@ class Database:
 
     async def delete_chapter(self, chapter_id: int) -> None:
         await self.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+
+    # ── chapter text cache (for quoting) ─────────────────────────────────────
+    async def get_chapter_cache(self, url: str) -> list[str] | None:
+        row = await self.fetchone(
+            "SELECT paragraphs FROM chapter_cache WHERE telegraph_url=?", (url,))
+        if not row:
+            return None
+        try:
+            return json.loads(row["paragraphs"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    async def set_chapter_cache(self, url: str, paragraphs: list[str]) -> None:
+        await self.execute(
+            "INSERT INTO chapter_cache(telegraph_url,paragraphs,fetched_at) "
+            "VALUES(?,?,?) ON CONFLICT(telegraph_url) DO UPDATE SET "
+            "paragraphs=excluded.paragraphs, fetched_at=excluded.fetched_at",
+            (url, json.dumps(paragraphs, ensure_ascii=False), _now()))
 
     # ── arc operations (rename / merge / split) ──────────────────────────────
     async def rename_arc(self, project_id: int, old_arc: str, new_arc: str) -> int:
