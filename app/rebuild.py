@@ -20,7 +20,6 @@ from .db import Database
 from .render import (
     paginate_project,
     render_group,
-    render_project,
     render_project_index,
     render_root,
     render_section,

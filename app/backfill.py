@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from .config import Config
 from .db import Database
 from .parser import (
-    ParsedPost,
     extract_chapters,
     extract_external_links,
     parse_export_html,

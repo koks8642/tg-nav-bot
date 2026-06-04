@@ -222,6 +222,10 @@ def paginate_project(project, chapters: list, external_links: list,
             current = candidate
     if current:
         parts.append(current)
+    # every part gets a back-to-navigation footer so the reader can return
+    if home_path:
+        footer = [hr(), p(a("⬅️ На главную", f"https://telegra.ph/{home_path}"))]
+        parts = [part + footer for part in parts]
     return parts  # caller renders an index page pointing at these parts
 
 

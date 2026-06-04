@@ -43,7 +43,7 @@ from .config import Config
 from .db import Database
 from .parser import parsed_post_from_message
 from .pipeline import process_post
-from .util import slugify
+from .util import clip, slugify
 
 log = logging.getLogger("bot")
 
@@ -75,12 +75,6 @@ ADMIN_COMMANDS = [
 def esc(s) -> str:
     s = "" if s is None else str(s)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def clip(s: str | None, n: int = 60) -> str:
-    """Shorten a title for list display: first line, trimmed to n chars + …."""
-    s = (s or "Без названия").splitlines()[0].strip()
-    return s if len(s) <= n else s[:n].rstrip() + "…"
 
 
 class BotApp:
@@ -428,7 +422,7 @@ class BotApp:
                 out.append(f'{s["emoji"]} <b>{esc(s["name"])}</b>')
         for it in res.get("items", [])[:12]:
             emoji = it.get("section_emoji") or "•"
-            out.append(f'{emoji} <a href="{esc(it["url"])}">{esc(clip(it["title"]))}</a>')
+            out.append(f'{emoji} <a href="{esc(it["url"])}">{esc(clip(it["title"], 60))}</a>')
         if not out:
             return "Ничего не найдено. Попробуйте номер главы, арку или название."
         return f"🔎 Результаты по «{esc(query)}»:\n\n" + "\n".join(out)
@@ -556,7 +550,6 @@ class BotApp:
              InlineKeyboardButton("🗂 Разделы", callback_data="sect")],
             [InlineKeyboardButton("🏬 Виды произведений", callback_data="groups"),
              InlineKeyboardButton("🏷 Хэштеги", callback_data="tags")],
-            [InlineKeyboardButton("⚠️ Конфликты", callback_data="conflicts")],
         ])
 
     async def _send_menu(self, message) -> None:
@@ -726,7 +719,7 @@ class BotApp:
             lines.append("— пока пусто —")
         for it in items[:30]:
             url = it["url"] or posts.get(it["post_id"], "")
-            title = esc(clip(it["title"]))
+            title = esc(clip(it["title"], 60))
             lines.append(f'• <a href="{esc(url)}">{title}</a>' if url else f"• {title}")
         if len(items) > 30:
             lines.append(f"…и ещё {len(items) - 30}")
@@ -809,7 +802,7 @@ class BotApp:
         if not items:
             lines.append("— пока пусто —")
         for it in items:
-            lines.append(f'• <a href="{esc(it["url"])}">{esc(clip(it["title"]))}</a>')
+            lines.append(f'• <a href="{esc(it["url"])}">{esc(clip(it["title"], 60))}</a>')
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🏠 К проекту", callback_data=f"card:{pid}")]])
         await q.edit_message_text("\n".join(lines), reply_markup=kb,
@@ -837,16 +830,6 @@ class BotApp:
             await enqueue_full_rebuild(self.db)
             await q.edit_message_text("♻️ Пересборка поставлена в очередь.",
                                       reply_markup=self._back())
-        elif head == "conflicts":
-            await self._show_conflicts(q)
-        elif head == "conf":
-            await self.db.execute("UPDATE conflicts SET status='resolved' WHERE id=?",
-                                  (int(parts[1]),))
-            await self._show_conflicts(q)
-        elif head == "confx":
-            await self.db.execute("UPDATE conflicts SET status='ignored' WHERE id=?",
-                                  (int(parts[1]),))
-            await self._show_conflicts(q)
         # projects
         elif head == "proj":
             await self._show_projects(q)
@@ -1465,19 +1448,6 @@ class BotApp:
             reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
     # ── chapters CRUD ──────────────────────────────────────────────────────────
-    async def _chapter_results(self, message, query: str) -> None:
-        res = await self.db.search(query, limit=20)
-        chapters = res["chapters"]
-        if not chapters:
-            await message.reply_text("Глав не найдено.", reply_markup=self._back())
-            return
-        kb = [[InlineKeyboardButton(
-            f"{c['project_emoji']} гл.{c['number']} {('· '+c['arc']) if c['arc'] else ''}",
-            callback_data=f"c:{c['id']}")] for c in chapters[:20]]
-        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
-        await message.reply_text("Выберите главу для редактирования:",
-                                 reply_markup=InlineKeyboardMarkup(kb))
-
     async def _show_chapter(self, q, cid: int) -> None:
         c = await self.db.get_chapter(cid)
         if not c:
@@ -1661,9 +1631,6 @@ class BotApp:
             except Exception as e:  # noqa: BLE001
                 await msg.reply_text(f"❌ {esc(e)}", reply_markup=self._back(f"c:{cid}"))
 
-        elif action == "ch_find":
-            await self._chapter_results(msg, text)
-
         # arcs
         elif action == "arc_rename":
             pid, arc = await_data["pid"], await_data["arc"]
@@ -1711,28 +1678,6 @@ class BotApp:
             await self.db.add_external_link(pid, platform, url, manual=1)
         # keep the projects.<platform>_url column in sync for the API
         await self.db.update_project(pid, **{f"{platform}_url": url})
-
-    # ── conflicts ──────────────────────────────────────────────────────────────
-    async def _show_conflicts(self, q) -> None:
-        rows = await self.db.fetchall(
-            "SELECT * FROM conflicts WHERE status='open' ORDER BY id DESC LIMIT 8")
-        if not rows:
-            await q.edit_message_text("✅ Открытых конфликтов нет.",
-                                      reply_markup=self._back())
-            return
-        lines = ["<b>⚠️ Конфликты:</b>"]
-        kb = []
-        for r in rows:
-            lines.append(f"• #{r['id']} [{esc(r['type'])}] {esc(r['detail'][:70])}")
-            kb.append([
-                InlineKeyboardButton(f"✓ Решить #{r['id']}",
-                                     callback_data=f"conf:{r['id']}"),
-                InlineKeyboardButton("🚫 Отклонить",
-                                     callback_data=f"confx:{r['id']}")])
-        kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
-        await q.edit_message_text("\n".join(lines),
-                                  reply_markup=InlineKeyboardMarkup(kb),
-                                  parse_mode=ParseMode.HTML)
 
 
 def _int(s: str, default: int) -> int:

@@ -23,6 +23,8 @@ PROJECT_TAG = {"pokrovitel": "покровитель", "geniy": "гений",
                "urozhay": "урожай", "bashnya": "башня", "drakon": "дракон"}
 
 ART_RE = re.compile(r"обложк|\bарт\b|рисун|иллюстрац|сторис|фан-?арт", re.I)
+DONATE_RE = re.compile(
+    r"донат|задонат|поддерж|пожертв|cloudtips|boosty|денюжк|спасибо.*подд", re.I)
 ANNOUNCE_RE = re.compile(
     r"график|расписани|сегодня глав|глав[ыа]? будут|не будет|приоритет|выйдут|"
     r"выпуск|планиру|анонс|следующ\w+ глав|на следующей неделе|релиз", re.I)
@@ -31,6 +33,8 @@ ANNOUNCE_RE = re.compile(
 def category_tags(text: str) -> list[str]:
     if ART_RE.search(text):
         return ["арт"]
+    if DONATE_RE.search(text):
+        return ["донат"]
     if ANNOUNCE_RE.search(text):
         return ["анонс"]
     return ["мысли"]

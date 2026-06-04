@@ -1,8 +1,6 @@
 """Config: post links must be derived from the configured channel, not hardcoded."""
 from __future__ import annotations
 
-import os
-
 from app.config import load_config
 
 

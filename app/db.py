@@ -7,12 +7,11 @@ data on a persistent volume.
 """
 from __future__ import annotations
 
-import json
 import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 import aiosqlite
 
@@ -338,7 +337,7 @@ class Database:
             else "SELECT * FROM projects WHERE group_id=?"
         if not include_hidden:
             sql += " AND hidden=0"
-        sql += " ORDER BY sort_order, canonical_name"
+        sql += self._PROJ_ORDER
         return await self.fetchall(sql, (group_id,))
 
     async def count_projects_in_group(self, group_id: int) -> int:
@@ -353,11 +352,14 @@ class Database:
     async def get_project(self, project_id: int) -> aiosqlite.Row | None:
         return await self.fetchone("SELECT * FROM projects WHERE id=?", (project_id,))
 
+    _PROJ_ORDER = (" ORDER BY (SELECT COUNT(*) FROM chapters c "
+                   "WHERE c.project_id=projects.id) DESC, sort_order, canonical_name")
+
     async def list_projects(self, include_hidden: bool = False) -> list[aiosqlite.Row]:
         sql = "SELECT * FROM projects"
         if not include_hidden:
             sql += " WHERE hidden=0"
-        sql += " ORDER BY sort_order, canonical_name"
+        sql += self._PROJ_ORDER
         return await self.fetchall(sql)
 
     async def upsert_project(self, key: str, canonical_name: str, slug: str,
@@ -570,7 +572,7 @@ class Database:
         sql = "SELECT * FROM items"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY date DESC, id DESC"
+        sql += " ORDER BY date ASC, id ASC"   # oldest first (feed: new at bottom)
         return await self.fetchall(sql, params)
 
     async def get_item(self, item_id: int) -> aiosqlite.Row | None:
