@@ -27,12 +27,14 @@ from telegram import (
     InputTextMessageContent,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
@@ -100,6 +102,8 @@ class BotApp:
         self._cmd_admins: set[int] = set()
         # ≡-menu project command name → project id
         self._proj_commands_map: dict[str, int] = {}
+        # user ids who have already been sent a ReplyKeyboardRemove in groups
+        self._group_kb_removed: set[int] = set()
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -145,6 +149,10 @@ class BotApp:
         # in GROUPS the bot reacts ONLY to the «цитата …» keyword, nothing else
         app.add_handler(MessageHandler(
             filters.ChatType.GROUPS & filters.TEXT, self.on_group_text))
+        # also handle new members joining the group — to clear their keyboard
+        app.add_handler(MessageHandler(
+            filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            self.on_group_new_members))
 
         self.application = app
         return app
@@ -582,14 +590,60 @@ class BotApp:
         m = re.match(r"(?i)цитата\b[:\s]*", t)
         return t[m.end():].strip() if m else None
 
+    async def _remove_group_keyboard(self, update: Update,
+                                     context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send an invisible ReplyKeyboardRemove once per user per group so the
+        reply keyboard (Произведения/Помощь/Админка) disappears for that user.
+        The message is immediately deleted so it doesn't pollute the chat."""
+        uid = update.effective_user.id
+        chat_id = update.effective_chat.id
+        key = (uid, chat_id)
+        if key in self._group_kb_removed:
+            return
+        try:
+            sent = await context.bot.send_message(
+                chat_id, "​",  # zero-width space — invisible
+                reply_markup=ReplyKeyboardRemove(),
+                reply_to_message_id=update.effective_message.message_id)
+            self._group_kb_removed.add(key)
+            await context.bot.delete_message(chat_id, sent.message_id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("remove group keyboard failed: %s", e)
+
     async def on_group_text(self, update: Update,
                             context: ContextTypes.DEFAULT_TYPE) -> None:
         """Groups: react ONLY to «цитата …» — no menu, search or other UI."""
         msg = update.effective_message
+        uid = update.effective_user.id if update.effective_user else None
+        # remove the reply keyboard for this user if not already done
+        if uid and (uid, update.effective_chat.id) not in self._group_kb_removed:
+            await self._remove_group_keyboard(update, context)
         rest = self._strip_quote_kw(msg.text or "", context.bot.username)
         if rest is None:
             return
         await self._quote_from_text(msg, rest, allow_preview=False)
+
+    async def on_group_new_members(self, update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE) -> None:
+        """When someone joins a group the bot is in, send them a
+        ReplyKeyboardRemove so the DM keyboard doesn't show in the group."""
+        msg = update.effective_message
+        if not msg or not msg.new_chat_members:
+            return
+        for member in msg.new_chat_members:
+            if member.is_bot:
+                continue
+            key = (member.id, update.effective_chat.id)
+            if key not in self._group_kb_removed:
+                try:
+                    sent = await context.bot.send_message(
+                        update.effective_chat.id, "​",
+                        reply_markup=ReplyKeyboardRemove())
+                    self._group_kb_removed.add(key)
+                    await context.bot.delete_message(
+                        update.effective_chat.id, sent.message_id)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("remove keyboard for new member failed: %s", e)
 
     async def _quote_from_text(self, message, text: str, *, pid: int | None = None,
                                allow_preview: bool = True) -> None:
