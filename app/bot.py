@@ -1,8 +1,9 @@
 """Telegram bot: channel watcher + instant search (everyone) + full admin CRUD.
 
 * Channel watcher → :mod:`app.pipeline` (writes DB, enqueues rebuilds).
-* Anyone can search by sending a number / title / arc ("304", "глава 304",
-  "покровитель 305", "турнир"), or via inline mode (@bot 304) in any chat.
+* Anyone can search (in DM) by sending a number / title / arc ("304",
+  "глава 304", "покровитель 305", "турнир"). Quoting works via /quote in
+  DM and groups. A per-user rate limit protects against flooding.
 * Owners get a full CRUD menu: projects, hashtags, sections, chapters,
   conflicts, manual ops — all through inline keyboards + short text prompts.
 
@@ -14,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
-from uuid import uuid4
+import time
 
 from telegram import (
     BotCommand,
@@ -23,8 +24,6 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InlineQueryResultArticle,
-    InputTextMessageContent,
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
@@ -36,7 +35,6 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
-    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -67,6 +65,8 @@ BTN_MORE = "➡️ Ещё"
 BTN_PREV = "⬅️ Назад"
 TITLES_PER_PAGE = 8
 QUOTE_COOLDOWN = 2.0   # seconds between quote requests per user (anti-flood)
+RATE_LIMIT = 10        # max actions per RATE_WINDOW per non-admin user
+RATE_WINDOW = 60.0     # seconds
 
 PLATFORMS = [("rl", "ranobelib", "RanobeLib"), ("ml", "mangalib", "MangaLib"),
              ("sk", "senkuro", "Senkuro"), ("bo", "boosty", "Boosty")]
@@ -97,6 +97,8 @@ class BotApp:
         self._admin_ids_ts: float = 0.0
         # per-user cooldown timestamps for the expensive quote path (anti-flood)
         self._quote_seen: dict[int, float] = {}
+        # per-user sliding window of recent action timestamps (rate limiting)
+        self._rate: dict[int, list[float]] = {}
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -127,7 +129,6 @@ class BotApp:
         app.add_handler(CommandHandler("start", self.cmd_start, filters=priv))
         app.add_handler(CommandHandler("id", self.cmd_id, filters=priv))
         app.add_handler(CallbackQueryHandler(self.on_callback))
-        app.add_handler(InlineQueryHandler(self.on_inline))
         app.add_error_handler(self._on_error)
         # private free text → reply-keyboard nav / quote flow / owner / search
         app.add_handler(MessageHandler(priv & filters.TEXT & ~filters.COMMAND,
@@ -280,7 +281,7 @@ class BotApp:
                               f"chapters={result.chapters} items={result.items}")
 
     # ── commands ─────────────────────────────────────────────────────────────
-    def _greeting_html(self, is_adm: bool, bot_username: str) -> str:
+    def _greeting_html(self, is_adm: bool) -> str:
         """The DM welcome / guide (shown on /start, /rqmbot and «ℹ️ Помощь»)."""
         text = (
             "👋 <b>Навигатор переводов RQM</b>\n"
@@ -297,8 +298,6 @@ class BotApp:
             "📄 <b>Цитата главы:</b> <code>/quote покровитель глава 150 абзацы 1-5</code> "
             'или <code>… от "фраза" до "фраза"</code>. Можно из карточки тайтла '
             "кнопкой «Цитировать».\n\n"
-            f"⚡️ <b>Поиск в любом чате:</b> наберите <code>@{esc(bot_username)}</code> "
-            "и запрос — и отправьте главу другу, не выходя из переписки.\n\n"
             "👇 Внизу: <b>📚 Произведения</b> → виды (манга / манхва / новеллы) → "
             "тайтлы. Полная навигация закреплена в канале.")
         if is_adm:
@@ -307,9 +306,11 @@ class BotApp:
 
     async def cmd_start(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await self._flood(update.effective_user):
+            return
         is_adm = await self._owner(update)
         await update.message.reply_text(
-            self._greeting_html(is_adm, context.bot.username or "bot"),
+            self._greeting_html(is_adm),
             parse_mode=ParseMode.HTML, disable_web_page_preview=True,
             reply_markup=self._main_keyboard(is_adm))
 
@@ -319,10 +320,12 @@ class BotApp:
         msg = update.effective_message
         if not msg:
             return
+        if await self._flood(update.effective_user):
+            return
         if msg.chat.type == ChatType.PRIVATE:
             is_adm = await self._owner(update)
             await msg.reply_text(
-                self._greeting_html(is_adm, context.bot.username or "bot"),
+                self._greeting_html(is_adm),
                 parse_mode=ParseMode.HTML, disable_web_page_preview=True,
                 reply_markup=self._main_keyboard(is_adm))
             return
@@ -346,6 +349,11 @@ class BotApp:
         if not msg:
             return
         in_priv = msg.chat.type == ChatType.PRIVATE
+        if await self._flood(update.effective_user):
+            rm = None if in_priv else ReplyKeyboardRemove()
+            await msg.reply_text("⏳ Слишком много запросов. Подождите минуту.",
+                                 reply_markup=rm)
+            return
         text = (msg.text or "").partition(" ")[2].strip()  # drop the /quote token
         if not text:
             rm = None if in_priv else ReplyKeyboardRemove()
@@ -452,6 +460,9 @@ class BotApp:
         msg = update.effective_message
         if not msg or not msg.text:
             return
+        if await self._flood(update.effective_user):
+            await msg.reply_text("⏳ Слишком много запросов. Подождите минуту.")
+            return
         text = msg.text.strip()
         # reply-keyboard navigation
         if text == BTN_HELP:
@@ -494,72 +505,31 @@ class BotApp:
             return
         await self._do_search(msg, text)
 
-    async def on_inline(self, update: Update,
-                        context: ContextTypes.DEFAULT_TYPE) -> None:
-        iq = update.inline_query
-        query = (iq.query or "").strip()[:100]
-        if not query:
-            await iq.answer([], cache_time=5)
-            return
-        try:
-            res = await self.db.search(query, limit=25)
-        except Exception:  # noqa: BLE001
-            log.exception("inline search failed")
-            await iq.answer([], cache_time=5)
-            return
-        posts = await self._post_urls()
+    # ── rate limiting (non-admin users) ───────────────────────────────────────
+    def _over_rate(self, user_id: int) -> bool:
+        """Sliding-window limiter: at most RATE_LIMIT actions per RATE_WINDOW."""
+        now = time.time()
+        bucket = [t for t in self._rate.get(user_id, ()) if now - t < RATE_WINDOW]
+        self._rate[user_id] = bucket
+        if len(self._rate) > 10000:  # opportunistic cleanup
+            self._rate = {u: ts for u, ts in self._rate.items() if ts}
+        if len(bucket) >= RATE_LIMIT:
+            return True
+        bucket.append(now)
+        return False
 
-        def article(title: str, desc: str, body: str) -> InlineQueryResultArticle:
-            return InlineQueryResultArticle(
-                id=str(uuid4()), title=title, description=desc,
-                input_message_content=InputTextMessageContent(
-                    body, parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True))
-
-        results: list[InlineQueryResultArticle] = []
-        # ── project / group / section cards first (a name query wants these) ──
-        for p in res.get("projects", [])[:5]:
-            page = await self.db.get_page_for("project", p["id"])
-            cnt = await self.db.count_chapters(p["id"])
-            body = f"{p['emoji']} <b>{esc(p['canonical_name'])}</b> · глав: {cnt}"
-            if page:
-                body += (f"\n<a href=\"https://telegra.ph/{page['path']}\">"
-                         "🌐 Открыть навигацию</a>")
-            results.append(article(
-                f"{p['emoji']} {p['canonical_name']}", "Открыть тайтл", body))
-        for g in res.get("groups", [])[:3]:
-            page = await self.db.get_page_for("group", g["id"])
-            if page:
-                results.append(article(
-                    f"{g['emoji']} {g['name']}", "Вид произведений",
-                    f"{g['emoji']} <b>{esc(g['name'])}</b>\n"
-                    f"<a href=\"https://telegra.ph/{page['path']}\">🌐 Открыть</a>"))
-        for s in res.get("sections", [])[:3]:
-            page = await self.db.get_page_for("section", s["id"])
-            if page:
-                results.append(article(
-                    f"{s['emoji']} {s['name']}", "Раздел",
-                    f"{s['emoji']} <b>{esc(s['name'])}</b>\n"
-                    f"<a href=\"https://telegra.ph/{page['path']}\">🌐 Открыть</a>"))
-        # ── chapters ──────────────────────────────────────────────────────────
-        for c in res["chapters"][:25]:
-            title = f"{c['project_name']} — гл. {c['number']}"
-            desc = c["arc"] or ""
-            body = f"<b>{esc(c['project_name'])}</b> гл. {c['number']}"
-            if c["arc"]:
-                body += f" · {esc(c['arc'])}"
-            body += f"\n<a href=\"{esc(c['telegraph_url'])}\">📖 Читать в Telegraph</a>"
-            purl = posts.get(c["post_id"])
-            if purl:
-                body += f"\n<a href=\"{esc(purl)}\">💬 Пост в канале</a>"
-            results.append(article(title, desc, body))
-        await iq.answer(results[:50], cache_time=5, is_personal=False)
+    async def _flood(self, user) -> bool:
+        """True if this (non-admin) user is over the rate limit. Admins exempt."""
+        if user is None:
+            return False
+        if await self.is_admin(user.id):
+            return False
+        return self._over_rate(user.id)
 
     # ── chapter quoting (/quote; DM + groups) ─────────────────────────────────
     def _quote_throttled(self, user_id: int | None) -> bool:
         """True if this user fired a quote too recently. Cheap per-user cooldown
         so a flood of /quote can't hammer Telegraph. State is in-memory."""
-        import time
         if user_id is None:
             return False
         now = time.time()
@@ -733,6 +703,10 @@ class BotApp:
                           context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
         if not q:
+            return
+        if await self._flood(q.from_user):
+            await self._safe_answer(
+                q, "⏳ Слишком много запросов. Подождите минуту.", show_alert=True)
             return
         data = q.data or ""
         head = data.split(":")[0]
