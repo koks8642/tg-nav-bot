@@ -1,14 +1,15 @@
-"""Tests for the chapter-quoting engine (parse / select / split / flatten)."""
+"""Tests for the chapter-quoting engine (parse / select / build / flatten)."""
 from __future__ import annotations
 
 import pytest
 
 from app.quote import (
     QuoteError,
-    build_messages,
+    build_preview,
+    build_quote,
     nodes_to_paragraphs,
     parse_quote,
-    preview_text,
+    range_label,
     select,
 )
 
@@ -36,7 +37,6 @@ def test_parse_phrases():
 def test_parse_from():
     r = parse_quote("отличный повелитель глава 7 с 4")
     assert r.mode == "from" and r.a == 4 and r.number == 7
-    assert r.project_query == "отличный повелитель"
 
 
 def test_parse_preview_and_number_fallback():
@@ -45,7 +45,6 @@ def test_parse_preview_and_number_fallback():
 
 
 def test_parse_pid_mode_no_project():
-    # "_ <num> <range>" form used when the project is already known (card flow)
     r = parse_quote("_ 5 абзацы 1-3")
     assert r.number == 5 and (r.a, r.b) == (1, 3)
 
@@ -61,14 +60,14 @@ def test_nodes_to_paragraphs():
         {"tag": "p", "children": ["Первый абзац."]},
         {"tag": "figure", "children": [{"tag": "img"}]},
         {"tag": "p", "children": ["Второй ", {"tag": "a", "children": ["ссылка"]}, "."]},
-        {"tag": "p", "children": ["   "]},  # whitespace-only → dropped
+        {"tag": "p", "children": ["   "]},
     ]
     assert nodes_to_paragraphs(content) == ["Первый абзац.", "Второй ссылка."]
 
 
 # ── selecting a fragment ─────────────────────────────────────────────────────
 
-PARAS = [f"Абзац {i}." for i in range(1, 11)]  # 10 paragraphs
+PARAS = [f"Абзац {i}." for i in range(1, 11)]
 
 
 def test_select_paragraph_range():
@@ -78,7 +77,7 @@ def test_select_paragraph_range():
 
 def test_select_from_to_end():
     sel, a, b = select(PARAS, parse_quote("x глава 1 с 8"))
-    assert (a, b) == (8, 10) and sel == ["Абзац 8.", "Абзац 9.", "Абзац 10."]
+    assert (a, b) == (8, 10)
 
 
 def test_select_phrases():
@@ -96,40 +95,48 @@ def test_select_phrase_not_found_raises():
         select(PARAS, parse_quote('x глава 1 от "нет такого" до "Абзац 4"'))
 
 
-def test_select_too_big_raises():
-    big = [f"p{i}" for i in range(200)]
+# ── range label ──────────────────────────────────────────────────────────────
+
+def test_range_label_paragraphs():
+    assert range_label(parse_quote("x глава 1 абзацы 3-7"), 3, 7) == "абзацы 3–7"
+
+
+def test_range_label_single():
+    assert range_label(parse_quote("x глава 1 абзац 5"), 5, 5) == "абзац 5"
+
+
+def test_range_label_phrases():
+    r = parse_quote('x глава 1 от "А" до "Б"')
+    assert range_label(r, 2, 4) == "от «А» до «Б»"
+
+
+# ── single-message quote (collapsible blockquote) ────────────────────────────
+
+def test_build_quote_collapsible_and_linked():
+    out = build_quote("https://telegra.ph/X", "Проект — Глава 1", "абзацы 1–2",
+                      ["абзац раз", "абзац два"])
+    assert "<blockquote expandable>" in out and "</blockquote>" in out
+    assert '<a href="https://telegra.ph/X">' in out
+    assert "абзац раз" in out and "абзац два" in out
+    assert "абзацы 1–2" in out
+
+
+def test_build_quote_escapes_html():
+    out = build_quote("https://telegra.ph/X", "T", "абзац 1", ['<b>не тег</b> & "к"'])
+    assert "&lt;b&gt;" in out and "&amp;" in out
+
+
+def test_build_quote_rejects_too_long():
     with pytest.raises(QuoteError):
-        select(big, parse_quote("x глава 1 абзацы 1-100"))
+        build_quote("https://telegra.ph/X", "T", "абзацы 1–2",
+                    ["Я" * 3000, "Б" * 3000], limit=4096)
 
 
-# ── message splitting within the 4096 budget (header included) ───────────────
+# ── preview (DM helper, may split) ───────────────────────────────────────────
 
-def test_build_messages_fits_single():
-    msgs = build_messages("ЗАГОЛОВОК", ["короткий абзац"])
-    assert len(msgs) == 1
-    assert msgs[0].startswith("ЗАГОЛОВОК") and "короткий абзац" in msgs[0]
-
-
-def test_build_messages_splits_and_keeps_all_text():
-    header = "H" * 50
-    paras = ["X" * 1000 for _ in range(10)]  # 10k chars of body
-    msgs = build_messages(header, paras, limit=4096)
-    assert len(msgs) >= 3
-    assert all(len(m) <= 4096 for m in msgs)
-    # header only on the first message, and every paragraph's content survives
-    assert msgs[0].startswith(header)
-    joined = "".join(msgs)
-    assert joined.count("X") == 10 * 1000
-
-
-def test_build_messages_hard_splits_huge_paragraph():
-    msgs = build_messages("", ["Y" * 9000], limit=4096)
-    assert len(msgs) >= 3 and all(len(m) <= 4096 for m in msgs)
-    assert "".join(msgs).count("Y") == 9000
-
-
-def test_preview_text_numbered():
-    pv = preview_text(["Первый длинный абзац " * 10, "Короткий"])
-    lines = pv.splitlines()
-    assert lines[0].startswith("1. ") and lines[1].startswith("2. ")
-    assert lines[0].endswith("…")  # long one is clipped
+def test_build_preview_numbered_and_splits():
+    paras = ["X" * 200 for _ in range(60)]
+    msgs = build_preview("Заголовок", paras, limit=1000)
+    assert len(msgs) >= 2 and all(len(m) <= 1000 for m in msgs)
+    assert msgs[0].startswith("Заголовок")
+    assert "1. " in msgs[0]

@@ -1,20 +1,24 @@
 """Chapter quoting: fetch chapter text from Telegraph, pick a fragment by
-paragraph numbers or by start/end phrases, and split it into ≤4096-char
-messages (accounting for the bot's own header text in the budget)."""
+paragraph numbers or by start/end phrases, and render it as ONE message — a
+2-line header (chapter link + range) followed by an expandable blockquote.
+A fragment that does not fit one message is rejected (never split)."""
 from __future__ import annotations
 
+import html
 import re
 from dataclasses import dataclass
 
 from .db import Database
 from .telegraph import TelegraphClient
+from .util import clip
 
-TG_LIMIT = 4096           # Telegram message hard limit
-MAX_PARAGRAPHS = 60       # safety cap per request
+TG_LIMIT = 4096           # Telegram message hard limit (visible text)
+QUOTE_MARGIN = 80         # reserve for the header/markup safety
+MAX_PARAGRAPHS = 200      # hard upper bound (length check is the real limit)
 
 
 class QuoteError(Exception):
-    """User-facing error (bad range, phrase not found, …)."""
+    """User-facing error (bad range, phrase not found, too long …)."""
 
 
 # ── Telegraph content → paragraphs ───────────────────────────────────────────
@@ -133,12 +137,11 @@ def select(paragraphs: list[str], req: QuoteRequest) -> tuple[list[str], int, in
         si = next((i for i, p in enumerate(paragraphs) if sp in p.lower()), None)
         if si is None:
             raise QuoteError(f"фраза начала «{req.start_phrase}» не найдена.")
-        ei = next((i for i in range(n - 1, -1, -1) if ep in paragraphs[i].lower()),
-                  None)
+        # end = FIRST occurrence at/after the start (smallest sensible range)
+        ei = next((i for i in range(si, n) if ep in paragraphs[i].lower()), None)
         if ei is None:
-            raise QuoteError(f"фраза конца «{req.end_phrase}» не найдена.")
-        if si > ei:
-            raise QuoteError("фраза конца идёт раньше фразы начала.")
+            raise QuoteError(
+                f"фраза конца «{req.end_phrase}» не найдена после начала.")
         a, b = si + 1, ei + 1
     else:  # preview → whole chapter (caller renders the numbered list)
         a, b = 1, n
@@ -150,32 +153,45 @@ def select(paragraphs: list[str], req: QuoteRequest) -> tuple[list[str], int, in
     return paragraphs[a - 1:b], a, b
 
 
-# ── building messages within the 4096 budget (header included) ───────────────
+# ── range label & single-message quote (collapsible blockquote) ──────────────
 
-def build_messages(header: str, paragraphs: list[str],
-                   limit: int = TG_LIMIT) -> list[str]:
-    """Pack paragraphs into messages ≤ limit. The header (bot's system text)
-    counts toward the first message's budget; continuations carry no header."""
+def range_label(req: QuoteRequest, a: int, b: int) -> str:
+    """Human-readable range for the header's 2nd line."""
+    if req.mode == "phrases":
+        return f"от «{req.start_phrase}» до «{req.end_phrase}»"
+    if a == b:
+        return f"абзац {a}"
+    return f"абзацы {a}–{b}"
+
+
+def build_quote(link_url: str, title_line: str, label: str,
+                paragraphs: list[str], limit: int = TG_LIMIT) -> str:
+    """One HTML message: header (chapter link + range, plain) then an
+    expandable blockquote with the text. Raises QuoteError if it does not fit
+    a single Telegram message (we never split)."""
+    body = "\n\n".join(paragraphs)
+    # visible text = title + range + body (HTML tags don't count toward 4096)
+    visible = len(title_line) + len(label) + len(body) + 4
+    if visible > limit - QUOTE_MARGIN:
+        raise QuoteError(
+            f"фрагмент слишком длинный для одного сообщения "
+            f"(~{visible} символов, лимит {limit}). Сузьте диапазон.")
+    head = (f'🔗 <a href="{html.escape(link_url, quote=True)}">'
+            f'{html.escape(title_line)}</a>\n{html.escape(label)}')
+    return f"{head}\n<blockquote expandable>{html.escape(body)}</blockquote>"
+
+
+def build_preview(header: str, paragraphs: list[str],
+                  limit: int = TG_LIMIT) -> list[str]:
+    """Numbered paragraph list (DM helper) — may span several messages."""
+    lines = [f"{i}. {clip(p, 80)}" for i, p in enumerate(paragraphs, 1)]
     msgs: list[str] = []
-    cur = (header.rstrip() + "\n\n") if header else ""
-    for para in paragraphs:
-        piece = para + "\n\n"
-        if cur.strip() and len(cur) + len(piece) > limit:
+    cur = header.rstrip() + "\n\n"
+    for ln in lines:
+        if len(cur) + len(ln) + 1 > limit:
             msgs.append(cur.rstrip())
             cur = ""
-        # a single paragraph longer than the limit → hard-split it
-        while len(cur) + len(piece) > limit:
-            room = max(1, limit - len(cur))
-            msgs.append((cur + piece[:room]).rstrip())
-            cur, piece = "", piece[room:]
-        cur += piece
+        cur += ln + "\n"
     if cur.strip():
         msgs.append(cur.rstrip())
-    return msgs or [header.rstrip()]
-
-
-def preview_text(paragraphs: list[str], per_line: int = 80) -> str:
-    """Numbered paragraph list so the user can see structure and pick indices."""
-    lines = [f"{i}. {p[:per_line].rstrip()}{'…' if len(p) > per_line else ''}"
-             for i, p in enumerate(paragraphs, 1)]
-    return "\n".join(lines)
+    return msgs

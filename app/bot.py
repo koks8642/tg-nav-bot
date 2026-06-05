@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from telegram import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeChat,
     BotCommandScopeDefault,
     InlineKeyboardButton,
@@ -45,10 +46,11 @@ from .parser import parsed_post_from_message
 from .pipeline import process_post
 from .quote import (
     QuoteError,
-    build_messages,
+    build_preview,
+    build_quote,
     fetch_paragraphs,
     parse_quote,
-    preview_text,
+    range_label,
     select,
 )
 from .util import clip, slugify
@@ -121,28 +123,28 @@ class BotApp:
         app.add_handler(MessageHandler(
             filters.UpdateType.EDITED_CHANNEL_POST & chan, self.on_channel_post))
 
-        app.add_handler(CommandHandler("start", self.cmd_start))
-        app.add_handler(CommandHandler("help", self.cmd_start))
-        app.add_handler(CommandHandler("id", self.cmd_id))
-        app.add_handler(CommandHandler("health", self.cmd_health))
-        app.add_handler(CommandHandler("links", self.cmd_links))
-        app.add_handler(CommandHandler("menu", self.cmd_menu))
-        app.add_handler(CommandHandler("search", self.cmd_search))
-        app.add_handler(CommandHandler("rebuild", self.cmd_rebuild))
-        app.add_handler(CommandHandler("quote", self.cmd_quote))
+        # all bot commands work ONLY in private chats (groups stay clean)
+        priv = filters.ChatType.PRIVATE
+        app.add_handler(CommandHandler("start", self.cmd_start, filters=priv))
+        app.add_handler(CommandHandler("help", self.cmd_start, filters=priv))
+        app.add_handler(CommandHandler("id", self.cmd_id, filters=priv))
+        app.add_handler(CommandHandler("health", self.cmd_health, filters=priv))
+        app.add_handler(CommandHandler("links", self.cmd_links, filters=priv))
+        app.add_handler(CommandHandler("menu", self.cmd_menu, filters=priv))
+        app.add_handler(CommandHandler("search", self.cmd_search, filters=priv))
+        app.add_handler(CommandHandler("rebuild", self.cmd_rebuild, filters=priv))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(InlineQueryHandler(self.on_inline))
         app.add_error_handler(self._on_error)
-        # private free text → owner pending input, otherwise search (everyone)
+        # private free text → quote keyword / owner pending / search
+        app.add_handler(MessageHandler(priv & filters.TEXT & ~filters.COMMAND,
+                                       self.on_text))
+        # private /command fallback → per-project quick command → its card
+        app.add_handler(MessageHandler(priv & filters.COMMAND,
+                                       self.on_project_command))
+        # in GROUPS the bot reacts ONLY to the «цитата …» keyword, nothing else
         app.add_handler(MessageHandler(
-            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
-            self.on_text))
-        # group messages that mention the bot → quote command (privacy off)
-        app.add_handler(MessageHandler(
-            filters.ChatType.GROUPS & filters.TEXT & filters.Entity("mention"),
-            self.on_group_mention))
-        # any other /command → maybe a per-project quick command → its card
-        app.add_handler(MessageHandler(filters.COMMAND, self.on_project_command))
+            filters.ChatType.GROUPS & filters.TEXT, self.on_group_text))
 
         self.application = app
         return app
@@ -170,6 +172,8 @@ class BotApp:
             # access is the "📚 Тайтлы" reply button, which scales to dozens.
             await self._project_commands()
             await bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+            # groups: no command menu at all (bot only answers «цитата …»)
+            await bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
             admin_ids = set(self.cfg.owner_user_ids) | await self._channel_admin_ids(force=True)
             for uid in admin_ids:
                 try:
@@ -524,10 +528,15 @@ class BotApp:
                 reply_markup=self._main_keyboard(await self.is_admin(
                     update.effective_user.id)))
             return
+        # «цитата …» keyword (DM)
+        rest = self._strip_quote_kw(text, context.bot.username)
+        if rest is not None:
+            await self._quote_from_text(msg, rest, allow_preview=True)
+            return
         # quote flow (any user, started from a project card)
         if context.user_data.get("quote_pid"):
             pid = context.user_data.pop("quote_pid")
-            await self._quote_from_text(msg, text, pid=pid)
+            await self._quote_from_text(msg, text, pid=pid, allow_preview=True)
             return
         # owner mid-flow? consume as the awaited input
         if await self._owner(update) and context.user_data.get("await"):
@@ -562,38 +571,36 @@ class BotApp:
                     disable_web_page_preview=True)))
         await iq.answer(results, cache_time=5, is_personal=False)
 
-    # ── chapter quoting (DM + groups) ─────────────────────────────────────────
-    async def cmd_quote(self, update: Update,
-                        context: ContextTypes.DEFAULT_TYPE) -> None:
-        args = " ".join(context.args) if context.args else ""
-        if not args:
-            await update.effective_message.reply_text(
-                "📄 Цитирование главы:\n"
-                "• /quote <тайтл> глава N абзацы A-B\n"
-                '• /quote <тайтл> глава N от "фраза" до "фраза"\n'
-                "• /quote <тайтл> глава N — покажу нумерованные абзацы для выбора")
-            return
-        await self._quote_from_text(update.effective_message, args)
+    # ── chapter quoting (keyword «цитата …»; DM + groups) ─────────────────────
+    @staticmethod
+    def _strip_quote_kw(text: str, bot_username: str | None) -> str | None:
+        """If the message is a «цитата …» request (optionally after an @mention),
+        return the part after the keyword; otherwise None."""
+        t = text.strip()
+        if bot_username and t.lower().startswith("@" + bot_username.lower()):
+            t = t[len("@" + bot_username):].strip()
+        m = re.match(r"(?i)цитата\b[:\s]*", t)
+        return t[m.end():].strip() if m else None
 
-    async def on_group_mention(self, update: Update,
-                               context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def on_group_text(self, update: Update,
+                            context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Groups: react ONLY to «цитата …» — no menu, search or other UI."""
         msg = update.effective_message
-        uname = (context.bot.username or "").lower()
-        text = (msg.text or "").strip()
-        if not uname or not text.lower().startswith("@" + uname):
+        rest = self._strip_quote_kw(msg.text or "", context.bot.username)
+        if rest is None:
             return
-        rest = text[len("@" + uname):].strip()
-        if rest:
-            await self._quote_from_text(msg, rest)
+        await self._quote_from_text(msg, rest, allow_preview=False)
 
-    async def _quote_from_text(self, message, text: str, *, pid: int | None = None) -> None:
+    async def _quote_from_text(self, message, text: str, *, pid: int | None = None,
+                               allow_preview: bool = True) -> None:
         if self.tg is None:
             await message.reply_text("Цитирование временно недоступно.")
             return
         req = parse_quote(text if pid is None else f"_ {text}")
         if not req:
             await message.reply_text(
-                "Не понял запрос. Пример: «покровитель глава 150 абзацы 1-5».")
+                "Не понял запрос. Пример: «цитата покровитель глава 150 абзацы 1-5» "
+                'или «… от "фраза" до "фраза"».')
             return
         if pid is not None:
             proj = await self.db.get_project(pid)
@@ -621,20 +628,29 @@ class BotApp:
             return
 
         if req.mode == "preview":
+            if not allow_preview:
+                await message.reply_text(
+                    "Укажите диапазон: «абзацы A-B» или «от \"фраза\" до \"фраза\"». "
+                    "Предпросмотр абзацев доступен в личке с ботом.")
+                return
             header = (f"📄 {proj['canonical_name']} — Глава {req.number}\n"
-                      f"Абзацев: {len(paras)}. Укажите диапазон, напр.: "
-                      f"«{proj['canonical_name']} глава {req.number} абзацы 1-5».")
-            for m in build_messages(header, [preview_text(paras)]):
+                      f"Абзацев: {len(paras)}. Диапазон: «… абзацы 1-5» "
+                      'или «… от "фраза" до "фраза"».')
+            for m in build_preview(header, paras):
                 await message.reply_text(m, disable_web_page_preview=True)
             return
         try:
             sel, a, b = select(paras, req)
+            title = f"{proj['canonical_name']} — Глава {req.number}"
+            out = build_quote(ch["telegraph_url"], title,
+                              range_label(req, a, b), sel)
         except QuoteError as e:
             await message.reply_text(f"⚠️ {e}")
             return
-        header = f"📄 {proj['canonical_name']} — Глава {req.number}, абзацы {a}–{b}:"
-        for m in build_messages(header, sel):
-            await message.reply_text(m, disable_web_page_preview=True)
+        await message.reply_text(out, parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+
+    # ── owner menu ─────────────────────────────────────────────────────────────
 
     # ── owner menu ─────────────────────────────────────────────────────────────
     def _menu_markup(self) -> InlineKeyboardMarkup:
@@ -739,12 +755,16 @@ class BotApp:
         parts = data.split(":")
         head = parts[0]
         if head == "quote":
-            context.user_data["quote_pid"] = int(parts[1])
+            pid = int(parts[1])
+            context.user_data["quote_pid"] = pid
+            p = await self.db.get_project(pid)
+            name = esc(p["canonical_name"]) if p else "произведение"
             await q.message.reply_text(
-                "📄 Пришлите номер главы и (опц.) диапазон:\n"
-                "• <code>5</code> — покажу нумерованные абзацы\n"
-                "• <code>5 абзацы 3-10</code>\n"
-                "• <code>5 от \"фраза\" до \"фраза\"</code>",
+                f"📄 <b>Цитата · {name}</b>\n"
+                "Пришлите <b>номер главы</b> и диапазон:\n"
+                "• <code>&lt;глава&gt; абзацы 3-10</code> — например <code>150 абзацы 3-10</code>\n"
+                "• <code>&lt;глава&gt; от \"фраза\" до \"фраза\"</code>\n"
+                "• только номер главы — покажу нумерованные абзацы для выбора",
                 parse_mode=ParseMode.HTML)
             return
         if head == "card":
