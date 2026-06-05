@@ -19,6 +19,7 @@ from uuid import uuid4
 from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     BotCommandScopeDefault,
     InlineKeyboardButton,
@@ -30,7 +31,7 @@ from telegram import (
     ReplyKeyboardRemove,
     Update,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -101,8 +102,6 @@ class BotApp:
         self._cmd_admins: set[int] = set()
         # ≡-menu project command name → project id
         self._proj_commands_map: dict[str, int] = {}
-        # user ids who have already been sent a ReplyKeyboardRemove in groups
-        self._group_kb_removed: set[int] = set()
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -148,10 +147,6 @@ class BotApp:
         # in GROUPS the bot reacts ONLY to the «цитата …» keyword, nothing else
         app.add_handler(MessageHandler(
             filters.ChatType.GROUPS & filters.TEXT, self.on_group_text))
-        # also handle new members joining the group — to clear their keyboard
-        app.add_handler(MessageHandler(
-            filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS,
-            self.on_group_new_members))
 
         self.application = app
         return app
@@ -171,16 +166,25 @@ class BotApp:
         await self.setup_commands()
 
     async def setup_commands(self) -> None:
-        """Set the ≡ command menu: basic for everyone, full for each admin."""
+        """Set the ≡ command menu: public commands ONLY in private chats, the
+        full menu for each admin, and NOTHING in groups (the bot never adds any
+        UI to a group — it only answers «цитата …»).
+
+        Public commands are scoped to private chats rather than Default so they
+        can't leak into groups: Telegram falls back to Default for groups, and
+        an empty AllGroupChats override is unreliable across clients. We clear
+        both Default and AllGroupChats so no command menu shows in any group.
+        """
         bot = self.application.bot
         try:
             # build the command→project map (so /<key> still works if typed) but
             # DON'T clutter the ≡ menu with one command per project — quick title
             # access is the "📚 Тайтлы" reply button, which scales to dozens.
             await self._project_commands()
-            await bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
-            # groups: no command menu at all (bot only answers «цитата …»)
-            await bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+            await bot.set_my_commands(
+                PUBLIC_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+            await bot.delete_my_commands(scope=BotCommandScopeDefault())
+            await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
             admin_ids = set(self.cfg.owner_user_ids) | await self._channel_admin_ids(force=True)
             for uid in admin_ids:
                 try:
@@ -589,71 +593,36 @@ class BotApp:
         m = re.match(r"(?i)цитата\b[:\s]*", t)
         return t[m.end():].strip() if m else None
 
-    async def _remove_group_keyboard(self, update: Update,
-                                     context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send an invisible ReplyKeyboardRemove once per user per group so the
-        reply keyboard (Произведения/Помощь/Админка) disappears for that user.
-        The message is immediately deleted so it doesn't pollute the chat."""
-        uid = update.effective_user.id
-        chat_id = update.effective_chat.id
-        key = (uid, chat_id)
-        if key in self._group_kb_removed:
-            return
-        try:
-            sent = await context.bot.send_message(
-                chat_id, "​",  # zero-width space — invisible
-                reply_markup=ReplyKeyboardRemove(),
-                reply_to_message_id=update.effective_message.message_id)
-            self._group_kb_removed.add(key)
-            await context.bot.delete_message(chat_id, sent.message_id)
-        except Exception as e:  # noqa: BLE001
-            log.debug("remove group keyboard failed: %s", e)
-
     async def on_group_text(self, update: Update,
                             context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Groups: react ONLY to «цитата …» — no menu, search or other UI."""
+        """Groups: react ONLY to «цитата …» — never touch the chat otherwise
+        (no menu, search, status messages or keyboards)."""
         msg = update.effective_message
-        uid = update.effective_user.id if update.effective_user else None
-        # remove the reply keyboard for this user if not already done
-        if uid and (uid, update.effective_chat.id) not in self._group_kb_removed:
-            await self._remove_group_keyboard(update, context)
+        if not msg:
+            return
         rest = self._strip_quote_kw(msg.text or "", context.bot.username)
         if rest is None:
             return
         await self._quote_from_text(msg, rest, allow_preview=False)
 
-    async def on_group_new_members(self, update: Update,
-                                   context: ContextTypes.DEFAULT_TYPE) -> None:
-        """When someone joins a group the bot is in, send them a
-        ReplyKeyboardRemove so the DM keyboard doesn't show in the group."""
-        msg = update.effective_message
-        if not msg or not msg.new_chat_members:
-            return
-        for member in msg.new_chat_members:
-            if member.is_bot:
-                continue
-            key = (member.id, update.effective_chat.id)
-            if key not in self._group_kb_removed:
-                try:
-                    sent = await context.bot.send_message(
-                        update.effective_chat.id, "​",
-                        reply_markup=ReplyKeyboardRemove())
-                    self._group_kb_removed.add(key)
-                    await context.bot.delete_message(
-                        update.effective_chat.id, sent.message_id)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("remove keyboard for new member failed: %s", e)
-
     async def _quote_from_text(self, message, text: str, *, pid: int | None = None,
                                allow_preview: bool = True) -> None:
+        # In a group, ride a ReplyKeyboardRemove on our actual reply so any
+        # leftover reply keyboard disappears for the asker — without sending or
+        # deleting any extra message. In private chats we keep the keyboard
+        # (rm=None leaves it untouched).
+        rm = (ReplyKeyboardRemove()
+              if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+              else None)
         if self.tg is None:
-            await message.reply_text("Цитирование временно недоступно.")
+            await message.reply_text("Цитирование временно недоступно.",
+                                     reply_markup=rm)
             return
         req = parse_quote(text if pid is None else f"_ {text}")
         if not req:
             await message.reply_text(
                 "Не понял запрос. Пример: «цитата покровитель глава 150 абзацы 1-5» "
-                'или «… от "фраза" до "фраза"».')
+                'или «… от "фраза" до "фраза"».', reply_markup=rm)
             return
         if pid is not None:
             proj = await self.db.get_project(pid)
@@ -661,30 +630,34 @@ class BotApp:
             res = await self.db.search(req.project_query)
             proj = res["projects"][0] if res["projects"] else None
         if not proj:
-            await message.reply_text("Тайтл не найден.")
+            await message.reply_text("Тайтл не найден.", reply_markup=rm)
             return
         ch = await self.db.fetchone(
             "SELECT * FROM chapters WHERE project_id=? AND number=?",
             (proj["id"], req.number))
         if not ch:
             await message.reply_text(
-                f"У «{proj['canonical_name']}» нет главы {req.number}.")
+                f"У «{proj['canonical_name']}» нет главы {req.number}.",
+                reply_markup=rm)
             return
         try:
             paras = await fetch_paragraphs(self.db, self.tg, ch["telegraph_url"])
         except Exception as e:  # noqa: BLE001
             log.warning("quote fetch failed: %s", e)
-            await message.reply_text("Не удалось получить текст главы с Telegraph.")
+            await message.reply_text("Не удалось получить текст главы с Telegraph.",
+                                     reply_markup=rm)
             return
         if not paras:
-            await message.reply_text("Текст главы пуст или недоступен.")
+            await message.reply_text("Текст главы пуст или недоступен.",
+                                     reply_markup=rm)
             return
 
         if req.mode == "preview":
             if not allow_preview:
                 await message.reply_text(
                     "Укажите диапазон: «абзацы A-B» или «от \"фраза\" до \"фраза\"». "
-                    "Предпросмотр абзацев доступен в личке с ботом.")
+                    "Предпросмотр абзацев доступен в личке с ботом.",
+                    reply_markup=rm)
                 return
             header = (f"📄 {proj['canonical_name']} — Глава {req.number}\n"
                       f"Абзацев: {len(paras)}. Диапазон: «… абзацы 1-5» "
@@ -698,10 +671,10 @@ class BotApp:
             out = build_quote(ch["telegraph_url"], title,
                               range_label(req, a, b), sel)
         except QuoteError as e:
-            await message.reply_text(f"⚠️ {e}")
+            await message.reply_text(f"⚠️ {e}", reply_markup=rm)
             return
         await message.reply_text(out, parse_mode=ParseMode.HTML,
-                                 disable_web_page_preview=True)
+                                 disable_web_page_preview=True, reply_markup=rm)
 
     # ── owner menu ─────────────────────────────────────────────────────────────
     def _menu_markup(self) -> InlineKeyboardMarkup:
