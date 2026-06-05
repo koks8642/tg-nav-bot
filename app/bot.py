@@ -20,7 +20,6 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
-    BotCommandScopeChat,
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -67,21 +66,19 @@ BTN_BACK = "🔙 Меню"
 BTN_MORE = "➡️ Ещё"
 BTN_PREV = "⬅️ Назад"
 TITLES_PER_PAGE = 8
+QUOTE_COOLDOWN = 2.0   # seconds between quote requests per user (anti-flood)
 
 PLATFORMS = [("rl", "ranobelib", "RanobeLib"), ("ml", "mangalib", "MangaLib"),
              ("sk", "senkuro", "Senkuro"), ("bo", "boosty", "Boosty")]
 PLATFORM_BY_CODE = {code: (col, label) for code, col, label in PLATFORMS}
 
-# Commands shown in the ≡ menu under the input field.
-PUBLIC_COMMANDS = [
-    BotCommand("start", "О боте и как искать 🔎"),
-    BotCommand("help", "Подсказка по поиску"),
+# Command (≡ / "/") menu. In private chats the menu is intentionally EMPTY
+# (everything is reachable from the reply keyboard, so commands would only
+# duplicate buttons). In groups the bot exposes exactly two commands:
+GROUP_COMMANDS = [
+    BotCommand("quote", "📄 Цитата главы: /quote <тайтл> глава N абзацы A-B"),
+    BotCommand("rqmbot", "❓ Как пользоваться ботом"),
 ]
-ADMIN_COMMANDS = [
-    BotCommand("menu", "🛠 Админка (проекты, разделы, хэштеги, конфликты)"),
-    BotCommand("help", "🔎 Подсказка по поиску"),
-]
-# /links, /health, /rebuild stay registered but hidden from the menu.
 
 
 def esc(s) -> str:
@@ -98,10 +95,8 @@ class BotApp:
         # cache of channel admin user ids (creator + administrators)
         self._admin_ids: set[int] = set()
         self._admin_ids_ts: float = 0.0
-        # users whose personal ≡ admin command menu we've already set
-        self._cmd_admins: set[int] = set()
-        # ≡-menu project command name → project id
-        self._proj_commands_map: dict[str, int] = {}
+        # per-user cooldown timestamps for the expensive quote path (anti-flood)
+        self._quote_seen: dict[int, float] = {}
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -125,95 +120,46 @@ class BotApp:
         app.add_handler(MessageHandler(
             filters.UpdateType.EDITED_CHANNEL_POST & chan, self.on_channel_post))
 
-        # all bot commands work ONLY in private chats (groups stay clean)
         priv = filters.ChatType.PRIVATE
+        # /quote and /rqmbot work everywhere (DM + groups); the rest is DM-only.
+        app.add_handler(CommandHandler("quote", self.cmd_quote))
+        app.add_handler(CommandHandler("rqmbot", self.cmd_help))
         app.add_handler(CommandHandler("start", self.cmd_start, filters=priv))
-        app.add_handler(CommandHandler("help", self.cmd_start, filters=priv))
         app.add_handler(CommandHandler("id", self.cmd_id, filters=priv))
-        app.add_handler(CommandHandler("health", self.cmd_health, filters=priv))
-        app.add_handler(CommandHandler("links", self.cmd_links, filters=priv))
-        app.add_handler(CommandHandler("menu", self.cmd_menu, filters=priv))
-        app.add_handler(CommandHandler("search", self.cmd_search, filters=priv))
-        app.add_handler(CommandHandler("rebuild", self.cmd_rebuild, filters=priv))
         app.add_handler(CallbackQueryHandler(self.on_callback))
         app.add_handler(InlineQueryHandler(self.on_inline))
         app.add_error_handler(self._on_error)
-        # private free text → quote keyword / owner pending / search
+        # private free text → reply-keyboard nav / quote flow / owner / search
         app.add_handler(MessageHandler(priv & filters.TEXT & ~filters.COMMAND,
                                        self.on_text))
-        # private /command fallback → per-project quick command → its card
-        app.add_handler(MessageHandler(priv & filters.COMMAND,
-                                       self.on_project_command))
-        # in GROUPS the bot reacts ONLY to the «цитата …» keyword, nothing else
-        app.add_handler(MessageHandler(
-            filters.ChatType.GROUPS & filters.TEXT, self.on_group_text))
+        # in GROUPS the bot reacts ONLY to /quote (+/rqmbot) — handled above by
+        # the command handlers. No other group message triggers anything.
 
         self.application = app
         return app
 
-    async def on_project_command(self, update: Update,
-                                 context: ContextTypes.DEFAULT_TYPE) -> None:
-        msg = update.effective_message
-        if not msg or not msg.text:
-            return
-        cmd = msg.text[1:].split("@")[0].split()[0].lower()
-        pid = self._proj_commands_map.get(cmd)
-        if pid is not None:
-            await self._send_project_card(msg, pid)
-
-    # ── command menu (≡ button under the input field) ────────────────────────
+    # ── command menu (the "/" list under the input field) ─────────────────────
     async def _post_init(self, application: Application) -> None:
         await self.setup_commands()
 
     async def setup_commands(self) -> None:
-        """Set the ≡ command menu: public commands ONLY in private chats, the
-        full menu for each admin, and NOTHING in groups (the bot never adds any
-        UI to a group — it only answers «цитата …»).
+        """Configure the "/" command menu.
 
-        Public commands are scoped to private chats rather than Default so they
-        can't leak into groups: Telegram falls back to Default for groups, and
-        an empty AllGroupChats override is unreliable across clients. We clear
-        both Default and AllGroupChats so no command menu shows in any group.
+        Private chats: NO commands at all (everything is on the reply keyboard,
+        so a command menu would only duplicate buttons). Groups: exactly
+        /quote and /rqmbot. We clear Default + AllPrivateChats and set only the
+        group scope, so nothing leaks into private chats and groups show just
+        the two intended commands.
         """
         bot = self.application.bot
         try:
-            # build the command→project map (so /<key> still works if typed) but
-            # DON'T clutter the ≡ menu with one command per project — quick title
-            # access is the "📚 Тайтлы" reply button, which scales to dozens.
-            await self._project_commands()
-            await bot.set_my_commands(
-                PUBLIC_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+            await bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
             await bot.delete_my_commands(scope=BotCommandScopeDefault())
-            await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
-            admin_ids = set(self.cfg.owner_user_ids) | await self._channel_admin_ids(force=True)
-            for uid in admin_ids:
-                try:
-                    await bot.set_my_commands(
-                        ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
-                    self._cmd_admins.add(uid)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("set admin commands for %s skipped: %s", uid, e)
-            log.info("command menus set (%d admins)", len(admin_ids))
+            await bot.set_my_commands(
+                GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+            log.info("command menu set (private: none, groups: quote+rqmbot)")
         except Exception as e:  # noqa: BLE001
             log.warning("set_my_commands failed: %s", e)
-
-    @staticmethod
-    def _proj_cmd_name(key: str) -> str:
-        """A valid Telegram command (a-z0-9_, ≤32) for a project key."""
-        return re.sub(r"[^a-z0-9_]", "_", key.lower())[:32].strip("_") or "p"
-
-    async def _project_commands(self) -> list[BotCommand]:
-        """One ≡-menu command per project → opens its card. Also (re)builds the
-        command→project map used by the fallback handler."""
-        self._proj_commands_map = {}
-        cmds: list[BotCommand] = []
-        for p in await self.db.list_projects():
-            name = self._proj_cmd_name(p["key"])
-            if name in self._proj_commands_map:
-                continue
-            self._proj_commands_map[name] = p["id"]
-            cmds.append(BotCommand(name, f"📖 {p['canonical_name']}"[:256]))
-        return cmds[:90]  # Telegram caps total commands at 100
 
     def _main_keyboard(self, is_admin: bool) -> ReplyKeyboardMarkup:
         """Top-level reply keyboard: Произведения + help / admin."""
@@ -294,21 +240,7 @@ class BotApp:
 
     async def _owner(self, update: Update) -> bool:
         u = update.effective_user
-        if not u or not await self.is_admin(u.id):
-            return False
-        await self._ensure_admin_commands(u.id)
-        return True
-
-    async def _ensure_admin_commands(self, uid: int) -> None:
-        """Lazily give a recognised admin their personal ≡ command menu."""
-        if uid in self._cmd_admins:
-            return
-        try:
-            await self.application.bot.set_my_commands(
-                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
-            self._cmd_admins.add(uid)
-        except Exception as e:  # noqa: BLE001
-            log.debug("ensure admin commands for %s: %s", uid, e)
+        return bool(u and await self.is_admin(u.id))
 
     async def notify_owners(self, text: str) -> None:
         if not self.application:
@@ -348,80 +280,91 @@ class BotApp:
                               f"chapters={result.chapters} items={result.items}")
 
     # ── commands ─────────────────────────────────────────────────────────────
-    async def cmd_start(self, update: Update,
-                        context: ContextTypes.DEFAULT_TYPE) -> None:
-        # /start and /help always show the user guide (for everyone). The admin
-        # panel is opened only by /menu. is_admin() here also primes the admin's
-        # ≡ command menu.
-        is_adm = await self._owner(update)
-        bot = context.bot.username or "bot"
+    def _greeting_html(self, is_adm: bool, bot_username: str) -> str:
+        """The DM welcome / guide (shown on /start, /rqmbot and «ℹ️ Помощь»)."""
         text = (
             "👋 <b>Навигатор переводов RQM</b>\n"
-            "Здесь можно мгновенно находить главы новелл и манги, а также арты, "
-            "мемы и заметки команды.\n\n"
-            "🔎 <b>Главное — это поиск.</b> Просто напишите мне сообщение, "
-            "никаких команд и кнопок не нужно. Искать можно по:\n"
-            "• <b>названию проекта</b> — открою карточку тайтла: все главы по аркам, "
-            "арты, мемы, заметки и ссылки на площадки (RanobeLib, MangaLib и др.);\n"
-            "• <b>номеру главы</b> — покажу её во всех тайтлах, где она выходила "
-            "(а если добавить название тайтла — сразу нужную);\n"
-            "• <b>названию арки</b> или <b>названию арта/мема/заметки</b>.\n\n"
-            "У каждого результата — кнопки <b>📖 Читать</b> (страница на Telegraph) "
-            "и <b>💬 Пост</b> (оригинальный пост в канале).\n\n"
-            f"⚡️ <b>Поиск в любом чате.</b> Наберите <code>@{bot}</code> и запрос — "
-            "и отправьте найденную главу другу, не выходя из переписки.\n\n"
-            "📌 Полная навигация по всем проектам закреплена в канале.\n\n"
-            "Попробуйте прямо сейчас — пришлите название любого тайтла 👇")
-        text += ("\n\n👇 Меню под полем ввода: <b>📚 Произведения</b> → виды "
-                 "(манга / манхва / новеллы) → конкретные тайтлы.")
+            "Мгновенный поиск глав новелл и манги, а также артов, мемов и "
+            "заметок команды.\n\n"
+            "🔎 <b>Просто напишите мне</b> — без команд и кнопок. Искать можно по:\n"
+            "• <b>названию тайтла</b> → карточка: все главы по аркам, арты/мемы/"
+            "заметки и ссылки на площадки (RanobeLib, MangaLib и др.);\n"
+            "• <b>номеру главы</b> (<code>304</code>, <code>покровитель 305</code>) "
+            "→ покажу во всех тайтлах, где она выходила;\n"
+            "• <b>названию арки</b> или <b>арта / мема / заметки</b>.\n\n"
+            "У каждого результата — <b>📖 Читать</b> (Telegraph) и <b>💬 Пост</b> "
+            "(оригинал в канале).\n\n"
+            "📄 <b>Цитата главы:</b> <code>/quote покровитель глава 150 абзацы 1-5</code> "
+            'или <code>… от "фраза" до "фраза"</code>. Можно из карточки тайтла '
+            "кнопкой «Цитировать».\n\n"
+            f"⚡️ <b>Поиск в любом чате:</b> наберите <code>@{esc(bot_username)}</code> "
+            "и запрос — и отправьте главу другу, не выходя из переписки.\n\n"
+            "👇 Внизу: <b>📚 Произведения</b> → виды (манга / манхва / новеллы) → "
+            "тайтлы. Полная навигация закреплена в канале.")
         if is_adm:
-            text += "\n\n🛠 <b>Вы администратор.</b> Управление: /menu"
+            text += "\n\n🛠 <b>Вы администратор.</b> Панель управления — кнопка «Админка»."
+        return text
+
+    async def cmd_start(self, update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+        is_adm = await self._owner(update)
         await update.message.reply_text(
-            text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            self._greeting_html(is_adm, context.bot.username or "bot"),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
             reply_markup=self._main_keyboard(is_adm))
+
+    async def cmd_help(self, update: Update,
+                       context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/rqmbot — context-aware mini-guide (full in DM, quote-only in groups)."""
+        msg = update.effective_message
+        if not msg:
+            return
+        if msg.chat.type == ChatType.PRIVATE:
+            is_adm = await self._owner(update)
+            await msg.reply_text(
+                self._greeting_html(is_adm, context.bot.username or "bot"),
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                reply_markup=self._main_keyboard(is_adm))
+            return
+        # group: the bot does exactly one thing here
+        await msg.reply_text(
+            "🤖 <b>RQM-бот в группе</b>\n"
+            "Здесь я умею только цитировать главы. Команда:\n"
+            "• <code>/quote покровитель глава 150 абзацы 1-5</code>\n"
+            '• <code>/quote покровитель глава 150 от "фраза" до "фраза"</code>\n\n'
+            "Полный поиск и навигация — в личке со мной "
+            f"(<a href=\"https://t.me/{esc(context.bot.username or 'bot')}\">"
+            "открыть</a>).",
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            reply_markup=ReplyKeyboardRemove())
+
+    async def cmd_quote(self, update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/quote — works in DM and groups. Preview (numbered paragraphs) is
+        DM-only; groups require an explicit range."""
+        msg = update.effective_message
+        if not msg:
+            return
+        in_priv = msg.chat.type == ChatType.PRIVATE
+        text = (msg.text or "").partition(" ")[2].strip()  # drop the /quote token
+        if not text:
+            rm = None if in_priv else ReplyKeyboardRemove()
+            await msg.reply_text(
+                "📄 Цитата главы. Пример:\n"
+                "• <code>/quote покровитель глава 150 абзацы 1-5</code>\n"
+                "• <code>/quote покровитель глава 150 абзац 7</code>\n"
+                '• <code>/quote покровитель глава 150 от "фраза" до "фраза"</code>'
+                + ("\n• <code>/quote покровитель глава 150</code> — список абзацев "
+                   "для выбора" if in_priv else ""),
+                parse_mode=ParseMode.HTML, reply_markup=rm)
+            return
+        await self._quote_from_text(msg, text, allow_preview=in_priv)
 
     async def cmd_id(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
         u, c = update.effective_user, update.effective_chat
         await update.message.reply_text(
             f"user_id: `{u.id}`\nchat_id: `{c.id}`", parse_mode=ParseMode.MARKDOWN)
-
-    async def cmd_menu(self, update: Update,
-                       context: ContextTypes.DEFAULT_TYPE) -> None:
-        if await self._owner(update):
-            await self._send_menu(update.effective_message)
-
-    async def cmd_search(self, update: Update,
-                         context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = " ".join(context.args) if context.args else ""
-        if not query:
-            await update.message.reply_text("Напишите запрос после /search, "
-                                            "или просто пришлите его сообщением.")
-            return
-        await self._do_search(update.effective_message, query)
-
-    async def cmd_health(self, update: Update,
-                         context: ContextTypes.DEFAULT_TYPE) -> None:
-        if await self._owner(update):
-            await update.message.reply_text(await self._health_text(),
-                                            parse_mode=ParseMode.HTML)
-
-    async def cmd_links(self, update: Update,
-                        context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._owner(update):
-            return
-        await update.message.reply_text(await self._links_text(),
-                                        parse_mode=ParseMode.HTML,
-                                        disable_web_page_preview=True)
-
-    async def cmd_rebuild(self, update: Update,
-                          context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._owner(update):
-            return
-        from .rebuild import enqueue_full_rebuild
-        await enqueue_full_rebuild(self.db)
-        await update.message.reply_text("♻️ Полная пересборка поставлена в очередь.")
-
 
     # ── search (everyone) ─────────────────────────────────────────────────────
     @staticmethod
@@ -458,7 +401,8 @@ class BotApp:
 
     async def _do_search(self, message, query: str) -> None:
         # strip a leading emoji/symbol (reply-keyboard buttons are "🌘 Имя")
-        query = re.sub(r"^\W+", "", query.strip())
+        # and cap length so a pasted wall of text can't drive a huge LIKE scan.
+        query = re.sub(r"^\W+", "", query.strip())[:100]
         try:
             res = await self.db.search(query, limit=30)
             # a project name/hashtag with no chapter number → show its card
@@ -539,12 +483,7 @@ class BotApp:
                 reply_markup=self._main_keyboard(await self.is_admin(
                     update.effective_user.id)))
             return
-        # «цитата …» keyword (DM)
-        rest = self._strip_quote_kw(text, context.bot.username)
-        if rest is not None:
-            await self._quote_from_text(msg, rest, allow_preview=True)
-            return
-        # quote flow (any user, started from a project card)
+        # quote flow (any user, started from a project card's «Цитировать» button)
         if context.user_data.get("quote_pid"):
             pid = context.user_data.pop("quote_pid")
             await self._quote_from_text(msg, text, pid=pid, allow_preview=True)
@@ -558,11 +497,16 @@ class BotApp:
     async def on_inline(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
         iq = update.inline_query
-        query = (iq.query or "").strip()
+        query = (iq.query or "").strip()[:100]
         if not query:
             await iq.answer([], cache_time=5)
             return
-        res = await self.db.search(query, limit=25)
+        try:
+            res = await self.db.search(query, limit=25)
+        except Exception:  # noqa: BLE001
+            log.exception("inline search failed")
+            await iq.answer([], cache_time=5)
+            return
         posts = await self._post_urls()
         results = []
         for c in res["chapters"][:25]:
@@ -582,28 +526,21 @@ class BotApp:
                     disable_web_page_preview=True)))
         await iq.answer(results, cache_time=5, is_personal=False)
 
-    # ── chapter quoting (keyword «цитата …»; DM + groups) ─────────────────────
-    @staticmethod
-    def _strip_quote_kw(text: str, bot_username: str | None) -> str | None:
-        """If the message is a «цитата …» request (optionally after an @mention),
-        return the part after the keyword; otherwise None."""
-        t = text.strip()
-        if bot_username and t.lower().startswith("@" + bot_username.lower()):
-            t = t[len("@" + bot_username):].strip()
-        m = re.match(r"(?i)цитата\b[:\s]*", t)
-        return t[m.end():].strip() if m else None
-
-    async def on_group_text(self, update: Update,
-                            context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Groups: react ONLY to «цитата …» — never touch the chat otherwise
-        (no menu, search, status messages or keyboards)."""
-        msg = update.effective_message
-        if not msg:
-            return
-        rest = self._strip_quote_kw(msg.text or "", context.bot.username)
-        if rest is None:
-            return
-        await self._quote_from_text(msg, rest, allow_preview=False)
+    # ── chapter quoting (/quote; DM + groups) ─────────────────────────────────
+    def _quote_throttled(self, user_id: int | None) -> bool:
+        """True if this user fired a quote too recently. Cheap per-user cooldown
+        so a flood of /quote can't hammer Telegraph. State is in-memory."""
+        import time
+        if user_id is None:
+            return False
+        now = time.time()
+        last = self._quote_seen.get(user_id, 0.0)
+        # opportunistic cleanup so the dict can't grow unbounded
+        if len(self._quote_seen) > 5000:
+            self._quote_seen = {u: t for u, t in self._quote_seen.items()
+                                if now - t < QUOTE_COOLDOWN}
+        self._quote_seen[user_id] = now
+        return (now - last) < QUOTE_COOLDOWN
 
     async def _quote_from_text(self, message, text: str, *, pid: int | None = None,
                                allow_preview: bool = True) -> None:
@@ -614,6 +551,11 @@ class BotApp:
         rm = (ReplyKeyboardRemove()
               if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
               else None)
+        uid = message.from_user.id if message.from_user else None
+        if self._quote_throttled(uid):
+            await message.reply_text("⏳ Слишком часто. Подождите пару секунд.",
+                                     reply_markup=rm)
+            return
         if self.tg is None:
             await message.reply_text("Цитирование временно недоступно.",
                                      reply_markup=rm)
@@ -621,7 +563,7 @@ class BotApp:
         req = parse_quote(text if pid is None else f"_ {text}")
         if not req:
             await message.reply_text(
-                "Не понял запрос. Пример: «цитата покровитель глава 150 абзацы 1-5» "
+                "Не понял запрос. Пример: «/quote покровитель глава 150 абзацы 1-5» "
                 'или «… от "фраза" до "фраза"».', reply_markup=rm)
             return
         if pid is not None:
@@ -683,6 +625,9 @@ class BotApp:
              InlineKeyboardButton("🗂 Разделы", callback_data="sect")],
             [InlineKeyboardButton("🏬 Виды произведений", callback_data="groups"),
              InlineKeyboardButton("🏷 Хэштеги", callback_data="tags")],
+            [InlineKeyboardButton("📊 Статус", callback_data="health"),
+             InlineKeyboardButton("🔗 Ссылки", callback_data="links_cb")],
+            [InlineKeyboardButton("♻️ Пересобрать навигацию", callback_data="rebuild_all")],
         ])
 
     async def _send_menu(self, message) -> None:
@@ -1012,7 +957,6 @@ class BotApp:
                                   "AND target_id=?", (pid,))
             await self.db.execute("DELETE FROM projects WHERE id=?", (pid,))
             await self.db.enqueue_build("root", None)
-            await self.setup_commands()  # refresh ≡ project commands
             await q.edit_message_text("🗑 Проект удалён.", reply_markup=self._back("proj"))
         elif head == "ptags":
             await self._show_project_tags(q, int(parts[1]))
@@ -1640,7 +1584,6 @@ class BotApp:
             field = action[2:]
             if field == "name":
                 await self.db.update_project(pid, canonical_name=text)
-                await self.setup_commands()  # refresh ≡ project commands
             elif field == "emoji":
                 await self.db.update_project(pid, emoji=text[:8])
             elif field == "order":
@@ -1672,7 +1615,6 @@ class BotApp:
             pid = await self.db.upsert_project(
                 key=key, canonical_name=name, slug=slugify(name), emoji=emoji)
             await self._enqueue_project(pid)
-            await self.setup_commands()  # refresh ≡ project commands
             await msg.reply_text(
                 f"✅ Проект «{esc(name)}» создан. Привяжите к нему хэштег.",
                 reply_markup=InlineKeyboardMarkup([[

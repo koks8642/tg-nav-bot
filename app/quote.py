@@ -15,6 +15,8 @@ from .util import clip
 TG_LIMIT = 4096           # Telegram message hard limit (visible text)
 QUOTE_MARGIN = 80         # reserve for the header/markup safety
 MAX_PARAGRAPHS = 200      # hard upper bound (length check is the real limit)
+MAX_LINES = 200           # safety cap on total lines (blank lines count too)
+MAX_PREVIEW_MSGS = 6      # cap preview spam: never send more than N messages
 
 
 class QuoteError(Exception):
@@ -170,12 +172,15 @@ def build_quote(link_url: str, title_line: str, label: str,
     expandable blockquote with the text. Raises QuoteError if it does not fit
     a single Telegram message (we never split)."""
     body = "\n\n".join(paragraphs)
-    # visible text = title + range + body (HTML tags don't count toward 4096)
+    # visible text = title + range + body (HTML tags don't count toward 4096).
+    # Every newline counts toward the limit, so paragraphs separated by blank
+    # lines are accounted for here; we also guard the raw line count.
     visible = len(title_line) + len(label) + len(body) + 4
-    if visible > limit - QUOTE_MARGIN:
+    lines = body.count("\n") + 3  # body lines + the 2-line header
+    if visible > limit - QUOTE_MARGIN or lines > MAX_LINES:
         raise QuoteError(
-            f"фрагмент слишком длинный для одного сообщения "
-            f"(~{visible} символов, лимит {limit}). Сузьте диапазон.")
+            f"фрагмент слишком большой для одного сообщения "
+            f"(~{visible} симв., {lines} строк; лимит {limit}). Сузьте диапазон.")
     head = (f'🔗 <a href="{html.escape(link_url, quote=True)}">'
             f'{html.escape(title_line)}</a>\n{html.escape(label)}')
     return f"{head}\n<blockquote expandable>{html.escape(body)}</blockquote>"
@@ -183,15 +188,24 @@ def build_quote(link_url: str, title_line: str, label: str,
 
 def build_preview(header: str, paragraphs: list[str],
                   limit: int = TG_LIMIT) -> list[str]:
-    """Numbered paragraph list (DM helper) — may span several messages."""
+    """Numbered paragraph list (DM helper). Capped at MAX_PREVIEW_MSGS messages
+    so a huge chapter can't flood the chat — the rest is summarised."""
     lines = [f"{i}. {clip(p, 80)}" for i, p in enumerate(paragraphs, 1)]
     msgs: list[str] = []
     cur = header.rstrip() + "\n\n"
+    shown = 0
     for ln in lines:
         if len(cur) + len(ln) + 1 > limit:
             msgs.append(cur.rstrip())
             cur = ""
+            if len(msgs) >= MAX_PREVIEW_MSGS:
+                break
         cur += ln + "\n"
-    if cur.strip():
-        msgs.append(cur.rstrip())
+        shown += 1
+    else:
+        if cur.strip():
+            msgs.append(cur.rstrip())
+    if shown < len(paragraphs):
+        msgs[-1] += (f"\n\n…показаны абзацы 1–{shown} из {len(paragraphs)}. "
+                     "Сузьте диапазон, напр. «абзацы 50-70».")
     return msgs

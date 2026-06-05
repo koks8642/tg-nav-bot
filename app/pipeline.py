@@ -166,7 +166,9 @@ async def _store_category_item(db: Database, post: ParsedPost, section_id: int,
     """Category content (art/meme/note/…) lives in the Telegram post itself.
 
     The navigation entry is the post's first meaningful line (hashtags stripped)
-    plus a link to the post in the channel.
+    plus a link to the post in the channel. Media-only posts (e.g. just «#мем»
+    on a picture) carry no text, so they get a stable «<Раздел> #N» label
+    instead of a bare «Без названия».
     """
     title = ""
     for line in post.text.splitlines():
@@ -174,5 +176,23 @@ async def _store_category_item(db: Database, post: ParsedPost, section_id: int,
         if cleaned:
             title = cleaned[:200]
             break
-    await db.add_item(section_id, project_id, title or "Без названия", tg_url,
+    if not title:
+        title = await _auto_item_title(db, section_id, tg_url, post.message_id)
+    await db.add_item(section_id, project_id, title, tg_url,
                       post.message_id, date)
+
+
+async def _auto_item_title(db: Database, section_id: int, tg_url: str,
+                           message_id: int) -> str:
+    """Build «<Раздел> #N» for a text-less post. Reuses the existing title on
+    re-processing (so an edit doesn't renumber it), otherwise assigns the next
+    sequential number within the section."""
+    existing = await db.fetchone(
+        "SELECT title FROM items WHERE section_id=? AND post_id=? AND url=?",
+        (section_id, message_id, tg_url))
+    if existing and existing["title"]:
+        return existing["title"]
+    section = await db.get_section(section_id)
+    name = section["name"] if section else "Запись"
+    n = await db.count_items(section_id=section_id) + 1
+    return f"{name} #{n}"

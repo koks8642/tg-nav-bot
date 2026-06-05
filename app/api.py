@@ -25,12 +25,14 @@ def _json(data, status: int = 200) -> web.Response:
 
 
 async def health(request: web.Request):
+    # Liveness probe only — must NOT leak internal stats (this port may be
+    # publicly reachable on a VM). Admins see detailed stats via the bot.
     db: Database = request.app["db"]
     try:
-        stats = await db.stats()
-        return _json({"ok": True, "stats": stats})
-    except Exception as e:  # noqa: BLE001
-        return _json({"ok": False, "error": str(e)}, status=500)
+        await db.fetchone("SELECT 1")
+        return _json({"ok": True})
+    except Exception:  # noqa: BLE001
+        return _json({"ok": False}, status=500)
 
 
 async def index(request: web.Request):
