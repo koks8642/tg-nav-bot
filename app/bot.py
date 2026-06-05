@@ -34,7 +34,6 @@ from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
-    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
@@ -703,8 +702,6 @@ class BotApp:
             return
         await message.reply_text(out, parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
-
-    # ── owner menu ─────────────────────────────────────────────────────────────
 
     # ── owner menu ─────────────────────────────────────────────────────────────
     def _menu_markup(self) -> InlineKeyboardMarkup:
@@ -1571,11 +1568,6 @@ class BotApp:
             reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
     async def _section_edit(self, q, context, sid: int, field: str) -> None:
-        if field == "del":
-            await self.db.execute("DELETE FROM sections WHERE id=?", (sid,))
-            await self.db.enqueue_build("root", None)
-            await q.edit_message_text("🗑 Раздел удалён.", reply_markup=self._back("sect"))
-            return
         prompts = {"name": "новое название", "emoji": "новый эмодзи",
                    "order": "число порядка"}
         self._set_await(context, f"s_{field}", sid=sid)

@@ -100,8 +100,8 @@ app/
   bot.py        бот: watcher + поиск (текст/inline) + CRUD-админка
   api.py        минимальный health-сервер (liveness для хостинга)
   main.py       entrypoint: бот + health-сервер + воркер + reconciler
-scripts/        setup_telegraph, whoami, run_backfill, analyze_export
-tests/          39 тестов (parser, backfill, render, rebuild, pipeline, search, config)
+scripts/        setup_telegraph, whoami, run_backfill
+tests/          64 теста (parser, backfill, render, rebuild, pipeline, quote, search, config)
 ```
 
 ---
@@ -112,7 +112,6 @@ tests/          39 тестов (parser, backfill, render, rebuild, pipeline, se
 python -m pip install -r requirements.txt
 cp .env.example .env          # заполнить BOT_TOKEN, CHANNEL_CHAT_ID и т.д.
 
-python -m scripts.analyze_export   # что распарсится из экспорта (без БД)
 python -m scripts.run_backfill     # наполнить БД историей (data/rqm.db)
 python -m pytest -q                # тесты
 python -m app.main                 # запустить всё
