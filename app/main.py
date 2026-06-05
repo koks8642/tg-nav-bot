@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from datetime import datetime, timezone
 
 from aiohttp import web
 
@@ -21,6 +22,8 @@ from .seed import seed_registry
 from .telegraph import TelegraphClient
 
 WORKER_POLL_SECONDS = 3  # natural debounce for bursts of posts
+BACKUP_INTERVAL_HOURS = 24
+BACKUP_KEEP = 7          # rolling daily backups kept on disk
 
 
 async def _ensure_telegraph_token(db: Database, tg: TelegraphClient,
@@ -105,6 +108,30 @@ async def run() -> None:
 
     reconciler_task = asyncio.create_task(reconciler())
 
+    async def backup_worker() -> None:
+        """Daily on-disk snapshot of the DB, keeping the last BACKUP_KEEP files
+        under <db_dir>/backups/. Defends against accidental wipes / corruption,
+        not just restarts (the volume already survives restarts)."""
+        interval = BACKUP_INTERVAL_HOURS * 3600
+        backups = cfg.db_path.parent / "backups"
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return  # shutdown
+            except asyncio.TimeoutError:
+                pass
+            try:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                await db.snapshot(backups / f"rqm.{ts}.db")
+                kept = sorted(backups.glob("rqm.*.db"))
+                for old in kept[:-BACKUP_KEEP]:
+                    old.unlink(missing_ok=True)
+                log.info("backup written (%d kept)", min(len(kept), BACKUP_KEEP))
+            except Exception as e:  # noqa: BLE001
+                await db.log("ERROR", "backup", str(e))
+
+    backup_task = asyncio.create_task(backup_worker())
+
     # start the bot — retry init, since api.telegram.org can be slow/flaky
     # (notably throttled from RU networks); give it several attempts.
     for attempt in range(1, 8):
@@ -160,6 +187,7 @@ async def run() -> None:
         stop.set()
         worker_task.cancel()
         reconciler_task.cancel()
+        backup_task.cancel()
         await application.updater.stop()
         await application.stop()
         await application.shutdown()

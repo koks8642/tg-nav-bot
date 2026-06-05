@@ -48,10 +48,15 @@ def nodes_to_paragraphs(content: list) -> list[str]:
     return paras
 
 
+CACHE_TTL_SEC = 6 * 3600   # re-fetch chapter text at most ~once / 6h (auto-refresh)
+
+
 async def fetch_paragraphs(db: Database, telegraph: TelegraphClient,
                            url: str) -> list[str]:
-    """Cached chapter paragraphs (keyed by telegraph url)."""
-    cached = await db.get_chapter_cache(url)
+    """Cached chapter paragraphs (keyed by telegraph url). A stale entry (older
+    than CACHE_TTL_SEC) is re-fetched, so author edits to the Telegraph page
+    show up automatically without a manual refresh."""
+    cached = await db.get_chapter_cache(url, max_age_sec=CACHE_TTL_SEC)
     if cached is not None:
         return cached
     path = url.rstrip("/").rsplit("/", 1)[-1]

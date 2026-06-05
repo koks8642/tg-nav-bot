@@ -7,7 +7,9 @@ data on a persistent volume.
 """
 from __future__ import annotations
 
+import difflib
 import json
+import re
 import shutil
 import time
 from datetime import datetime, timezone
@@ -15,6 +17,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import aiosqlite
+
+FUZZY_CUTOFF = 0.72   # min similarity for typo-tolerant title matching
 
 SCHEMA_VERSION = 3
 
@@ -244,6 +248,17 @@ class Database:
             return None
         dest = self.path.with_name(f"{self.path.stem}.{int(time.time())}.bak")
         shutil.copy2(self.path, dest)
+        return dest
+
+    async def snapshot(self, dest: Path) -> Path:
+        """Write a consistent copy of the DB to ``dest`` using SQLite's
+        ``VACUUM INTO`` (safe even in WAL mode, unlike a raw file copy). The
+        destination must not already exist."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            dest.unlink()
+        await self.conn.commit()  # VACUUM can't run inside a transaction
+        await self.conn.execute("VACUUM INTO ?", (str(dest),))
         return dest
 
     # ── generic helpers ──────────────────────────────────────────────────────
@@ -524,11 +539,24 @@ class Database:
         await self.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
 
     # ── chapter text cache (for quoting) ─────────────────────────────────────
-    async def get_chapter_cache(self, url: str) -> list[str] | None:
+    async def get_chapter_cache(self, url: str,
+                                max_age_sec: int | None = None) -> list[str] | None:
+        """Cached paragraphs for a chapter. If ``max_age_sec`` is given, a stale
+        entry (older than that) is ignored so the text auto-refreshes when the
+        author edits the Telegraph page."""
         row = await self.fetchone(
-            "SELECT paragraphs FROM chapter_cache WHERE telegraph_url=?", (url,))
+            "SELECT paragraphs, fetched_at FROM chapter_cache WHERE telegraph_url=?",
+            (url,))
         if not row:
             return None
+        if max_age_sec is not None and row["fetched_at"]:
+            try:
+                fetched = datetime.fromisoformat(row["fetched_at"])
+                age = (datetime.now(timezone.utc) - fetched).total_seconds()
+                if age > max_age_sec:
+                    return None
+            except ValueError:
+                return None
         try:
             return json.loads(row["paragraphs"])
         except (json.JSONDecodeError, TypeError):
@@ -540,6 +568,10 @@ class Database:
             "VALUES(?,?,?) ON CONFLICT(telegraph_url) DO UPDATE SET "
             "paragraphs=excluded.paragraphs, fetched_at=excluded.fetched_at",
             (url, json.dumps(paragraphs, ensure_ascii=False), _now()))
+
+    async def delete_chapter_cache(self, url: str) -> None:
+        await self.execute(
+            "DELETE FROM chapter_cache WHERE telegraph_url=?", (url,))
 
     # ── arc operations (rename / merge / split) ──────────────────────────────
     async def rename_arc(self, project_id: int, old_arc: str, new_arc: str) -> int:
@@ -717,6 +749,21 @@ class Database:
                             proj_ids.add(pid)
                     if pid not in scope_ids:
                         scope_ids.append(pid)
+
+        # ── fuzzy fallback: tolerate typos in the title («покравитель») ───────
+        if text and not projects:
+            qwords = [w for w in words if len(w) >= 4] or [text]
+            scored: list[tuple[float, dict]] = []
+            for pr in await self.fetchall("SELECT * FROM projects WHERE hidden=0"):
+                nwords = [w for w in re.split(r"\W+", pr["canonical_name"].lower())
+                          if len(w) >= 4]
+                best = max((difflib.SequenceMatcher(None, qw, nw).ratio()
+                            for qw in qwords for nw in nwords), default=0.0)
+                if best >= FUZZY_CUTOFF:
+                    scored.append((best, dict(pr)))
+            scored.sort(key=lambda t: -t[0])
+            projects = [p for _, p in scored[:5]]
+            scope_ids = [p["id"] for p in projects]
 
         # ── chapters ──────────────────────────────────────────────────────────
         conds, params = ["1=1"], []

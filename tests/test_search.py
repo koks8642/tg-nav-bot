@@ -59,6 +59,15 @@ def test_search_variants(tmp_path):
             # переводчика" but not in its name → must still find the section
             r7 = await db.search("заметки")
             assert any(s["key"] == "zametki" for s in r7["sections"])
+
+            # fuzzy fallback: a typo'd title still resolves to the project
+            r8 = await db.search("покравитель")  # 'а' instead of 'о'
+            assert any(p["key"] == "pokrovitel" for p in r8["projects"])
+
+            # fuzzy + number: typo'd title scopes the chapter search
+            r9 = await db.search("покравитель 200")
+            assert r9["chapters"] and all(
+                c["project_key"] == "pokrovitel" for c in r9["chapters"])
         finally:
             await db.close()
     asyncio.run(go())

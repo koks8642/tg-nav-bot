@@ -160,5 +160,27 @@ def test_edit_updates_same_chapter(tmp_path):
     asyncio.run(go())
 
 
+def test_edit_removes_dropped_chapter(tmp_path):
+    async def go():
+        db, cfg = await _fresh_db(tmp_path / "ed.db")
+        try:
+            both = [
+                ("https://telegra.ph/x-Glava-305", "Глава 305"),
+                ("https://telegra.ph/x-Glava-306", "Глава 306"),
+            ]
+            await process_post(db, cfg, _post(700, "#покровитель главы 305-306", both))
+            proj = await db.get_project_by_key("pokrovitel")
+            assert len(await db.list_chapters(proj["id"])) == 2
+            # edit drops the link to 306 → it must disappear from navigation
+            only = [("https://telegra.ph/x-Glava-305", "Глава 305")]
+            await process_post(db, cfg, _post(700, "#покровитель глава 305", only),
+                               is_edit=True)
+            nums = [c["number"] for c in await db.list_chapters(proj["id"])]
+            assert nums == [305]
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     pass

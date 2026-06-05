@@ -76,8 +76,8 @@ PLATFORM_BY_CODE = {code: (col, label) for code, col, label in PLATFORMS}
 # (everything is reachable from the reply keyboard, so commands would only
 # duplicate buttons). In groups the bot exposes exactly two commands:
 GROUP_COMMANDS = [
-    BotCommand("quote", "📄 Цитата главы: /quote <тайтл> глава N абзацы A-B"),
-    BotCommand("rqmbot", "❓ Как пользоваться ботом"),
+    BotCommand("quote", "Процитировать главу"),
+    BotCommand("rqmbot", "Как пользоваться ботом"),
 ]
 
 
@@ -508,7 +508,40 @@ class BotApp:
             await iq.answer([], cache_time=5)
             return
         posts = await self._post_urls()
-        results = []
+
+        def article(title: str, desc: str, body: str) -> InlineQueryResultArticle:
+            return InlineQueryResultArticle(
+                id=str(uuid4()), title=title, description=desc,
+                input_message_content=InputTextMessageContent(
+                    body, parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True))
+
+        results: list[InlineQueryResultArticle] = []
+        # ── project / group / section cards first (a name query wants these) ──
+        for p in res.get("projects", [])[:5]:
+            page = await self.db.get_page_for("project", p["id"])
+            cnt = await self.db.count_chapters(p["id"])
+            body = f"{p['emoji']} <b>{esc(p['canonical_name'])}</b> · глав: {cnt}"
+            if page:
+                body += (f"\n<a href=\"https://telegra.ph/{page['path']}\">"
+                         "🌐 Открыть навигацию</a>")
+            results.append(article(
+                f"{p['emoji']} {p['canonical_name']}", "Открыть тайтл", body))
+        for g in res.get("groups", [])[:3]:
+            page = await self.db.get_page_for("group", g["id"])
+            if page:
+                results.append(article(
+                    f"{g['emoji']} {g['name']}", "Вид произведений",
+                    f"{g['emoji']} <b>{esc(g['name'])}</b>\n"
+                    f"<a href=\"https://telegra.ph/{page['path']}\">🌐 Открыть</a>"))
+        for s in res.get("sections", [])[:3]:
+            page = await self.db.get_page_for("section", s["id"])
+            if page:
+                results.append(article(
+                    f"{s['emoji']} {s['name']}", "Раздел",
+                    f"{s['emoji']} <b>{esc(s['name'])}</b>\n"
+                    f"<a href=\"https://telegra.ph/{page['path']}\">🌐 Открыть</a>"))
+        # ── chapters ──────────────────────────────────────────────────────────
         for c in res["chapters"][:25]:
             title = f"{c['project_name']} — гл. {c['number']}"
             desc = c["arc"] or ""
@@ -519,12 +552,8 @@ class BotApp:
             purl = posts.get(c["post_id"])
             if purl:
                 body += f"\n<a href=\"{esc(purl)}\">💬 Пост в канале</a>"
-            results.append(InlineQueryResultArticle(
-                id=str(uuid4()), title=title, description=desc,
-                input_message_content=InputTextMessageContent(
-                    body, parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True)))
-        await iq.answer(results, cache_time=5, is_personal=False)
+            results.append(article(title, desc, body))
+        await iq.answer(results[:50], cache_time=5, is_personal=False)
 
     # ── chapter quoting (/quote; DM + groups) ─────────────────────────────────
     def _quote_throttled(self, user_id: int | None) -> bool:
@@ -628,6 +657,7 @@ class BotApp:
             [InlineKeyboardButton("📊 Статус", callback_data="health"),
              InlineKeyboardButton("🔗 Ссылки", callback_data="links_cb")],
             [InlineKeyboardButton("♻️ Пересобрать навигацию", callback_data="rebuild_all")],
+            [InlineKeyboardButton("💾 Скачать бэкап БД", callback_data="backup")],
         ])
 
     async def _send_menu(self, message) -> None:
@@ -635,6 +665,27 @@ class BotApp:
             "🛠 <b>Админка RQM</b>\nВыберите раздел. "
             "Поиск работает в любой момент — просто пришлите запрос.",
             reply_markup=self._menu_markup(), parse_mode=ParseMode.HTML)
+
+    async def _send_backup(self, q) -> None:
+        """Snapshot the DB and DM it to the admin who pressed the button."""
+        import time
+        await q.edit_message_text("💾 Готовлю бэкап…", reply_markup=self._back())
+        dest = self.cfg.db_path.with_name(
+            f"{self.cfg.db_path.stem}.{int(time.time())}.backup.db")
+        try:
+            await self.db.snapshot(dest)
+            with open(dest, "rb") as fh:
+                await q.message.reply_document(
+                    fh, filename=dest.name,
+                    caption="💾 Бэкап базы RQM. Храните в надёжном месте.")
+        except Exception as e:  # noqa: BLE001
+            log.exception("backup failed")
+            await q.message.reply_text(f"❌ Не удалось сделать бэкап: {esc(e)}")
+        finally:
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _health_text(self) -> str:
         s = await self.db.stats()
@@ -922,6 +973,8 @@ class BotApp:
             await enqueue_full_rebuild(self.db)
             await q.edit_message_text("♻️ Пересборка поставлена в очередь.",
                                       reply_markup=self._back())
+        elif head == "backup":
+            await self._send_backup(q)
         # projects
         elif head == "proj":
             await self._show_projects(q)

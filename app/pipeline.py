@@ -107,6 +107,19 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
                 title=ch.title, telegraph_url=ch.telegraph_url,
                 post_id=post.message_id, src_kind="chapters", prefer=True)
             res.chapters += 1
+            if is_edit:
+                # the linked page may have changed → drop stale cached text
+                await db.delete_chapter_cache(ch.telegraph_url)
+        if is_edit:
+            # a chapter whose link was removed from the (edited) post must also
+            # disappear from the bot/navigation, not linger in the DB.
+            new_numbers = {ch.number for ch in chapters}
+            owned = await db.fetchall(
+                "SELECT id, number FROM chapters WHERE post_id=? AND project_id=?",
+                (post.message_id, project_id))
+            for row in owned:
+                if row["number"] not in new_numbers:
+                    await db.delete_chapter(row["id"])
         builds.add(("project", project_id))
 
     # ── category items (one per category tag, linked to the project if any) ───
