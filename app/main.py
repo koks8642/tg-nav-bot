@@ -132,6 +132,11 @@ async def run() -> None:
         drop_pending_updates=False)
     log.info("Bot polling started")
 
+    # post_init() does NOT fire with this manual init/start lifecycle (PTB only
+    # calls it from run_polling/run_webhook), so configure the "/" command menu
+    # explicitly here. setup_commands() handles its own errors.
+    await bot_app.setup_commands()
+
     # first-ever run → build all pages from whatever is in the DB
     if not await db.get_page_for("root", None):
         log.info("No root page yet — running an initial full rebuild")
