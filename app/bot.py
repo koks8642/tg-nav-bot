@@ -43,6 +43,7 @@ from telegram.ext import (
 )
 
 from .config import Config
+from .backup_check import validate_sqlite_database
 from .db import Database
 from .download import (
     FORMAT_LABELS,
@@ -51,7 +52,7 @@ from .download import (
     formats_for,
     project_kind,
 )
-from .parser import is_telegraph_url, parsed_post_from_message
+from .parser import classify_external, is_chapter_url, is_telegraph_url, parsed_post_from_message
 from .pipeline import process_post
 from .quote import (
     QuoteError,
@@ -115,6 +116,7 @@ class BotApp:
         self._admin_ids_ts: float = 0.0
         # per-user cooldown timestamps for the expensive quote path (anti-flood)
         self._quote_seen: dict[int, float] = {}
+        self._alert_seen: dict[str, float] = {}
         # per-user sliding window of recent action timestamps (rate limiting)
         self._rate: dict[int, list[float]] = {}
         # download queue (built lazily in the running loop) + per-user guards
@@ -266,10 +268,15 @@ class BotApp:
         return bool(u and await self.is_admin(u.id))
 
     def _redact(self, s) -> str:
-        """Strip the bot token from any string before it's stored or shown."""
+        """Strip runtime secrets from any string before it's stored or shown."""
         s = "" if s is None else str(s)
-        tok = self.cfg.bot_token
-        return s.replace(tok, "<BOT_TOKEN>") if tok and tok in s else s
+        secrets = [(self.cfg.bot_token, "<BOT_TOKEN>")]
+        tg_token = getattr(self.tg, "access_token", "")
+        secrets.append((tg_token, "<TELEGRAPH_TOKEN>"))
+        for token, label in secrets:
+            if token and token in s:
+                s = s.replace(token, label)
+        return s
 
     async def notify_owners(self, text: str) -> None:
         if not self.application:
@@ -281,6 +288,14 @@ class BotApp:
                 await self.application.bot.send_message(uid, text)
             except Exception as e:  # noqa: BLE001
                 log.debug("notify %s skipped: %s", uid, e)
+
+    async def notify_owners_throttled(
+            self, key: str, text: str, *, cooldown: float = 3600.0) -> None:
+        now = time.time()
+        if now - self._alert_seen.get(key, 0.0) < cooldown:
+            return
+        self._alert_seen[key] = now
+        await self.notify_owners(text)
 
     async def _post_urls(self) -> dict[int, str]:
         rows = await self.db.fetchall("SELECT message_id, tg_url FROM posts")
@@ -608,6 +623,12 @@ class BotApp:
                 "Не понял запрос. Пример: «/quote покровитель глава 150 абзацы 1-5» "
                 'или «… от "фраза" до "фраза"».', reply_markup=rm)
             return
+        if req.mode == "preview" and not allow_preview:
+            await message.reply_text(
+                "Укажите диапазон: «абзацы A-B» или «от \"фраза\" до \"фраза\"». "
+                "Предпросмотр абзацев доступен в личке с ботом.",
+                reply_markup=rm)
+            return
         if pid is not None:
             proj = await self.db.get_project(pid)
         else:
@@ -631,7 +652,9 @@ class BotApp:
                 reply_markup=rm)
             return
         try:
-            paras = await fetch_paragraphs(self.db, self.tg, ch["telegraph_url"])
+            paras = await asyncio.wait_for(
+                fetch_paragraphs(self.tg, ch["telegraph_url"]),
+                timeout=getattr(self.cfg, "quote_fetch_timeout_sec", 75))
         except Exception as e:  # noqa: BLE001
             log.warning("quote fetch failed: %s", e)
             await message.reply_text("Не удалось получить текст главы с Telegraph.",
@@ -643,12 +666,6 @@ class BotApp:
             return
 
         if req.mode == "preview":
-            if not allow_preview:
-                await message.reply_text(
-                    "Укажите диапазон: «абзацы A-B» или «от \"фраза\" до \"фраза\"». "
-                    "Предпросмотр абзацев доступен в личке с ботом.",
-                    reply_markup=rm)
-                return
             header = (f"📄 {proj['canonical_name']} — Глава {req.number}\n"
                       f"Абзацев: {len(paras)}. Диапазон: «… абзацы 1-5» "
                       'или «… от "фраза" до "фраза"».')
@@ -693,6 +710,7 @@ class BotApp:
             f"{self.cfg.db_path.stem}.{int(time.time())}.backup.db")
         try:
             await self.db.snapshot(dest)
+            validate_sqlite_database(dest)
             with open(dest, "rb") as fh:
                 await q.message.reply_document(
                     fh, filename=dest.name,
@@ -705,6 +723,25 @@ class BotApp:
                 dest.unlink(missing_ok=True)
             except Exception:  # noqa: BLE001
                 pass
+
+    async def send_backup_to_admins(self, path, *, caption: str) -> int:
+        """Send an existing DB snapshot to channel admins and configured owners.
+
+        Best-effort: admins who never opened a DM with the bot may be unreachable.
+        """
+        if not self.application:
+            return 0
+        targets = set(self.cfg.owner_user_ids) | await self._channel_admin_ids()
+        sent = 0
+        for uid in sorted(targets):
+            try:
+                with open(path, "rb") as fh:
+                    await self.application.bot.send_document(
+                        uid, document=fh, filename=path.name, caption=caption)
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                log.debug("daily backup to %s skipped: %s", uid, e)
+        return sent
 
     async def _health_text(self) -> str:
         s = await self.db.stats()
@@ -824,7 +861,7 @@ class BotApp:
         elif head == "arcs":
             await self._show_arcs(q, int(parts[1]))
         elif head == "arc":
-            await self._show_arc_chapters(q, int(parts[1]), int(parts[2]))
+            await self._show_arc_chapters(q, int(parts[1]), parts[2])
         elif head == "pcat":
             await self._show_project_category(q, int(parts[1]), int(parts[2]))
         elif head == "seccard":
@@ -1031,7 +1068,10 @@ class BotApp:
                     while True:
                         job = await self._dl_queue.get()
                         try:
-                            await self._run_download(job, session)
+                            await asyncio.wait_for(
+                                self._run_download(job, session),
+                                timeout=getattr(
+                                    self.cfg, "download_job_timeout_sec", 1800))
                         except Exception:  # noqa: BLE001
                             log.exception("download failed")
                             try:
@@ -1174,6 +1214,29 @@ class BotApp:
         await message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
 
+    @staticmethod
+    def _arc_token(arc_row) -> str:
+        return f"n{arc_row['first_num']}"
+
+    @staticmethod
+    def _arc_by_token(arcs, token: str):
+        """Resolve current arc rows by stable first chapter number.
+
+        Numeric tokens are accepted as a legacy fallback for old inline buttons
+        that encoded the arc's list index.
+        """
+        if token.startswith("n"):
+            try:
+                first_num = int(token[1:])
+            except ValueError:
+                return None
+            return next((a for a in arcs if a["first_num"] == first_num), None)
+        try:
+            idx = int(token)
+        except ValueError:
+            return None
+        return arcs[idx] if 0 <= idx < len(arcs) else None
+
     async def _show_arcs(self, q, pid: int) -> None:
         arcs = await self.db.list_arcs(pid)
         p = await self.db.get_project(pid)
@@ -1184,18 +1247,19 @@ class BotApp:
             return
         kb = [[InlineKeyboardButton(
             f"📂 {a['arc']} ({_num_range(a['first_num'], a['last_num'])}, {a['n']})",
-            callback_data=f"arc:{pid}:{i}")] for i, a in enumerate(arcs)]
+            callback_data=f"arc:{pid}:{self._arc_token(a)}")] for a in arcs]
         kb.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"card:{pid}")])
         await q.edit_message_text(
             f"{p['emoji']} <b>{esc(p['canonical_name'])}</b> — выберите арку:",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
-    async def _show_arc_chapters(self, q, pid: int, idx: int) -> None:
+    async def _show_arc_chapters(self, q, pid: int, token: str) -> None:
         arcs = await self.db.list_arcs(pid)
-        if idx >= len(arcs):
+        selected = self._arc_by_token(arcs, token)
+        if selected is None:
             await self._show_arcs(q, pid)
             return
-        arc = arcs[idx]["arc"]
+        arc = selected["arc"]
         chapters = await self.db.chapters_in_arc(pid, arc)
         posts = await self._post_urls()
         lines = [f"📂 <b>{esc(arc)}</b>"]
@@ -1281,9 +1345,7 @@ class BotApp:
                     InlineKeyboardButton("Отмена", callback_data=f"p:{pid}")]]))
         elif head == "pdelyes":
             pid = int(parts[1])
-            await self.db.execute("DELETE FROM hashtag_map WHERE kind='project' "
-                                  "AND target_id=?", (pid,))
-            await self.db.execute("DELETE FROM projects WHERE id=?", (pid,))
+            await self.db.delete_project(pid)
             await self.db.enqueue_build("root", None)
             await q.edit_message_text("🗑 Проект удалён.", reply_markup=self._back("proj"))
         elif head == "ptags":
@@ -1353,20 +1415,20 @@ class BotApp:
         elif head == "pchaps":
             await self._show_arc_admin(q, int(parts[1]))
         elif head == "parc":
-            await self._show_arc_actions(q, int(parts[1]), int(parts[2]))
+            await self._show_arc_actions(q, int(parts[1]), parts[2])
         elif head == "pcharc":
-            await self._show_arc_chapters_admin(q, int(parts[1]), int(parts[2]))
+            await self._show_arc_chapters_admin(q, int(parts[1]), parts[2])
         elif head == "arcren":
-            await self._arc_prompt(q, context, int(parts[1]), int(parts[2]), "arc_rename",
+            await self._arc_prompt(q, context, int(parts[1]), parts[2], "arc_rename",
                                    "новое название арки:")
         elif head == "arcsplit":
-            await self._arc_prompt(q, context, int(parts[1]), int(parts[2]), "arc_split",
+            await self._arc_prompt(q, context, int(parts[1]), parts[2], "arc_split",
                                    "номер и название новой арки (напр. «320 Финал»): "
                                    "главы с этим номером и дальше уйдут в новую арку")
         elif head == "arcmrg":
-            await self._show_arc_merge(q, int(parts[1]), int(parts[2]))
+            await self._show_arc_merge(q, int(parts[1]), parts[2])
         elif head == "arcmrg2":
-            await self._do_arc_merge(q, int(parts[1]), int(parts[2]), int(parts[3]))
+            await self._do_arc_merge(q, int(parts[1]), parts[2], parts[3])
         elif head == "c":
             await self._show_chapter(q, int(parts[1]))
         elif head == "ce":
@@ -1412,10 +1474,7 @@ class BotApp:
                     InlineKeyboardButton("Отмена", callback_data=f"s:{sid}")]]))
         elif head == "sdelyes":
             sid = int(parts[1])
-            await self.db.execute("DELETE FROM hashtag_map WHERE kind='category' "
-                                  "AND target_id=?", (sid,))
-            await self.db.execute("DELETE FROM items WHERE section_id=?", (sid,))
-            await self.db.execute("DELETE FROM sections WHERE id=?", (sid,))
+            await self.db.delete_section(sid)
             await self.db.enqueue_build("root", None)
             await q.edit_message_text("🗑 Раздел удалён (с хэштегами и записями).",
                                       reply_markup=self._back("sect"))
@@ -1648,25 +1707,26 @@ class BotApp:
             return
         kb = [[InlineKeyboardButton(
             f"📂 {a['arc']} ({_num_range(a['first_num'], a['last_num'])}, {a['n']})",
-            callback_data=f"parc:{pid}:{i}")] for i, a in enumerate(arcs)]
+            callback_data=f"parc:{pid}:{self._arc_token(a)}")] for a in arcs]
         kb.append([InlineKeyboardButton("⬅️ К проекту", callback_data=f"p:{pid}")])
         await q.edit_message_text(
             f"📖 <b>Главы и арки</b> · {p['emoji']} {esc(p['canonical_name'])}\n"
             "Выберите арку:", reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML)
 
-    async def _show_arc_actions(self, q, pid: int, idx: int) -> None:
+    async def _show_arc_actions(self, q, pid: int, token: str) -> None:
         arcs = await self.db.list_arcs(pid)
-        if idx >= len(arcs):
+        a = self._arc_by_token(arcs, token)
+        if a is None:
             await self._show_arc_admin(q, pid)
             return
-        a = arcs[idx]
+        arc_token = self._arc_token(a)
         kb = [
             [InlineKeyboardButton("📖 Главы арки (править)",
-                                  callback_data=f"pcharc:{pid}:{idx}")],
-            [InlineKeyboardButton("✏️ Переименовать", callback_data=f"arcren:{pid}:{idx}"),
-             InlineKeyboardButton("✂️ Разбить", callback_data=f"arcsplit:{pid}:{idx}")],
-            [InlineKeyboardButton("🔗 Объединить с…", callback_data=f"arcmrg:{pid}:{idx}")],
+                                  callback_data=f"pcharc:{pid}:{arc_token}")],
+            [InlineKeyboardButton("✏️ Переименовать", callback_data=f"arcren:{pid}:{arc_token}"),
+             InlineKeyboardButton("✂️ Разбить", callback_data=f"arcsplit:{pid}:{arc_token}")],
+            [InlineKeyboardButton("🔗 Объединить с…", callback_data=f"arcmrg:{pid}:{arc_token}")],
             [InlineKeyboardButton("⬅️ К аркам", callback_data=f"pchaps:{pid}")],
         ]
         one = a['first_num'] == a['last_num']
@@ -1676,52 +1736,60 @@ class BotApp:
             f"всего {a['n']}", reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML)
 
-    async def _show_arc_chapters_admin(self, q, pid: int, idx: int) -> None:
+    async def _show_arc_chapters_admin(self, q, pid: int, token: str) -> None:
         arcs = await self.db.list_arcs(pid)
-        if idx >= len(arcs):
+        selected = self._arc_by_token(arcs, token)
+        if selected is None:
             await self._show_arc_admin(q, pid)
             return
-        arc = arcs[idx]["arc"]
+        arc = selected["arc"]
+        arc_token = self._arc_token(selected)
         chapters = await self.db.chapters_in_arc(pid, arc)
         kb = [[InlineKeyboardButton(
             f"гл. {c['number']}" + (f" — {c['title']}" if c["title"] else ""),
             callback_data=f"c:{c['id']}")] for c in chapters[:60]]
-        kb.append([InlineKeyboardButton("⬅️ К арке", callback_data=f"parc:{pid}:{idx}")])
+        kb.append([InlineKeyboardButton("⬅️ К арке", callback_data=f"parc:{pid}:{arc_token}")])
         await q.edit_message_text(f"📂 <b>{esc(arc)}</b> — выберите главу:",
                                   reply_markup=InlineKeyboardMarkup(kb),
                                   parse_mode=ParseMode.HTML)
 
-    async def _arc_prompt(self, q, context, pid: int, idx: int, action: str,
+    async def _arc_prompt(self, q, context, pid: int, token: str, action: str,
                           prompt: str) -> None:
         arcs = await self.db.list_arcs(pid)
-        if idx >= len(arcs):
+        selected = self._arc_by_token(arcs, token)
+        if selected is None:
             await self._show_arc_admin(q, pid)
             return
-        self._set_await(context, action, pid=pid, arc=arcs[idx]["arc"])
+        self._set_await(context, action, pid=pid, arc=selected["arc"])
         await q.edit_message_text(f"✏️ Пришлите {prompt}",
-                                  reply_markup=self._back(f"parc:{pid}:{idx}"))
+                                  reply_markup=self._back(f"parc:{pid}:{self._arc_token(selected)}"))
 
-    async def _show_arc_merge(self, q, pid: int, idx: int) -> None:
+    async def _show_arc_merge(self, q, pid: int, token: str) -> None:
         arcs = await self.db.list_arcs(pid)
-        if idx >= len(arcs):
+        selected = self._arc_by_token(arcs, token)
+        if selected is None:
             await self._show_arc_admin(q, pid)
             return
-        src = arcs[idx]["arc"]
+        src = selected["arc"]
+        src_token = self._arc_token(selected)
         kb = [[InlineKeyboardButton(f"→ {a['arc']}",
-                                    callback_data=f"arcmrg2:{pid}:{idx}:{j}")]
-              for j, a in enumerate(arcs) if j != idx]
-        kb.append([InlineKeyboardButton("⬅️ Отмена", callback_data=f"parc:{pid}:{idx}")])
+                                    callback_data=(
+                                        f"arcmrg2:{pid}:{src_token}:{self._arc_token(a)}"))]
+              for a in arcs if a["first_num"] != selected["first_num"]]
+        kb.append([InlineKeyboardButton("⬅️ Отмена", callback_data=f"parc:{pid}:{src_token}")])
         await q.edit_message_text(
             f"🔗 Объединить «{esc(src)}» с другой аркой — все её главы получат "
             "выбранную арку. С какой?", reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML)
 
-    async def _do_arc_merge(self, q, pid: int, srcidx: int, dstidx: int) -> None:
+    async def _do_arc_merge(self, q, pid: int, src_token: str, dst_token: str) -> None:
         arcs = await self.db.list_arcs(pid)
-        if srcidx >= len(arcs) or dstidx >= len(arcs):
+        src_row = self._arc_by_token(arcs, src_token)
+        dst_row = self._arc_by_token(arcs, dst_token)
+        if src_row is None or dst_row is None:
             await self._show_arc_admin(q, pid)
             return
-        src, dst = arcs[srcidx]["arc"], arcs[dstidx]["arc"]
+        src, dst = src_row["arc"], dst_row["arc"]
         n = await self.db.rename_arc(pid, src, dst)
         await self._enqueue_project(pid)
         await q.edit_message_text(f"✅ Объединено: {n} глав → «{esc(dst)}».",
@@ -1921,7 +1989,14 @@ class BotApp:
                 await self.db.update_project(pid, sort_order=_int(text, 100))
             elif field in ("rl", "ml", "sk", "bo"):
                 col, _label = PLATFORM_BY_CODE[field]
-                await self._set_project_link(pid, col, "" if text == "-" else text)
+                url = "" if text == "-" else text
+                if url and classify_external(url) != col:
+                    await msg.reply_text(
+                        "❌ Нужна корректная ссылка выбранной площадки "
+                        "(или «-», чтобы удалить).",
+                        reply_markup=self._back(f"p:{pid}"))
+                    return
+                await self._set_project_link(pid, col, url)
             await self._enqueue_project(pid)
             await msg.reply_text("✅ Сохранено. Страница пересобирается.",
                                  reply_markup=self._back(f"p:{pid}"))
@@ -2020,7 +2095,10 @@ class BotApp:
 
         # hashtag add: got the tag, now ask for target
         elif action == "tag_new":
-            tag = text.lstrip("#").lower().split()[0]
+            tag = text.lstrip("#").lower().split()[0] if text.strip() else ""
+            if not tag:
+                await msg.reply_text("Пустой хэштег.", reply_markup=self._back("tags"))
+                return
             context.user_data["new_tag"] = tag
             await self._tag_pick_target(msg, context)
 
@@ -2036,8 +2114,8 @@ class BotApp:
                 await msg.reply_text("Номер главы — целое число (например 305).",
                                      reply_markup=self._back(f"c:{cid}"))
                 return
-            if field == "url" and not re.match(r"https?://", text):
-                await msg.reply_text("Ссылка должна начинаться с http(s)://.",
+            if field == "url" and not is_chapter_url(text):
+                await msg.reply_text("Нужна ссылка главы Telegraph/Teletype.",
                                      reply_markup=self._back(f"c:{cid}"))
                 return
             try:
@@ -2089,6 +2167,10 @@ class BotApp:
             if action == "it_title":
                 await self.db.update_item(iid, title=text)
             else:
+                if not re.match(r"https?://", text):
+                    await msg.reply_text("Ссылка должна начинаться с http(s)://.",
+                                         reply_markup=self._back(f"item:{iid}"))
+                    return
                 await self.db.update_item(iid, url=text)
             if it["section_id"]:
                 await self.db.enqueue_build("section", it["section_id"])

@@ -40,7 +40,10 @@ def test_teletype_chapter_and_zero_number():
 def test_is_telegraph_both_domains():
     assert is_telegraph_url("https://telegra.ph/Foo-10-26")
     assert is_telegraph_url("https://graph.org/Foo-10-26")
+    assert is_telegraph_url("https://sub.telegra.ph/Foo-10-26")
     assert not is_telegraph_url("https://ranobelib.me/ru/book/1")
+    assert not is_telegraph_url("https://telegra.ph.evil.example/Foo")
+    assert not is_telegraph_url("https://evil-telegra.ph.example/Foo")
 
 
 def test_classify_external_platforms():
@@ -49,6 +52,7 @@ def test_classify_external_platforms():
     assert classify_external("https://senkuro.com/manga/x") == "senkuro"
     assert classify_external("https://boosty.to/becamerqm") == "boosty"
     assert classify_external("https://example.com") is None
+    assert classify_external("https://ranobelib.me.evil.example/ru/book/1") is None
 
 
 def test_extract_external_links_dedup():

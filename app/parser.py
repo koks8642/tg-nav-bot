@@ -17,6 +17,7 @@ import html as html_lib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 # ── Domains ──────────────────────────────────────────────────────────────────
 TELEGRAPH_HOSTS = ("telegra.ph", "graph.org")          # text chapters (novels)
@@ -105,12 +106,18 @@ class ParsedPost:
 
 # ── small utilities ──────────────────────────────────────────────────────────
 
+def _host_matches(url: str, hosts: tuple[str, ...]) -> bool:
+    """True only for an exact host or a subdomain, never substring bait."""
+    host = (urlparse(url if "://" in url else f"https://{url}").hostname or "").lower()
+    return any(host == h or host.endswith(f".{h}") for h in hosts)
+
+
 def is_telegraph_url(url: str) -> bool:
-    return any(h in url for h in TELEGRAPH_HOSTS)
+    return _host_matches(url, TELEGRAPH_HOSTS)
 
 
 def is_teletype_url(url: str) -> bool:
-    return any(h in url for h in TELETYPE_HOSTS)
+    return _host_matches(url, TELETYPE_HOSTS)
 
 
 def is_chapter_url(url: str) -> bool:
@@ -120,7 +127,7 @@ def is_chapter_url(url: str) -> bool:
 
 def classify_external(url: str) -> str | None:
     for platform, hosts in EXTERNAL_PLATFORMS.items():
-        if any(h in url for h in hosts):
+        if _host_matches(url, hosts):
             return platform
     return None
 

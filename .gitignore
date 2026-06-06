@@ -29,3 +29,6 @@ Thumbs.db
 /ChatExport/video_files/
 /ChatExport/images/
 /ChatExport/stickers/
+
+# pytest --basetemp artifact (CI)
+.test-tmp/

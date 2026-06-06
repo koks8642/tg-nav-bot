@@ -67,6 +67,10 @@ class Config:
     db_path: Path
     export_html: Path
     log_level: str
+    unknown_hashtag_mode: str
+    quote_fetch_timeout_sec: int
+    download_job_timeout_sec: int
+    rebuild_queue_timeout_sec: int
 
     @property
     def channel_internal_id(self) -> str:
@@ -123,4 +127,9 @@ def load_config(*, require_bot: bool = True) -> Config:
         db_path=db_path,
         export_html=export_html,
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        unknown_hashtag_mode=os.environ.get(
+            "UNKNOWN_HASHTAG_MODE", "conflict").strip().lower(),
+        quote_fetch_timeout_sec=_env_int("QUOTE_FETCH_TIMEOUT_SEC", 75),
+        download_job_timeout_sec=_env_int("DOWNLOAD_JOB_TIMEOUT_SEC", 1800),
+        rebuild_queue_timeout_sec=_env_int("REBUILD_QUEUE_TIMEOUT_SEC", 1200),
     )

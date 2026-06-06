@@ -106,5 +106,60 @@ def test_incremental_queue_rebuild(tmp_path):
     asyncio.run(go())
 
 
+def test_root_build_queue_dedupes_null_ref(tmp_path):
+    async def go():
+        db, _cfg = await _prepare(tmp_path / "r3.db")
+        try:
+            await db.enqueue_build("root", None)
+            await db.enqueue_build("root", None)
+            await db.enqueue_build("root", None)
+            rows = await db.fetchall(
+                "SELECT * FROM build_queue WHERE page_kind='root' "
+                "AND page_ref IS NULL AND status='pending'")
+            assert len(rows) == 1
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
+def test_enqueue_during_processing_is_not_lost(tmp_path):
+    async def go():
+        db, _cfg = await _prepare(tmp_path / "r4.db")
+        try:
+            await db.execute("DELETE FROM build_queue")
+            await db.enqueue_build("root", None)
+            processing = await db.take_pending_builds()
+            assert len(processing) == 1
+
+            await db.enqueue_build("root", None)
+            await db.mark_build(processing[0]["id"], "done")
+            await db.clear_done_builds()
+
+            pending = await db.take_pending_builds()
+            assert len(pending) == 1
+            assert pending[0]["page_kind"] == "root"
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
+def test_stale_processing_with_new_pending_recovers(tmp_path):
+    async def go():
+        db, _cfg = await _prepare(tmp_path / "r5.db")
+        try:
+            await db.execute("DELETE FROM build_queue")
+            await db.enqueue_build("root", None)
+            processing = await db.take_pending_builds()
+            await db.enqueue_build("root", None)
+            # Simulate a worker restart before the processing row was marked.
+            pending = await db.take_pending_builds()
+            assert len(pending) == 1
+            assert pending[0]["id"] != processing[0]["id"]
+            assert (await db.stats())["pending_builds"] == 0
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     pass

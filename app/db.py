@@ -7,20 +7,21 @@ data on a persistent volume.
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
-import json
 import re
 import shutil
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, AsyncIterator, Sequence
 
 import aiosqlite
 
 FUZZY_CUTOFF = 0.72   # min similarity for typo-tolerant title matching
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -139,10 +140,10 @@ CREATE TABLE IF NOT EXISTS telegraph_pages (
 
 CREATE TABLE IF NOT EXISTS build_queue (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    page_kind   TEXT NOT NULL,          -- root|project|section
+    page_kind   TEXT NOT NULL,          -- root|project|group|section
     page_ref    INTEGER,                -- project_id / section_id (NULL for root)
     enqueued_at TEXT,
-    status      TEXT DEFAULT 'pending', -- pending|done|error
+    status      TEXT DEFAULT 'pending', -- pending|processing|done|error
     attempts    INTEGER DEFAULT 0,
     last_error  TEXT DEFAULT '',
     UNIQUE(page_kind, page_ref, status)
@@ -175,12 +176,6 @@ CREATE TABLE IF NOT EXISTS conflicts (
     status      TEXT DEFAULT 'open'     -- open|resolved|ignored
 );
 
-CREATE TABLE IF NOT EXISTS chapter_cache (
-    telegraph_url TEXT PRIMARY KEY,
-    paragraphs    TEXT,                  -- JSON list of plain-text paragraphs
-    fetched_at    TEXT
-);
-
 CREATE INDEX IF NOT EXISTS idx_chapters_project ON chapters(project_id, number);
 CREATE INDEX IF NOT EXISTS idx_chapters_arc ON chapters(project_id, arc);
 CREATE INDEX IF NOT EXISTS idx_chapters_number ON chapters(number);
@@ -199,11 +194,21 @@ class Database:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._conn: aiosqlite.Connection | None = None
+        # One shared connection is used by many concurrent asyncio tasks
+        # (bot handlers, rebuild/reconcile/backup/download workers). A single
+        # write lock serialises explicit transactions and standalone writes so
+        # two tasks can never overlap a BEGIN on the same connection; the owner
+        # task is tracked so its own nested writes don't deadlock on the lock.
+        self._tx_lock: asyncio.Lock | None = None
+        self._tx_owner: asyncio.Task | None = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     async def connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.path)
+        # isolation_level=None → autocommit; we manage BEGIN/COMMIT explicitly,
+        # so sqlite3 never auto-opens a transaction that would clash with ours.
+        self._conn = await aiosqlite.connect(self.path, isolation_level=None)
+        self._tx_lock = asyncio.Lock()
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL;")
         await self._conn.execute("PRAGMA foreign_keys=ON;")
@@ -238,9 +243,64 @@ class Database:
             if "group_id" not in cols:
                 await self.conn.execute(
                     "ALTER TABLE projects ADD COLUMN group_id INTEGER")
+        if version < 4:
+            # v4: keep SQLite reserved for channel navigation state. Text caches
+            # from user-triggered quote/download requests are no longer stored.
+            await self.conn.execute("DROP TABLE IF EXISTS chapter_cache")
+        if version < 5:
+            # v5: SQLite UNIQUE treats NULL as distinct, so older DBs could
+            # accumulate many root/pending queue rows.
+            await self._dedupe_build_queue()
         if version < SCHEMA_VERSION:
             await self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION};")
+        await self._dedupe_build_queue()
+        await self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_build_queue_dedupe "
+            "ON build_queue(page_kind, COALESCE(page_ref, -1), status)")
         await self.conn.commit()
+
+    async def _dedupe_build_queue(self) -> None:
+        await self.conn.execute(
+            "DELETE FROM build_queue WHERE id NOT IN ("
+            "SELECT MIN(id) FROM build_queue "
+            "GROUP BY page_kind, COALESCE(page_ref, -1), status)")
+
+    @property
+    def in_transaction(self) -> bool:
+        """True only for the task that currently owns the open transaction."""
+        try:
+            return self._tx_owner is asyncio.current_task()
+        except RuntimeError:  # no running loop
+            return False
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Group related writes into one SQLite transaction.
+
+        Most helpers auto-commit for convenience. Inside this context they defer
+        the commit, so channel post processing/admin deletes cannot leave a
+        half-applied state if an exception is raised midway.
+
+        Serialised across tasks by ``_tx_lock`` (one open transaction per
+        connection at a time); reentrant for the owning task so nested helpers
+        join the same transaction instead of deadlocking.
+        """
+        if self.in_transaction:                 # nested call in the same task
+            yield
+            return
+        assert self._tx_lock is not None
+        async with self._tx_lock:
+            self._tx_owner = asyncio.current_task()
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
+            finally:
+                self._tx_owner = None
 
     def backup(self) -> Path | None:
         """Copy the DB file aside before a mass operation (best-effort)."""
@@ -257,8 +317,11 @@ class Database:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             dest.unlink()
-        await self.conn.commit()  # VACUUM can't run inside a transaction
-        await self.conn.execute("VACUUM INTO ?", (str(dest),))
+        # hold the write lock so no other task has a transaction open — VACUUM
+        # cannot run inside a transaction.
+        assert self._tx_lock is not None
+        async with self._tx_lock:
+            await self.conn.execute("VACUUM INTO ?", (str(dest),))
         return dest
 
     # ── generic helpers ──────────────────────────────────────────────────────
@@ -271,9 +334,16 @@ class Database:
         return list(await cur.fetchall())
 
     async def execute(self, sql: str, params: Sequence[Any] = ()) -> aiosqlite.Cursor:
-        cur = await self.conn.execute(sql, params)
-        await self.conn.commit()
-        return cur
+        # Inside our own transaction → just run; the commit happens at tx end.
+        if self.in_transaction:
+            return await self.conn.execute(sql, params)
+        # Standalone write: take the write lock so it can't land inside another
+        # task's open transaction (and get committed/rolled back with it).
+        assert self._tx_lock is not None
+        async with self._tx_lock:
+            cur = await self.conn.execute(sql, params)
+            await self.conn.commit()
+            return cur
 
     # ── meta key/value (telegraph token, last_update_id, …) ──────────────────
     async def meta_get(self, key: str, default: str | None = None) -> str | None:
@@ -347,11 +417,15 @@ class Database:
                            (*fields.values(), group_id))
 
     async def delete_group(self, group_id: int) -> None:
-        await self.execute("UPDATE projects SET group_id=NULL WHERE group_id=?",
-                           (group_id,))
-        await self.execute("DELETE FROM hashtag_map WHERE kind='group' "
-                           "AND target_id=?", (group_id,))
-        await self.execute("DELETE FROM groups WHERE id=?", (group_id,))
+        async with self.transaction():
+            await self.execute("UPDATE projects SET group_id=NULL WHERE group_id=?",
+                               (group_id,))
+            await self.execute("DELETE FROM hashtag_map WHERE kind='group' "
+                               "AND target_id=?", (group_id,))
+            await self.execute(
+                "DELETE FROM telegraph_pages WHERE kind='group' AND ref_id=?",
+                (group_id,))
+            await self.execute("DELETE FROM groups WHERE id=?", (group_id,))
 
     async def projects_in_group(self, group_id: int | None,
                                 include_hidden: bool = False) -> list[aiosqlite.Row]:
@@ -408,6 +482,17 @@ class Database:
             (*fields.values(), project_id),
         )
 
+    async def delete_project(self, project_id: int) -> None:
+        async with self.transaction():
+            await self.execute("DELETE FROM hashtag_map WHERE kind='project' "
+                               "AND target_id=?", (project_id,))
+            await self.execute(
+                "DELETE FROM telegraph_pages WHERE kind='project' AND ref_id=?",
+                (project_id,))
+            await self.execute("DELETE FROM meta WHERE key=?",
+                               (f"project_parts:{project_id}",))
+            await self.execute("DELETE FROM projects WHERE id=?", (project_id,))
+
     # ── aliases ──────────────────────────────────────────────────────────────
     async def add_alias(self, project_id: int, pattern: str) -> None:
         await self.execute(
@@ -449,6 +534,16 @@ class Database:
             f"UPDATE sections SET {sets} WHERE id=?",
             (*fields.values(), section_id),
         )
+
+    async def delete_section(self, section_id: int) -> None:
+        async with self.transaction():
+            await self.execute("DELETE FROM hashtag_map WHERE kind='category' "
+                               "AND target_id=?", (section_id,))
+            await self.execute("DELETE FROM items WHERE section_id=?", (section_id,))
+            await self.execute(
+                "DELETE FROM telegraph_pages WHERE kind='section' AND ref_id=?",
+                (section_id,))
+            await self.execute("DELETE FROM sections WHERE id=?", (section_id,))
 
     # ── hashtag map ──────────────────────────────────────────────────────────
     async def set_hashtag(self, hashtag: str, kind: str, target_id: int) -> None:
@@ -537,41 +632,6 @@ class Database:
 
     async def delete_chapter(self, chapter_id: int) -> None:
         await self.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
-
-    # ── chapter text cache (for quoting) ─────────────────────────────────────
-    async def get_chapter_cache(self, url: str,
-                                max_age_sec: int | None = None) -> list[str] | None:
-        """Cached paragraphs for a chapter. If ``max_age_sec`` is given, a stale
-        entry (older than that) is ignored so the text auto-refreshes when the
-        author edits the Telegraph page."""
-        row = await self.fetchone(
-            "SELECT paragraphs, fetched_at FROM chapter_cache WHERE telegraph_url=?",
-            (url,))
-        if not row:
-            return None
-        if max_age_sec is not None and row["fetched_at"]:
-            try:
-                fetched = datetime.fromisoformat(row["fetched_at"])
-                age = (datetime.now(timezone.utc) - fetched).total_seconds()
-                if age > max_age_sec:
-                    return None
-            except ValueError:
-                return None
-        try:
-            return json.loads(row["paragraphs"])
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-    async def set_chapter_cache(self, url: str, paragraphs: list[str]) -> None:
-        await self.execute(
-            "INSERT INTO chapter_cache(telegraph_url,paragraphs,fetched_at) "
-            "VALUES(?,?,?) ON CONFLICT(telegraph_url) DO UPDATE SET "
-            "paragraphs=excluded.paragraphs, fetched_at=excluded.fetched_at",
-            (url, json.dumps(paragraphs, ensure_ascii=False), _now()))
-
-    async def delete_chapter_cache(self, url: str) -> None:
-        await self.execute(
-            "DELETE FROM chapter_cache WHERE telegraph_url=?", (url,))
 
     # ── arc operations (rename / merge / split) ──────────────────────────────
     async def rename_arc(self, project_id: int, old_arc: str, new_arc: str) -> int:
@@ -685,25 +745,89 @@ class Database:
 
     # ── build queue ──────────────────────────────────────────────────────────
     async def enqueue_build(self, page_kind: str, page_ref: int | None) -> None:
+        now = _now()
+        if page_ref is None:
+            existing = await self.fetchone(
+                "SELECT id FROM build_queue WHERE page_kind=? "
+                "AND page_ref IS NULL AND status='pending'",
+                (page_kind,))
+        else:
+            existing = await self.fetchone(
+                "SELECT id FROM build_queue WHERE page_kind=? "
+                "AND page_ref=? AND status='pending'",
+                (page_kind, page_ref))
+        if existing:
+            await self.execute("UPDATE build_queue SET enqueued_at=? WHERE id=?",
+                               (now, existing["id"]))
+            return
         await self.execute(
             "INSERT INTO build_queue(page_kind,page_ref,enqueued_at,status) "
-            "VALUES(?,?,?, 'pending') "
-            "ON CONFLICT(page_kind,page_ref,status) DO UPDATE SET enqueued_at=excluded.enqueued_at",
-            (page_kind, page_ref, _now()),
+            "VALUES(?,?,?, 'pending')",
+            (page_kind, page_ref, now),
         )
 
     async def take_pending_builds(self) -> list[aiosqlite.Row]:
-        return await self.fetchall(
-            "SELECT * FROM build_queue WHERE status='pending' ORDER BY enqueued_at")
+        async with self.transaction():
+            # If the worker was cancelled mid-rebuild, those rows must not stay
+            # stuck forever. The worker is single-process/serial, so resetting
+            # any leftovers here is safe.
+            await self.execute(
+                "DELETE FROM build_queue WHERE status='processing' AND EXISTS ("
+                "SELECT 1 FROM build_queue b2 WHERE b2.status='pending' "
+                "AND b2.page_kind=build_queue.page_kind "
+                "AND COALESCE(b2.page_ref, -1)=COALESCE(build_queue.page_ref, -1))")
+            await self.execute(
+                "UPDATE build_queue SET status='pending' WHERE status='processing'")
+            rows = await self.fetchall(
+                "SELECT * FROM build_queue WHERE status='pending' ORDER BY enqueued_at")
+            for row in rows:
+                await self.execute(
+                    "UPDATE build_queue SET status='processing' WHERE id=?",
+                    (row["id"],))
+            return rows
 
     async def mark_build(self, build_id: int, status: str, error: str = "") -> None:
-        await self.execute(
-            "UPDATE build_queue SET status=?, last_error=?, attempts=attempts+1 WHERE id=?",
-            (status, error[:1000], build_id),
-        )
+        async with self.transaction():
+            row = await self.fetchone(
+                "SELECT page_kind, page_ref FROM build_queue WHERE id=?",
+                (build_id,))
+            if row:
+                if row["page_ref"] is None:
+                    await self.execute(
+                        "DELETE FROM build_queue WHERE id<>? AND page_kind=? "
+                        "AND page_ref IS NULL AND status=?",
+                        (build_id, row["page_kind"], status))
+                else:
+                    await self.execute(
+                        "DELETE FROM build_queue WHERE id<>? AND page_kind=? "
+                        "AND page_ref=? AND status=?",
+                        (build_id, row["page_kind"], row["page_ref"], status))
+            await self.execute(
+                "UPDATE build_queue SET status=?, last_error=?, attempts=attempts+1 WHERE id=?",
+                (status, error[:1000], build_id),
+            )
 
     async def clear_done_builds(self) -> None:
         await self.execute("DELETE FROM build_queue WHERE status='done'")
+
+    async def prune_operational_logs(self, *, keep_events: int = 5000,
+                                     keep_audits: int = 5000,
+                                     keep_closed_conflicts: int = 2000) -> None:
+        """Bound operational tables so long-lived bots do not grow forever."""
+        async with self.transaction():
+            await self.execute(
+                "DELETE FROM event_log WHERE id NOT IN ("
+                "SELECT id FROM event_log ORDER BY id DESC LIMIT ?)",
+                (keep_events,))
+            await self.execute(
+                "DELETE FROM audit_log WHERE id NOT IN ("
+                "SELECT id FROM audit_log ORDER BY id DESC LIMIT ?)",
+                (keep_audits,))
+            await self.execute(
+                "DELETE FROM conflicts WHERE status<>'open' AND id NOT IN ("
+                "SELECT id FROM conflicts WHERE status<>'open' "
+                "ORDER BY id DESC LIMIT ?)",
+                (keep_closed_conflicts,))
 
     # ── smart search (bot + inline) ──────────────────────────────────────────
     async def search(self, query: str, limit: int = 40) -> dict[str, list[dict]]:

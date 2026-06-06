@@ -8,7 +8,6 @@ import html
 import re
 from dataclasses import dataclass
 
-from .db import Database
 from .telegraph import TelegraphClient
 from .util import clip
 
@@ -48,22 +47,12 @@ def nodes_to_paragraphs(content: list) -> list[str]:
     return paras
 
 
-CACHE_TTL_SEC = 6 * 3600   # re-fetch chapter text at most ~once / 6h (auto-refresh)
-
-
-async def fetch_paragraphs(db: Database, telegraph: TelegraphClient,
-                           url: str) -> list[str]:
-    """Cached chapter paragraphs (keyed by telegraph url). A stale entry (older
-    than CACHE_TTL_SEC) is re-fetched, so author edits to the Telegraph page
-    show up automatically without a manual refresh."""
-    cached = await db.get_chapter_cache(url, max_age_sec=CACHE_TTL_SEC)
-    if cached is not None:
-        return cached
+async def fetch_paragraphs(telegraph: TelegraphClient, url: str) -> list[str]:
+    """Fetch chapter paragraphs from Telegraph without persisting user-request
+    cache in SQLite. The DB stays reserved for channel navigation state."""
     path = url.rstrip("/").rsplit("/", 1)[-1]
     content = await telegraph.get_page_content(path)
-    paras = nodes_to_paragraphs(content)
-    await db.set_chapter_cache(url, paras)
-    return paras
+    return nodes_to_paragraphs(content)
 
 
 # ── command parsing ──────────────────────────────────────────────────────────

@@ -8,22 +8,34 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import stat
 from datetime import datetime, timezone
 
 from aiohttp import web
 
 from .api import build_api_app
+from .backup_check import validate_sqlite_database
 from .bot import BotApp
-from .config import load_config
+from .config import PROJECT_ROOT, load_config
 from .db import Database
 from .rebuild import Rebuilder, enqueue_full_rebuild
 from .seed import seed_registry
 from .telegraph import TelegraphClient
 
 WORKER_POLL_SECONDS = 3  # natural debounce for bursts of posts
-BACKUP_INTERVAL_HOURS = 24
+BACKUP_CHECK_SECONDS = 3600
 BACKUP_KEEP = 7          # rolling daily backups kept on disk
+
+
+def _warn_env_permissions(log: logging.Logger) -> None:
+    env_path = PROJECT_ROOT / ".env"
+    if os.name == "nt" or not env_path.exists():
+        return
+    mode = stat.S_IMODE(env_path.stat().st_mode)
+    if mode & 0o077:
+        log.warning(".env is readable by group/others; run: chmod 600 .env")
 
 
 async def _ensure_telegraph_token(db: Database, tg: TelegraphClient,
@@ -38,21 +50,29 @@ async def _ensure_telegraph_token(db: Database, tg: TelegraphClient,
     token = await tg.create_account("RQM")
     await db.meta_set("telegraph_token", token)
     logging.getLogger("main").warning(
-        "Created a new Telegraph account. Token stored in DB. For safety also "
-        "set TELEGRAPH_TOKEN=%s in the environment.", token)
+        "Created a new Telegraph account. Token stored in DB. For long-term "
+        "ops, set TELEGRAPH_TOKEN in the server environment.")
 
 
-class _TokenRedactor(logging.Filter):
-    """Strip the bot token (and any Bot API URL secret) from every log record,
+class _SecretsRedactor(logging.Filter):
+    """Strip runtime secrets from every log record,
     so it can never leak to the console or the hosting platform's log viewer."""
 
-    def __init__(self, token: str):
+    def __init__(self, *secrets: str):
         super().__init__()
-        self._token = token
+        self._secrets: list[str] = []
+        for secret in secrets:
+            self.add_secret(secret)
+
+    def add_secret(self, secret: str | None) -> None:
+        if secret and secret not in self._secrets:
+            self._secrets.append(secret)
 
     def _clean(self, value):
-        if isinstance(value, str) and self._token and self._token in value:
-            return value.replace(self._token, "<BOT_TOKEN>")
+        if isinstance(value, str):
+            for idx, secret in enumerate(self._secrets):
+                label = "<BOT_TOKEN>" if idx == 0 else "<SECRET>"
+                value = value.replace(secret, label)
         return value
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -73,11 +93,11 @@ async def run() -> None:
     # Silence it (and httpcore) and additionally redact the token everywhere.
     for noisy in ("httpx", "httpcore", "aiohttp.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    if cfg.bot_token:
-        redactor = _TokenRedactor(cfg.bot_token)
-        for handler in logging.getLogger().handlers:
-            handler.addFilter(redactor)
+    redactor = _SecretsRedactor(cfg.bot_token, cfg.telegraph_token)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redactor)
     log = logging.getLogger("main")
+    _warn_env_permissions(log)
 
     db = Database(cfg.db_path)
     await db.connect()
@@ -86,6 +106,7 @@ async def run() -> None:
     tg = TelegraphClient(cfg.telegraph_token, cfg.telegraph_author,
                          cfg.telegraph_author_url)
     await _ensure_telegraph_token(db, tg, cfg)
+    redactor.add_secret(tg.access_token)
     rebuilder = Rebuilder(db, tg, cfg)
 
     bot_app = BotApp(db, cfg, telegraph=tg)
@@ -104,12 +125,17 @@ async def run() -> None:
     async def worker() -> None:
         while not stop.is_set():
             try:
-                n = await rebuilder.process_queue()
+                n = await asyncio.wait_for(
+                    rebuilder.process_queue(),
+                    timeout=cfg.rebuild_queue_timeout_sec)
                 if n:
                     log.info("rebuilt %d page(s)", n)
             except Exception as e:  # noqa: BLE001
                 await db.log("ERROR", "worker", str(e))
                 log.exception("rebuild worker error")
+                await bot_app.notify_owners_throttled(
+                    "rebuild_worker",
+                    f"⚠️ Ошибка пересборки навигации: {bot_app._redact(e)}")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=WORKER_POLL_SECONDS)
             except asyncio.TimeoutError:
@@ -135,32 +161,55 @@ async def run() -> None:
                 log.info("periodic reconcile: full rebuild enqueued")
             except Exception as e:  # noqa: BLE001
                 await db.log("ERROR", "reconcile", str(e))
+                await bot_app.notify_owners_throttled(
+                    "reconcile",
+                    f"⚠️ Ошибка periodic reconcile: {bot_app._redact(e)}")
 
     reconciler_task = asyncio.create_task(reconciler())
 
     async def backup_worker() -> None:
         """Daily on-disk snapshot of the DB, keeping the last BACKUP_KEEP files
         under <db_dir>/backups/. Defends against accidental wipes / corruption,
-        not just restarts (the volume already survives restarts)."""
-        interval = BACKUP_INTERVAL_HOURS * 3600
+        not just restarts (the volume already survives restarts). Also DMs the
+        snapshot to admins once per UTC day."""
         backups = cfg.db_path.parent / "backups"
         while not stop.is_set():
             try:
-                await asyncio.wait_for(stop.wait(), timeout=interval)
-                return  # shutdown
-            except asyncio.TimeoutError:
-                pass
-            try:
-                ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-                await db.snapshot(backups / f"rqm.{ts}.db")
+                now = datetime.now(timezone.utc)
+                today = now.strftime("%Y-%m-%d")
+                if await db.meta_get("last_daily_backup_utc") == today:
+                    await asyncio.wait_for(stop.wait(), timeout=BACKUP_CHECK_SECONDS)
+                    continue
+                ts = now.strftime("%Y%m%d-%H%M%S")
+                dest = await db.snapshot(backups / f"rqm.{ts}.db")
+                validate_sqlite_database(dest)
+                sent = await bot_app.send_backup_to_admins(
+                    dest,
+                    caption=("💾 Ежедневный бэкап базы RQM. "
+                             "Это актуальный snapshot навигации канала."))
+                if sent:
+                    await db.meta_set("last_daily_backup_utc", today)
+                else:
+                    await db.log(
+                        "WARNING", "backup",
+                        "daily backup snapshot was written but not delivered")
+                    await bot_app.notify_owners_throttled(
+                        "backup_not_delivered",
+                        "⚠️ Ежедневный бэкап создан, но не отправился ни одному админу.")
                 kept = sorted(backups.glob("rqm.*.db"))
                 for old in kept[:-BACKUP_KEEP]:
                     old.unlink(missing_ok=True)
-                log.info("backup written (%d kept)", min(len(kept), BACKUP_KEEP))
+                await db.prune_operational_logs()
+                log.info("backup written and sent to %d admin(s) (%d kept)",
+                         sent, min(len(kept), BACKUP_KEEP))
+                await asyncio.wait_for(stop.wait(), timeout=BACKUP_CHECK_SECONDS)
+            except asyncio.TimeoutError:
+                pass
             except Exception as e:  # noqa: BLE001
                 await db.log("ERROR", "backup", str(e))
-
-    backup_task = asyncio.create_task(backup_worker())
+                await bot_app.notify_owners_throttled(
+                    "backup_error",
+                    f"⚠️ Ошибка ежедневного бэкапа: {bot_app._redact(e)}")
 
     # start the bot — retry init, since api.telegram.org can be slow/flaky
     # (notably throttled from RU networks); give it several attempts.
@@ -194,6 +243,8 @@ async def run() -> None:
     # explicitly here. setup_commands() handles its own errors.
     await bot_app.setup_commands()
 
+    backup_task = asyncio.create_task(backup_worker())
+
     # download builder/sender (serial queue → one heavy download at a time)
     download_task = asyncio.create_task(bot_app.download_worker())
 
@@ -204,6 +255,9 @@ async def run() -> None:
             await rebuilder.rebuild_all()
         except Exception:  # noqa: BLE001
             log.exception("initial rebuild failed (will retry via queue)")
+            await bot_app.notify_owners_throttled(
+                "initial_rebuild",
+                "⚠️ Первичная пересборка навигации упала; бот попробует снова через очередь.")
 
     # graceful shutdown
     loop = asyncio.get_running_loop()

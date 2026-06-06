@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import os
 
+import pytest
+
 from app.config import load_config
 from app.db import Database
 from app.parser import Anchor, ParsedPost
@@ -65,7 +67,7 @@ def test_no_hashtag_ignored(tmp_path):
     asyncio.run(go())
 
 
-def test_unknown_hashtag_autocreates_section(tmp_path):
+def test_unknown_hashtag_records_conflict_without_publishing(tmp_path):
     async def go():
         db, cfg = await _fresh_db(tmp_path / "u.db")
         try:
@@ -73,9 +75,10 @@ def test_unknown_hashtag_autocreates_section(tmp_path):
             assert res.action == "unknown_hashtag"
             assert res.notify is not None
             sec = await db.get_section_by_key("tag_spoylery")
-            assert sec is not None
+            assert sec is None
             mapping = await db.get_hashtag("спойлеры")
-            assert mapping["kind"] == "category"
+            assert mapping is None
+            assert (await db.stats())["items"] == 0
             # a conflict was recorded for the owner to resolve
             conflicts = await db.fetchall(
                 "SELECT * FROM conflicts WHERE type='unknown_hashtag'")
@@ -132,11 +135,58 @@ def test_multiple_categories_create_multiple_items(tmp_path):
         try:
             post = _post(801, "Стикерпак и мемы!\n#покровитель #мемы #стикерпак")
             res = await process_post(db, cfg, post)
-            # мемы (known) + стикерпак (unknown→auto-section) = 2 items
-            assert res.items == 2
+            # мемы (known) is filed; стикерпак is unknown and held for admin
+            assert res.items == 1
             assert res.action == "unknown_hashtag"  # стикерпак was unknown
             sticker = await db.get_section_by_key("tag_stikerpak")
-            assert sticker is not None
+            assert sticker is None
+            conflicts = await db.fetchall(
+                "SELECT * FROM conflicts WHERE type='unknown_hashtag'")
+            assert len(conflicts) == 1
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
+def test_process_post_rolls_back_on_late_failure(tmp_path):
+    async def go():
+        db, cfg = await _fresh_db(tmp_path / "rollback.db")
+        try:
+            original_enqueue = db.enqueue_build
+
+            async def boom(_kind, _ref):
+                raise RuntimeError("queue failed")
+
+            db.enqueue_build = boom
+            post = _post(
+                777,
+                "#покровитель Глава 777",
+                [("https://telegra.ph/x-Glava-777", "Глава 777")],
+            )
+            with pytest.raises(RuntimeError, match="queue failed"):
+                await process_post(db, cfg, post)
+            db.enqueue_build = original_enqueue
+            project = await db.get_project_by_key("pokrovitel")
+            chapters = await db.fetchall(
+                "SELECT * FROM chapters WHERE project_id=? AND number=777",
+                (project["id"],))
+            stored_post = await db.get_post(777)
+            assert chapters == []
+            assert stored_post is None
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
+def test_unknown_hashtag_auto_section_mode_is_available(tmp_path):
+    async def go():
+        db, cfg = await _fresh_db(tmp_path / "ua.db")
+        cfg = cfg.__class__(**{**cfg.__dict__, "unknown_hashtag_mode": "auto_section"})
+        try:
+            res = await process_post(db, cfg, _post(802, "Новый контент #спойлеры"))
+            assert res.action == "unknown_hashtag"
+            assert res.items == 1
+            assert await db.get_section_by_key("tag_spoylery") is not None
         finally:
             await db.close()
     asyncio.run(go())
@@ -177,6 +227,32 @@ def test_edit_removes_dropped_chapter(tmp_path):
                                is_edit=True)
             nums = [c["number"] for c in await db.list_chapters(proj["id"])]
             assert nums == [305]
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
+def test_edit_with_broken_markup_keeps_existing_chapters(tmp_path):
+    async def go():
+        db, cfg = await _fresh_db(tmp_path / "safe_edit.db")
+        try:
+            both = [
+                ("https://telegra.ph/x-Glava-305", "Глава 305"),
+                ("https://telegra.ph/x-Glava-306", "Глава 306"),
+            ]
+            await process_post(db, cfg, _post(701, "#покровитель главы 305-306", both))
+            proj = await db.get_project_by_key("pokrovitel")
+            assert len(await db.list_chapters(proj["id"])) == 2
+
+            await process_post(
+                db, cfg,
+                _post(701, "#покровитель я сломал формат и ссылки потом верну"),
+                is_edit=True)
+            nums = [c["number"] for c in await db.list_chapters(proj["id"])]
+            assert nums == [305, 306]
+            conflicts = await db.fetchall(
+                "SELECT * FROM conflicts WHERE type='unparsed_edit' AND ref='701'")
+            assert len(conflicts) == 1
         finally:
             await db.close()
     asyncio.run(go())

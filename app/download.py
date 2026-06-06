@@ -24,12 +24,13 @@ import aiohttp
 
 from .db import Database
 from .parser import is_teletype_url, is_telegraph_url
-from .quote import CACHE_TTL_SEC, nodes_to_paragraphs
+from .quote import nodes_to_paragraphs
 
 MAX_PART_BYTES = 45 * 1024 * 1024     # safety margin under Telegram's 50 MB
 _RAW_TEXT_LIMIT = 30 * 1024 * 1024    # raw novel text per volume (file stays small)
 _IMG_CONCURRENCY = 4
 _TEXT_CONCURRENCY = 6                  # parallel Telegraph reads when building novels
+_TEXT_BATCH = 50                        # cap in-memory fetched novel chapters
 _TELEGRAPH_GETPAGE = "https://api.telegra.ph/getPage"
 
 NOVEL_FORMATS = ("txt", "md", "fb2", "epub")
@@ -297,12 +298,10 @@ class Downloader:
 
     # ── novel ────────────────────────────────────────────────────────────────
     async def _novel_paragraphs(self, session, url: str) -> list[str] | None:
-        """Read one Telegraph chapter's text (cached, with light retries). Uses
+        """Read one Telegraph chapter's text (with light retries). Uses
         the passed session directly so reads run concurrently, instead of going
-        through the shared TelegraphClient lock (which serialises everything)."""
-        cached = await self.db.get_chapter_cache(url, max_age_sec=CACHE_TTL_SEC)
-        if cached is not None:
-            return cached
+        through the shared TelegraphClient lock (which serialises everything).
+        User-triggered downloads do not persist text caches in the navigation DB."""
         path = url.rstrip("/").rsplit("/", 1)[-1]
         for attempt in range(3):
             try:
@@ -311,9 +310,7 @@ class Downloader:
                         data={"path": path, "return_content": "true"}) as r:
                     payload = await r.json(content_type=None)
                 if payload.get("ok"):
-                    paras = nodes_to_paragraphs(payload["result"].get("content", []))
-                    await self.db.set_chapter_cache(url, paras)
-                    return paras
+                    return nodes_to_paragraphs(payload["result"].get("content", []))
             except Exception:  # noqa: BLE001
                 pass
             await asyncio.sleep(0.8 * (attempt + 1))
@@ -334,62 +331,93 @@ class Downloader:
                 await progress(done[0], len(chapters))
             return ch, paras
 
-        results = await asyncio.gather(*(fetch_one(ch) for ch in chapters))
-        fetched: list[dict] = [
-            {"number": ch["number"], "title": ch["title"], "paragraphs": p}
-            for ch, p in results if p]
-        if not fetched:
-            return
+        async def iter_fetched():
+            for start in range(0, len(chapters), _TEXT_BATCH):
+                batch = chapters[start:start + _TEXT_BATCH]
+                results = await asyncio.gather(*(fetch_one(ch) for ch in batch))
+                for ch, paras in results:
+                    if paras:
+                        yield {
+                            "number": ch["number"],
+                            "title": ch["title"],
+                            "paragraphs": paras,
+                        }
 
         if job.packaging == "per_chapter":
-            async for part in self._zip_per_chapter(
-                    base, [(c["number"],
-                            builder(f"{job.project_name} — Глава {c['number']}", [c]),
-                            ext) for c in fetched]):
+            async def files():
+                async for c in iter_fetched():
+                    yield (
+                        c["number"],
+                        builder(f"{job.project_name} — Глава {c['number']}", [c]),
+                        ext,
+                    )
+
+            async for part in self._zip_per_chapter_iter(base, files()):
                 yield part
             return
 
         # single document, split into volumes by accumulated raw text size
         vol, vol_bytes = [], 0
-        parts_meta: list[bytes] = []
-        for c in fetched:
+        first_part: bytes | None = None
+        part_idx = 1
+        multi = False
+
+        def queue_doc(data: bytes) -> list[tuple[str, bytes]]:
+            nonlocal first_part, part_idx, multi
+            out: list[tuple[str, bytes]] = []
+            if first_part is None:
+                first_part = data
+            else:
+                if not multi:
+                    multi = True
+                    out.append((f"{base} (часть 1).{ext}", first_part))
+                out.append((f"{base} (часть {part_idx}).{ext}", data))
+            part_idx += 1
+            return out
+
+        async for c in iter_fetched():
             size = sum(len(p) for p in c["paragraphs"]) + 64
             if vol and vol_bytes + size > _RAW_TEXT_LIMIT:
-                parts_meta.append(builder(job.project_name, vol))
+                for part in queue_doc(builder(job.project_name, vol)):
+                    yield part
                 vol, vol_bytes = [], 0
             vol.append(c)
             vol_bytes += size
         if vol:
-            parts_meta.append(builder(job.project_name, vol))
-        for idx, data in enumerate(parts_meta, 1):
-            suffix = f" (часть {idx})" if len(parts_meta) > 1 else ""
-            yield f"{base}{suffix}.{ext}", data
+            for part in queue_doc(builder(job.project_name, vol)):
+                yield part
+        if first_part is not None and not multi:
+            yield f"{base}.{ext}", first_part
 
     # ── manga ────────────────────────────────────────────────────────────────
     async def _produce_manga(self, job, chapters, session, progress):
         base = _safe(job.project_name)
         if job.packaging == "per_chapter":
-            files: list[tuple[int, bytes, str]] = []
-            for i, ch in enumerate(chapters):
-                try:
-                    pages = await _fetch_teletype_pages(session, ch["telegraph_url"])
-                except Exception:  # noqa: BLE001
-                    pages = []
-                if pages:
-                    named = [(f"{ch['number']:04d}_{p + 1:03d}.{_img_ext(b)}", b)
-                             for p, b in enumerate(pages)]
-                    data = (build_pdf(named) if job.fmt == "pdf" else build_cbz(named))
-                    files.append((ch["number"], data, job.fmt))
-                if progress:
-                    await progress(i + 1, len(chapters))
-            async for part in self._zip_per_chapter(base, files):
+            async def files():
+                for i, ch in enumerate(chapters):
+                    try:
+                        pages = await _fetch_teletype_pages(session, ch["telegraph_url"])
+                    except Exception:  # noqa: BLE001
+                        pages = []
+                    if pages:
+                        named = [(f"{ch['number']:04d}_{p + 1:03d}.{_img_ext(b)}", b)
+                                 for p, b in enumerate(pages)]
+                        data = (build_pdf(named) if job.fmt == "pdf" else build_cbz(named))
+                        yield ch["number"], data, job.fmt
+                    if progress:
+                        await progress(i + 1, len(chapters))
+
+            async for part in self._zip_per_chapter_iter(base, files()):
                 yield part
             return
 
         # single combined file, split at image granularity into volumes
         cur: list[tuple[str, bytes]] = []
-        cur_bytes, emitted = 0, []
+        cur_bytes = 0
         ext = "pdf" if job.fmt == "pdf" else "cbz"
+        first_part: bytes | None = None
+        part_idx = 1
+        multi = False
 
         async def flush():
             nonlocal cur, cur_bytes
@@ -399,6 +427,21 @@ class Downloader:
             cur, cur_bytes = [], 0
             return data
 
+        def queue_part(data: bytes | None) -> list[tuple[str, bytes]]:
+            nonlocal first_part, part_idx, multi
+            if data is None:
+                return []
+            out: list[tuple[str, bytes]] = []
+            if first_part is None:
+                first_part = data
+            else:
+                if not multi:
+                    multi = True
+                    out.append((f"{base} (часть 1).{ext}", first_part))
+                out.append((f"{base} (часть {part_idx}).{ext}", data))
+            part_idx += 1
+            return out
+
         for i, ch in enumerate(chapters):
             try:
                 pages = await _fetch_teletype_pages(session, ch["telegraph_url"])
@@ -406,37 +449,65 @@ class Downloader:
                 pages = []
             for p, b in enumerate(pages):
                 if cur and cur_bytes + len(b) > MAX_PART_BYTES:
-                    emitted.append(await flush())
+                    for part in queue_part(await flush()):
+                        yield part
                 cur.append((f"{ch['number']:04d}_{p + 1:03d}.{_img_ext(b)}", b))
                 cur_bytes += len(b)
             if progress:
                 await progress(i + 1, len(chapters))
-        last = await flush()
-        if last is not None:
-            emitted.append(last)
-        for idx, data in enumerate(emitted, 1):
-            suffix = f" (часть {idx})" if len(emitted) > 1 else ""
-            yield f"{base}{suffix}.{ext}", data
+        for part in queue_part(await flush()):
+            yield part
+        if first_part is not None and not multi:
+            yield f"{base}.{ext}", first_part
 
     # ── shared: pack per-chapter files into ≤limit ZIP volumes ────────────────
     async def _zip_per_chapter(self, base: str,
                                files: list[tuple[int, bytes, str]]):
+        async def gen():
+            for file in files:
+                yield file
+
+        async for part in self._zip_per_chapter_iter(base, gen()):
+            yield part
+
+    async def _zip_per_chapter_iter(self, base: str, files):
         cur: list[tuple[str, bytes]] = []
         cur_bytes = 0
-        volumes: list[list[tuple[str, bytes]]] = []
-        for num, data, ext in files:
-            name = f"{base}_Глава_{num:04d}.{ext}"
-            if cur and cur_bytes + len(data) > MAX_PART_BYTES:
-                volumes.append(cur)
-                cur, cur_bytes = [], 0
-            cur.append((name, data))
-            cur_bytes += len(data)
-        if cur:
-            volumes.append(cur)
-        for idx, vol in enumerate(volumes, 1):
+        first_zip: bytes | None = None
+        part_idx = 1
+        multi = False
+
+        def build_zip(vol: list[tuple[str, bytes]]) -> bytes:
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
                 for name, data in vol:
                     z.writestr(name, data)
-            suffix = f" (часть {idx})" if len(volumes) > 1 else ""
-            yield f"{base}{suffix}.zip", buf.getvalue()
+            return buf.getvalue()
+
+        def queue_zip(vol: list[tuple[str, bytes]]) -> list[tuple[str, bytes]]:
+            nonlocal first_zip, part_idx, multi
+            out: list[tuple[str, bytes]] = []
+            data = build_zip(vol)
+            if first_zip is None:
+                first_zip = data
+            else:
+                if not multi:
+                    multi = True
+                    out.append((f"{base} (часть 1).zip", first_zip))
+                out.append((f"{base} (часть {part_idx}).zip", data))
+            part_idx += 1
+            return out
+
+        async for num, data, ext in files:
+            name = f"{base}_Глава_{num:04d}.{ext}"
+            if cur and cur_bytes + len(data) > MAX_PART_BYTES:
+                for part in queue_zip(cur):
+                    yield part
+                cur, cur_bytes = [], 0
+            cur.append((name, data))
+            cur_bytes += len(data)
+        if cur:
+            for part in queue_zip(cur):
+                yield part
+        if first_zip is not None and not multi:
+            yield f"{base}.zip", first_zip

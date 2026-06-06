@@ -4,12 +4,13 @@ Runtime counterpart of the backfill. A post may carry **several** hashtags:
 
 * the first hashtag that maps to a *project* sets the post's project;
 * every hashtag that maps to a *category* files the post into that section;
-* an unknown hashtag auto-creates a category section (+ owner notice).
+* an unknown hashtag creates a conflict (+ owner notice) and is not published
+  until an admin binds it. Legacy auto-section mode is opt-in.
 
-So ``#покровитель #мемы #стикерпак`` ties the post to the «Покровитель» project
-AND lists it under the global «Мемы» and «стикерпак» sections. Chapters are
-extracted only when a project tag is present and the body has Telegraph links.
-The project is resolved **only** by hashtag here — never guessed from the title.
+So ``#покровитель #мемы`` ties the post to the «Покровитель» project AND lists
+it under the global «Мемы» section. Chapters are extracted only when a project
+tag is present and the body has Telegraph links. The project is resolved
+**only** by hashtag here — never guessed from the title.
 """
 from __future__ import annotations
 
@@ -43,6 +44,10 @@ class ProcessResult:
 async def process_post(db: Database, cfg: Config, post: ParsedPost,
                        *, is_edit: bool = False) -> ProcessResult:
     """Process one live (or edited) channel post. Idempotent by message_id."""
+    if not db.in_transaction:
+        async with db.transaction():
+            return await process_post(db, cfg, post, is_edit=is_edit)
+
     res = ProcessResult(message_id=post.message_id)
     tags = post.hashtags
     tg_url = cfg.post_url(post.message_id)
@@ -52,6 +57,8 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
         await db.upsert_post(post.message_id, tg_url, date, post.text[:4000],
                              "chatter", None)
         return res
+
+    auto_unknown = cfg.unknown_hashtag_mode in {"auto", "auto_section", "autosection"}
 
     # ── resolve every hashtag → project (first) / group / categories / unknown ─
     project_id: int | None = None
@@ -63,14 +70,16 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
     for tag in tags:
         mapping = await db.get_hashtag(tag)
         if mapping is None:
-            section_id = await db.upsert_section(
-                key=f"tag_{slugify(tag)}", name=f"#{tag}",
-                slug=slugify(tag), emoji="🆕", auto_created=1)
-            await db.set_hashtag(tag, "category", section_id)
-            await db.add_conflict("unknown_hashtag", tag,
-                                  f"auto-created section for #{tag} "
-                                  f"(msg {post.message_id})")
-            categories.append((section_id, tag))
+            detail = (f"unknown hashtag #{tag} in msg {post.message_id}; "
+                      "not published to navigation")
+            if auto_unknown:
+                section_id = await db.upsert_section(
+                    key=f"tag_{slugify(tag)}", name=f"#{tag}",
+                    slug=slugify(tag), emoji="🆕", auto_created=1)
+                await db.set_hashtag(tag, "category", section_id)
+                categories.append((section_id, tag))
+                detail = f"auto-created section for #{tag} (msg {post.message_id})"
+            await db.add_conflict("unknown_hashtag", tag, detail)
             unknown.append(tag)
         elif mapping["kind"] == "project":
             if project_id is None:
@@ -107,10 +116,7 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
                 title=ch.title, telegraph_url=ch.telegraph_url,
                 post_id=post.message_id, src_kind="chapters", prefer=True)
             res.chapters += 1
-            if is_edit:
-                # the linked page may have changed → drop stale cached text
-                await db.delete_chapter_cache(ch.telegraph_url)
-        if is_edit:
+        if is_edit and chapters:
             # a chapter whose link was removed from the (edited) post must also
             # disappear from the bot/navigation, not linger in the DB.
             new_numbers = {ch.number for ch in chapters}
@@ -120,6 +126,15 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
             for row in owned:
                 if row["number"] not in new_numbers:
                     await db.delete_chapter(row["id"])
+        elif is_edit:
+            owned = await db.fetchall(
+                "SELECT id FROM chapters WHERE post_id=? AND project_id=?",
+                (post.message_id, project_id))
+            if owned:
+                await db.add_conflict(
+                    "unparsed_edit", str(post.message_id),
+                    f"edited #{project_tag} post produced no chapters; "
+                    "kept existing chapters for safety")
         builds.add(("project", project_id))
 
     # ── category items (one per category tag, linked to the project if any) ───
@@ -145,8 +160,12 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
         res.action = "unknown_hashtag"
         res.new_section_name = f"#{unknown[0]}"
         tag_list = ", ".join(f"#{t}" for t in unknown)
-        res.notify = (f"🆕 Новый хэштег: {tag_list} — создан раздел. "
-                      f"Привяжите его к проекту/разделу в админке при желании.")
+        if auto_unknown:
+            res.notify = (f"🆕 Новый хэштег: {tag_list} — создан раздел. "
+                          f"Привяжите его к проекту/разделу в админке при желании.")
+        else:
+            res.notify = (f"⚠️ Неизвестный хэштег: {tag_list}. Пост не опубликован "
+                          "по этому тегу; привяжите хэштег в админке.")
     elif chapters:
         res.action = "chapters"
     elif categories:

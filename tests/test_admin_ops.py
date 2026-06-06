@@ -5,6 +5,7 @@ import asyncio
 import os
 
 from app.config import load_config
+from app.bot import BotApp
 from app.db import Database
 from app.parser import Anchor, ParsedPost
 from app.pipeline import process_post
@@ -40,6 +41,9 @@ def test_arc_rename_merge_split(tmp_path):
 
             arcs = await db.list_arcs(pid)
             assert {a["arc"] for a in arcs} == {"Альфа", "Бета"}
+            first = arcs[0]
+            assert BotApp._arc_by_token(arcs, BotApp._arc_token(first))["arc"] == first["arc"]
+            assert BotApp._arc_by_token(arcs, "0")["arc"] == first["arc"]
 
             # rename Альфа -> Пролог
             await db.rename_arc(pid, "Альфа", "Пролог")
@@ -106,6 +110,25 @@ def test_item_update_and_delete(tmp_path):
 
             await db.delete_item(iid)
             assert await db.count_items(section_id=sec["id"]) == 0
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
+def test_operational_log_pruning(tmp_path):
+    async def go():
+        db, _cfg = await _fresh(tmp_path / "logs.db")
+        try:
+            for i in range(10):
+                await db.log("WARNING", "test", f"event {i}")
+                await db.audit(i, "edit", "thing", i, "detail")
+            await db.prune_operational_logs(keep_events=3, keep_audits=4)
+            events = await db.fetchall("SELECT * FROM event_log ORDER BY id")
+            audits = await db.fetchall("SELECT * FROM audit_log ORDER BY id")
+            assert len(events) == 3
+            assert len(audits) == 4
+            assert events[0]["message"] == "event 7"
+            assert audits[0]["user_id"] == 6
         finally:
             await db.close()
     asyncio.run(go())

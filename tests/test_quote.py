@@ -7,6 +7,7 @@ from app.quote import (
     QuoteError,
     build_preview,
     build_quote,
+    fetch_paragraphs,
     nodes_to_paragraphs,
     parse_quote,
     range_label,
@@ -63,6 +64,18 @@ def test_nodes_to_paragraphs():
         {"tag": "p", "children": ["   "]},
     ]
     assert nodes_to_paragraphs(content) == ["Первый абзац.", "Второй ссылка."]
+
+
+def test_fetch_paragraphs_does_not_touch_db():
+    import asyncio
+
+    class FakeTelegraph:
+        async def get_page_content(self, path):
+            assert path == "X"
+            return [{"tag": "p", "children": ["Текст главы."]}]
+
+    paras = asyncio.run(fetch_paragraphs(FakeTelegraph(), "https://telegra.ph/X"))
+    assert paras == ["Текст главы."]
 
 
 # ── selecting a fragment ─────────────────────────────────────────────────────
