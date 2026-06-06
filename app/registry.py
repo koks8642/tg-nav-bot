@@ -1,18 +1,15 @@
 """Seed project / section / hashtag registry and post classification.
 
-The registry is the structural knowledge the backfill needs to attribute the
-*untagged* history to projects. In live mode projects are resolved purely by
-hashtag (see :mod:`app.pipeline`); the alias matching here is backfill-only.
-
-These seeds are written into the DB on first run and are fully editable
-afterwards through the admin panel — nothing here is hard-wired at runtime.
+These optional seeds are written into the DB on first run and are fully editable
+afterwards through the admin panel. New deployments can disable them with
+``SEED_DEFAULT_REGISTRY=0`` and configure everything by hand.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 
-from .parser import ParsedPost, find_project_header
+from .parser import ParsedPost
 
 
 @dataclass
@@ -109,41 +106,6 @@ SEED_SECTIONS: list[SeedSection] = [
 ]
 
 
-def build_alias_matchers() -> list[tuple[str, re.Pattern]]:
-    """Compile (project_key, pattern) pairs, longest/most-specific first."""
-    pairs: list[tuple[str, re.Pattern]] = []
-    for proj in SEED_PROJECTS:
-        for alias in proj.aliases:
-            pairs.append((proj.key, re.compile(alias, re.IGNORECASE)))
-    # more specific (longer) patterns first so "величайшего гени" beats "гени"
-    pairs.sort(key=lambda p: -len(p[1].pattern))
-    return pairs
-
-
-_ALIAS_MATCHERS = build_alias_matchers()
-
-
-def match_project_structural(post: ParsedPost) -> str | None:
-    """Backfill-only: guess the project key for an untagged post.
-
-    Strategy: first try the explicit header (``Новелла: "..."`` etc.), then fall
-    back to scanning telegraph slugs, then the whole body against aliases.
-    """
-    header = find_project_header(post.text)
-    candidates = [header] if header else []
-    # telegraph slugs are a very strong signal
-    candidates.extend(a.url for a in post.chapter_anchors)
-    candidates.append(post.text)
-
-    for cand in candidates:
-        if not cand:
-            continue
-        for key, pat in _ALIAS_MATCHERS:
-            if pat.search(cand):
-                return key
-    return None
-
-
 # ── Post classification ──────────────────────────────────────────────────────
 # kinds:
 #   navigation — author's hand-maintained "Навигация по тайтлу" aggregator
@@ -168,6 +130,4 @@ def classify_post(post: ParsedPost) -> str:
         return "navigation"
     if post.chapter_anchors:
         return "chapters"
-    # category vs chatter is decided by hashtags in live mode; in backfill we
-    # treat link-less posts as chatter unless they clearly carry a section tag.
     return "chatter"

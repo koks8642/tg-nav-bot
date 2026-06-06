@@ -1,18 +1,15 @@
-"""Render the real backfilled data into Telegraph nodes and validate them."""
+"""Render seeded live-style data into Telegraph nodes and validate them."""
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-from pathlib import Path
 
-from app.backfill import run_backfill
 from app.config import load_config
 from app.db import Database
 from app.render import paginate_project, render_project, render_root
+from app.seed import seed_registry
 from app.telegraph import MAX_CONTENT_BYTES, content_size
-
-ROOT = Path(__file__).resolve().parent.parent
 
 ALLOWED_TAGS = {"a", "b", "p", "h3", "h4", "ul", "li", "hr", "br", "i", "strong"}
 
@@ -30,11 +27,16 @@ def _validate_nodes(nodes):
 
 async def _prepare(db_path):
     os.environ["DB_PATH"] = str(db_path)
-    os.environ["EXPORT_HTML"] = str(ROOT / "ChatExport" / "messages.html")
     cfg = load_config(require_bot=False)
     db = Database(db_path)
     await db.connect()
-    await run_backfill(db, cfg, backup=False)
+    await seed_registry(db)
+    proj = await db.get_project_by_key("pokrovitel")
+    for n in range(1, 401):
+        await db.upsert_chapter(
+            proj["id"], n, "Арена" if n >= 200 else "Пролог", None,
+            f"https://telegra.ph/pokr-Glava-{n}-Arena-06-06",
+            1000 + n, "chapters")
     return db
 
 
@@ -49,7 +51,7 @@ def test_project_page_valid_and_within_size(tmp_path):
                      for r in await db.fetchall("SELECT message_id,tg_url FROM posts")}
             content = render_project(proj, chapters, external, posts)
             _validate_nodes(content)
-            # 191 chapters exceed Telegraph's cap → must paginate into parts
+            # A long project must paginate into parts under Telegraph's cap.
             assert content_size(content) > MAX_CONTENT_BYTES
             parts = paginate_project(proj, chapters, external, posts)
             assert len(parts) >= 2

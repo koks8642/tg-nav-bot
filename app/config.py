@@ -72,7 +72,6 @@ class Config:
     host: str
     port: int
     db_path: Path
-    export_html: Path
     seed_default_registry: bool
     log_level: str
     unknown_hashtag_mode: str
@@ -103,10 +102,6 @@ def load_config(*, require_bot: bool = True) -> Config:
     db_path = Path(os.environ.get("DB_PATH", "./data/rqm.db"))
     if not db_path.is_absolute():
         db_path = (PROJECT_ROOT / db_path).resolve()
-
-    export_html = Path(os.environ.get("EXPORT_HTML", "./ChatExport/messages.html"))
-    if not export_html.is_absolute():
-        export_html = (PROJECT_ROOT / export_html).resolve()
 
     channel_raw = os.environ.get("CHANNEL_CHAT_ID")
     if channel_raw is None:
@@ -140,7 +135,6 @@ def load_config(*, require_bot: bool = True) -> Config:
         host=os.environ.get("HOST", "0.0.0.0"),
         port=_env_int("PORT", 8080),
         db_path=db_path,
-        export_html=export_html,
         seed_default_registry=_env_bool("SEED_DEFAULT_REGISTRY", True),
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         unknown_hashtag_mode=os.environ.get(

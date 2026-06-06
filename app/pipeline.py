@@ -1,6 +1,6 @@
 """Live hashtag-centric processing of channel posts.
 
-Runtime counterpart of the backfill. A post may carry **several** hashtags:
+A post may carry **several** hashtags:
 
 * the first hashtag that maps to a *project* sets the post's project;
 * every hashtag that maps to a *category* files the post into that section;

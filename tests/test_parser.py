@@ -8,11 +8,10 @@ from app.parser import (
     extract_chapters,
     extract_external_links,
     extract_hashtags,
-    find_project_header,
     is_telegraph_url,
     parsed_post_from_message,
 )
-from app.registry import classify_post, match_project_structural
+from app.registry import classify_post
 
 
 def _post(text="", anchors=(), plain=()):
@@ -166,29 +165,6 @@ def test_non_telegraph_anchor_ignored():
     post = _post(anchors=[(
         "https://t.me/c/3131929652/33", "Навигация по тайтлу")])
     assert extract_chapters(post) == []
-
-
-# ── project header / structural matching ─────────────────────────────────────
-
-def test_find_project_header_novella():
-    assert find_project_header('Новелла: "Стал Покровителем Злодеев"') == \
-        "Стал Покровителем Злодеев"
-
-
-def test_find_project_header_old_prefix():
-    assert find_project_header("Стал Покровителем Злодеев, Главы 114-118") == \
-        "Стал Покровителем Злодеев"
-
-
-def test_match_project_structural_typo_tolerant():
-    post = _post(text='Навигация по тайтлу "Ошибочно Приняли За Величайшего Гений"')
-    assert match_project_structural(post) == "geniy"
-
-
-def test_match_project_by_slug():
-    post = _post(anchors=[(
-        "https://telegra.ph/Stal-Pokrovitelem-Zlodeev-Glava-200-x", "Глава 200")])
-    assert match_project_structural(post) == "pokrovitel"
 
 
 # ── classification ───────────────────────────────────────────────────────────

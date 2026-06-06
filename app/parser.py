@@ -1,22 +1,9 @@
-"""Post parser — the single source of structural truth.
-
-Two entry points share the same extraction core:
-
-* :func:`parse_export_html` reads a Telegram HTML export (``messages.html``)
-  into :class:`ParsedPost` records — used by the one-time backfill.
-* :func:`parsed_post_from_message` adapts a live Telegram message (text +
-  entities) into the same :class:`ParsedPost` — used by the live bot.
-
-Everything downstream (chapter extraction, hashtag reading, external-link
-detection, project-header guessing) operates on :class:`ParsedPost`, so the
-backfill and the live pipeline behave identically.
-"""
+"""Post parser for live Telegram channel messages."""
 from __future__ import annotations
 
-import html as html_lib
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import urlparse
 
 # ── Domains ──────────────────────────────────────────────────────────────────
@@ -39,11 +26,6 @@ _CHAPTER_NUM_RE = re.compile(r"глав[аы]?\s*№?\s*(\d+)", re.IGNORECASE)
 # circled numbers ①..⑳ and similar enumerators we strip from arc names
 _CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 _PAREN_RE = re.compile(r"[(（]\s*([^)）]*?)\s*[)）]")
-_HEADER_PATTERNS = (
-    re.compile(r'Новелла\s*:?\s*["«“]([^"»”\n]+)["»”]'),
-    re.compile(r'Навигаци[яи]\s+по\s+тайтлу\s*["«“]([^"»”\n]+)["»”]'),
-    re.compile(r'^\s*([^,\n#]+?),\s*Глав[аы]', re.MULTILINE),
-)
 # arc declared in the pack header, e.g.  Главы 157-161 «Почему Он Так Силён?»
 _HEADER_ARC_RE = re.compile(r'["«“]([^"»”\n]{2,60})["»”]')
 
@@ -225,20 +207,7 @@ def _looks_like_project_name(s: str) -> bool:
     return any(m in low for m in markers)
 
 
-def find_project_header(text: str) -> str | None:
-    """Structural project-name guess from a post body (backfill only)."""
-    for pat in _HEADER_PATTERNS:
-        m = pat.search(text or "")
-        if m:
-            name = m.group(1).strip()
-            # collapse whitespace
-            name = re.sub(r"\s+", " ", name)
-            if 2 <= len(name) <= 80:
-                return name
-    return None
-
-
-# ── chapter extraction (shared by backfill + live) ───────────────────────────
+# ── chapter extraction ───────────────────────────────────────────────────────
 
 def extract_chapters(post: ParsedPost) -> list[ChapterRef]:
     """Extract every chapter referenced in a post.
@@ -278,65 +247,6 @@ def extract_chapters(post: ParsedPost) -> list[ChapterRef]:
 
     out.sort(key=lambda c: c.number)
     return out
-
-
-# ── export (messages.html) parsing ───────────────────────────────────────────
-
-_MSG_SPLIT_RE = re.compile(
-    r'<div class="message (default clearfix(?: joined)?|service)" id="message(-?\d+)">'
-)
-_TEXT_DIV_RE = re.compile(r'<div class="text">(.*?)</div>', re.DOTALL)
-_ANCHOR_RE = re.compile(r'<a href="([^"]+)">(.*?)</a>', re.DOTALL)
-_DATE_RE = re.compile(r'<div class="pull_right date details"[^>]*title="([^"]+)"')
-_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
-_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def _parse_export_date(raw: str) -> datetime | None:
-    # e.g. "14.10.2025 20:43:18 UTC+03:00"
-    m = re.match(r"(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})", raw)
-    if not m:
-        return None
-    d, mo, y, hh, mm, ss = (int(x) for x in m.groups())
-    return datetime(y, mo, d, hh, mm, ss, tzinfo=timezone.utc)
-
-
-def _flatten_text(text_html: str) -> str:
-    text = _BR_RE.sub("\n", text_html)
-    text = _TAG_RE.sub("", text)
-    return html_lib.unescape(text).strip()
-
-
-def parse_export_html(path) -> list[ParsedPost]:
-    """Parse a Telegram HTML export into ParsedPost records (chronological)."""
-    raw = open(path, encoding="utf-8").read()
-    parts = _MSG_SPLIT_RE.split(raw)
-    posts: list[ParsedPost] = []
-    # parts: [pre, cls, id, body, cls, id, body, ...]
-    for k in range(1, len(parts), 3):
-        cls, mid_s, body = parts[k], parts[k + 1], parts[k + 2]
-        mid = int(mid_s)
-        if cls == "service" or mid < 0:
-            continue  # service/date separators carry no navigation data
-
-        tm = _TEXT_DIV_RE.search(body)
-        text_html = tm.group(1) if tm else ""
-        anchors = [
-            Anchor(url=html_lib.unescape(u), label=_flatten_text(lbl))
-            for u, lbl in _ANCHOR_RE.findall(text_html)
-        ]
-        dm = _DATE_RE.search(body)
-        date = _parse_export_date(dm.group(1)) if dm else None
-        posts.append(
-            ParsedPost(
-                message_id=mid,
-                date=date,
-                text=_flatten_text(text_html),
-                anchors=anchors,
-                plain_links=[],
-            )
-        )
-    return posts
 
 
 # ── live message adaptation ──────────────────────────────────────────────────

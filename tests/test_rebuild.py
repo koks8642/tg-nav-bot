@@ -6,14 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 
-from app.backfill import run_backfill
 from app.config import load_config
 from app.db import Database
 from app.rebuild import Rebuilder
-
-ROOT = Path(__file__).resolve().parent.parent
+from app.seed import seed_registry
 
 
 class MockTelegraph:
@@ -43,11 +40,22 @@ class MockTelegraph:
 
 async def _prepare(db_path):
     os.environ["DB_PATH"] = str(db_path)
-    os.environ["EXPORT_HTML"] = str(ROOT / "ChatExport" / "messages.html")
     cfg = load_config(require_bot=False)
     db = Database(db_path)
     await db.connect()
-    await run_backfill(db, cfg, backup=False)
+    await seed_registry(db)
+    pokr = await db.get_project_by_key("pokrovitel")
+    geniy = await db.get_project_by_key("geniy")
+    for n in range(1, 401):
+        await db.upsert_chapter(
+            pokr["id"], n, "Арена" if n >= 200 else "Пролог", None,
+            f"https://telegra.ph/pokr-Glava-{n}-Arena-06-06",
+            1000 + n, "chapters")
+    for n in range(1, 6):
+        await db.upsert_chapter(
+            geniy["id"], n, None, None,
+            f"https://telegra.ph/geniy-Glava-{n}-06-06",
+            2000 + n, "chapters")
     return db, cfg
 
 

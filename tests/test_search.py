@@ -3,22 +3,29 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 
-from app.backfill import run_backfill
 from app.config import load_config
 from app.db import Database
-
-ROOT = Path(__file__).resolve().parent.parent
+from app.seed import seed_registry
 
 
 async def _db(tmp):
     os.environ["DB_PATH"] = str(tmp / "s.db")
-    os.environ["EXPORT_HTML"] = str(ROOT / "ChatExport" / "messages.html")
     cfg = load_config(require_bot=False)
     db = Database(cfg.db_path)
     await db.connect()
-    await run_backfill(db, cfg, backup=False)
+    await seed_registry(db)
+    proj = await db.get_project_by_key("pokrovitel")
+    other = await db.get_project_by_key("geniy")
+    await db.upsert_chapter(
+        proj["id"], 200, "Арена", None,
+        "https://telegra.ph/pokr-Glava-200-Arena-06-06", 2000, "chapters")
+    await db.upsert_chapter(
+        proj["id"], 245, "Арена", None,
+        "https://telegra.ph/pokr-Glava-245-Arena-06-06", 2045, "chapters")
+    await db.upsert_chapter(
+        other["id"], 245, None, None,
+        "https://telegra.ph/geniy-Glava-245-06-06", 3045, "chapters")
     return db
 
 
