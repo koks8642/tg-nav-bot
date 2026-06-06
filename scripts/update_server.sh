@@ -49,6 +49,7 @@ if ! docker compose up -d --build; then
 fi
 
 echo "Running container smoke check..."
+sleep 5
 smoke_ok=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
   if docker compose exec -T rqm-nav python -m app.smoke; then
