@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 # ── Domains ──────────────────────────────────────────────────────────────────
-TELEGRAPH_HOSTS = ("telegra.ph", "graph.org")
+TELEGRAPH_HOSTS = ("telegra.ph", "graph.org")          # text chapters (novels)
+TELETYPE_HOSTS = ("teletype.in",)                      # image chapters (manga)
+# Any host that hosts a chapter the bot should treat like a chapter link.
+CHAPTER_HOSTS = TELEGRAPH_HOSTS + TELETYPE_HOSTS
 
 # platform → host fragments (first match wins)
 EXTERNAL_PLATFORMS: dict[str, tuple[str, ...]] = {
@@ -83,17 +86,18 @@ class ParsedPost:
         return extract_hashtags(self.text)
 
     @property
-    def telegraph_anchors(self) -> list[Anchor]:
-        """Telegraph links from both hyperlinked text and bare URLs.
+    def chapter_anchors(self) -> list[Anchor]:
+        """Chapter links (Telegraph = novels, Teletype = manga) from both
+        hyperlinked text and bare URLs.
 
-        Authors usually hyperlink "Глава N", but a bare pasted telegraph URL
+        Authors usually hyperlink "Глава N", but a bare pasted chapter URL
         (a ``url`` entity → ``plain_links``) should count as a chapter too. Bare
         links get an empty label, so the number/arc are read from the slug.
         """
-        out: list[Anchor] = [a for a in self.anchors if is_telegraph_url(a.url)]
+        out: list[Anchor] = [a for a in self.anchors if is_chapter_url(a.url)]
         seen = {a.url for a in out}
         for url in self.plain_links:
-            if is_telegraph_url(url) and url not in seen:
+            if is_chapter_url(url) and url not in seen:
                 seen.add(url)
                 out.append(Anchor(url=url, label=""))
         return out
@@ -103,6 +107,15 @@ class ParsedPost:
 
 def is_telegraph_url(url: str) -> bool:
     return any(h in url for h in TELEGRAPH_HOSTS)
+
+
+def is_teletype_url(url: str) -> bool:
+    return any(h in url for h in TELETYPE_HOSTS)
+
+
+def is_chapter_url(url: str) -> bool:
+    """A link the bot treats as a chapter (Telegraph text or Teletype manga)."""
+    return any(h in url for h in CHAPTER_HOSTS)
 
 
 def classify_external(url: str) -> str | None:
@@ -231,7 +244,7 @@ def extract_chapters(post: ParsedPost) -> list[ChapterRef]:
     out: list[ChapterRef] = []
     seen_numbers: set[int] = set()
 
-    for anchor in post.telegraph_anchors:
+    for anchor in post.chapter_anchors:
         label = (anchor.label or "").strip()
         m = _CHAPTER_NUM_RE.search(label)
         number: int | None = m and int(m.group(1)) or None

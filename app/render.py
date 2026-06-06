@@ -145,7 +145,7 @@ def _chapter_li(ch, post_url: str | None) -> dict:
     if title:
         head += f" — {title}"
     children: list[Any] = [b(head), br(),
-                           a("📖 Читать в Telegraph", ch["telegraph_url"])]
+                           a("📖 Читать", ch["telegraph_url"])]
     if post_url:
         children += ["  •  ", a("💬 Пост в канале", post_url)]
     return li(*children)

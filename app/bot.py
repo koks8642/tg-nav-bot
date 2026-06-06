@@ -41,7 +41,7 @@ from telegram.ext import (
 
 from .config import Config
 from .db import Database
-from .parser import parsed_post_from_message
+from .parser import is_telegraph_url, parsed_post_from_message
 from .pipeline import process_post
 from .quote import (
     QuoteError,
@@ -579,6 +579,12 @@ class BotApp:
         if not ch:
             await message.reply_text(
                 f"У «{proj['canonical_name']}» нет главы {req.number}.",
+                reply_markup=rm)
+            return
+        if not is_telegraph_url(ch["telegraph_url"]):
+            await message.reply_text(
+                "📄 Цитирование доступно только для текстовых глав (новелл). "
+                "Для манги/манхвы воспользуйтесь кнопкой «📖 Читать».",
                 reply_markup=rm)
             return
         try:

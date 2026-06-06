@@ -132,7 +132,7 @@ def match_project_structural(post: ParsedPost) -> str | None:
     header = find_project_header(post.text)
     candidates = [header] if header else []
     # telegraph slugs are a very strong signal
-    candidates.extend(a.url for a in post.telegraph_anchors)
+    candidates.extend(a.url for a in post.chapter_anchors)
     candidates.append(post.text)
 
     for cand in candidates:
@@ -163,10 +163,10 @@ _AGGREGATOR_MIN_LINKS = 12
 def classify_post(post: ParsedPost) -> str:
     head = post.text[:_NAV_FIRSTLINE_CHARS]
     is_aggregator = bool(_NAV_RE.search(head)) or \
-        len(post.telegraph_anchors) >= _AGGREGATOR_MIN_LINKS
-    if is_aggregator and post.telegraph_anchors:
+        len(post.chapter_anchors) >= _AGGREGATOR_MIN_LINKS
+    if is_aggregator and post.chapter_anchors:
         return "navigation"
-    if post.telegraph_anchors:
+    if post.chapter_anchors:
         return "chapters"
     # category vs chatter is decided by hashtags in live mode; in backfill we
     # treat link-less posts as chatter unless they clearly carry a section tag.
