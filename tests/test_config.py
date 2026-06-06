@@ -1,6 +1,8 @@
 """Config: post links must be derived from the configured channel, not hardcoded."""
 from __future__ import annotations
 
+import pytest
+
 from app.config import load_config
 
 
@@ -24,3 +26,10 @@ def test_seed_default_registry_can_be_disabled(monkeypatch):
     monkeypatch.setenv("SEED_DEFAULT_REGISTRY", "0")
     cfg = load_config(require_bot=False)
     assert cfg.seed_default_registry is False
+
+
+def test_invalid_channel_id_blocks_bot_start(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "x")
+    monkeypatch.setenv("CHANNEL_CHAT_ID", "")
+    with pytest.raises(RuntimeError, match="CHANNEL_CHAT_ID"):
+        load_config(require_bot=True)

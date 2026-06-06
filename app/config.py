@@ -108,10 +108,17 @@ def load_config(*, require_bot: bool = True) -> Config:
     if not export_html.is_absolute():
         export_html = (PROJECT_ROOT / export_html).resolve()
 
-    channel_raw = os.environ.get("CHANNEL_CHAT_ID", f"-100{CHANNEL_INTERNAL_ID}")
+    channel_raw = os.environ.get("CHANNEL_CHAT_ID")
+    if channel_raw is None:
+        channel_raw = f"-100{CHANNEL_INTERNAL_ID}"
     try:
         channel_chat_id = int(channel_raw)
     except ValueError:
+        if require_bot:
+            raise RuntimeError(
+                "CHANNEL_CHAT_ID is invalid. Set the target channel id in .env "
+                "before starting the bot."
+            )
         channel_chat_id = int(f"-100{CHANNEL_INTERNAL_ID}")
 
     bot_token = os.environ.get("BOT_TOKEN", "").strip()
