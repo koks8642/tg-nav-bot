@@ -43,6 +43,15 @@ def _parse_ids(raw: str) -> set[int]:
     return out
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to the default on a bad value instead
+    of crashing at startup."""
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -108,9 +117,9 @@ def load_config(*, require_bot: bool = True) -> Config:
         telegraph_author=os.environ.get("TELEGRAPH_AUTHOR", "Переводы RQM"),
         telegraph_author_url=os.environ.get("TELEGRAPH_AUTHOR_URL", ""),
         telegram_proxy=os.environ.get("TELEGRAM_PROXY", "").strip(),
-        reconcile_interval_min=int(os.environ.get("RECONCILE_INTERVAL_MIN", "30")),
+        reconcile_interval_min=_env_int("RECONCILE_INTERVAL_MIN", 30),
         host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8080")),
+        port=_env_int("PORT", 8080),
         db_path=db_path,
         export_html=export_html,
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),

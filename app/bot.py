@@ -99,6 +99,11 @@ def esc(s) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _num_range(first, last) -> str:
+    """«25» for a single chapter, «25–304» for a span."""
+    return str(first) if first == last else f"{first}–{last}"
+
+
 class BotApp:
     def __init__(self, db: Database, cfg: Config, telegraph=None):
         self.db = db
@@ -855,7 +860,7 @@ class BotApp:
                 chs = await self.db.list_chapters(st["pid"])
                 if chs:
                     nums = sorted(c["number"] for c in chs)
-                    hint = (f"\nДоступны главы <b>{nums[0]}–{nums[-1]}</b> "
+                    hint = (f"\nДоступны главы <b>{_num_range(nums[0], nums[-1])}</b> "
                             f"(всего {len(nums)}).")
             await q.message.reply_text(
                 "✏️ Пришлите номера глав: напр. <code>10-50</code>, "
@@ -940,16 +945,17 @@ class BotApp:
         available = sorted(c["number"] for c in chapters)
         avail = set(available)
         nums: set[int] = set()
-        for part in re.split(r"[,\s]+", text.strip()):
+        for part in re.split(r"[,\s]+", text.strip())[:50]:  # cap tokens
             m = re.match(r"^(\d+)(?:[-–—](\d+))?$", part)
             if not m:
                 continue
             a, b = int(m.group(1)), int(m.group(2) or m.group(1))
-            for n in range(min(a, b), max(a, b) + 1):
-                if n in avail:
-                    nums.add(n)
+            lo, hi = min(a, b), max(a, b)
+            # iterate over the actual chapters (bounded), NOT the typed span —
+            # so «1-99999999999» can't trigger a billion-step loop.
+            nums |= {n for n in avail if lo <= n <= hi}
         if not nums:
-            rng = f"{available[0]}–{available[-1]}" if available else "—"
+            rng = _num_range(available[0], available[-1]) if available else "—"
             total = len(available)
             await message.reply_text(
                 f"В этом тайтле {total} "
@@ -1177,7 +1183,7 @@ class BotApp:
                                           InlineKeyboardButton("⬅️ Назад", callback_data=f"card:{pid}")]]))
             return
         kb = [[InlineKeyboardButton(
-            f"📂 {a['arc']} ({a['first_num']}–{a['last_num']}, {a['n']})",
+            f"📂 {a['arc']} ({_num_range(a['first_num'], a['last_num'])}, {a['n']})",
             callback_data=f"arc:{pid}:{i}")] for i, a in enumerate(arcs)]
         kb.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"card:{pid}")])
         await q.edit_message_text(
@@ -1641,7 +1647,7 @@ class BotApp:
                                       reply_markup=self._back(f"p:{pid}"))
             return
         kb = [[InlineKeyboardButton(
-            f"📂 {a['arc']} ({a['first_num']}–{a['last_num']}, {a['n']})",
+            f"📂 {a['arc']} ({_num_range(a['first_num'], a['last_num'])}, {a['n']})",
             callback_data=f"parc:{pid}:{i}")] for i, a in enumerate(arcs)]
         kb.append([InlineKeyboardButton("⬅️ К проекту", callback_data=f"p:{pid}")])
         await q.edit_message_text(
@@ -1663,8 +1669,10 @@ class BotApp:
             [InlineKeyboardButton("🔗 Объединить с…", callback_data=f"arcmrg:{pid}:{idx}")],
             [InlineKeyboardButton("⬅️ К аркам", callback_data=f"pchaps:{pid}")],
         ]
+        one = a['first_num'] == a['last_num']
         await q.edit_message_text(
-            f"📂 <b>{esc(a['arc'])}</b>\nГлавы {a['first_num']}–{a['last_num']} · "
+            f"📂 <b>{esc(a['arc'])}</b>\n"
+            f"Глав{'а' if one else 'ы'} {_num_range(a['first_num'], a['last_num'])} · "
             f"всего {a['n']}", reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML)
 
@@ -2024,19 +2032,30 @@ class BotApp:
             if not c:
                 await msg.reply_text("Глава пропала.")
                 return
+            if field == "num" and not re.fullmatch(r"\d{1,7}", text):
+                await msg.reply_text("Номер главы — целое число (например 305).",
+                                     reply_markup=self._back(f"c:{cid}"))
+                return
+            if field == "url" and not re.match(r"https?://", text):
+                await msg.reply_text("Ссылка должна начинаться с http(s)://.",
+                                     reply_markup=self._back(f"c:{cid}"))
+                return
             try:
                 if field == "num":
                     await self.db.update_chapter(cid, number=int(text))
                 elif field == "arc":
-                    await self.db.update_chapter(cid, arc=text)
+                    await self.db.update_chapter(cid, arc=text or None)
                 elif field == "title":
                     await self.db.update_chapter(cid, title=text)
                 elif field == "url":
                     await self.db.update_chapter(cid, telegraph_url=text)
                 await self._enqueue_project(c["project_id"])
                 await msg.reply_text("✅ Сохранено.", reply_markup=self._back(f"c:{cid}"))
-            except Exception as e:  # noqa: BLE001
-                await msg.reply_text(f"❌ {esc(e)}", reply_markup=self._back(f"c:{cid}"))
+            except Exception:  # noqa: BLE001
+                log.exception("chapter edit failed")
+                await msg.reply_text(
+                    "❌ Не удалось сохранить (возможно, глава с таким номером "
+                    "уже существует).", reply_markup=self._back(f"c:{cid}"))
 
         # arcs
         elif action == "arc_rename":
