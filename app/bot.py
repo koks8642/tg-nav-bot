@@ -723,7 +723,7 @@ class BotApp:
     # ── callbacks router ────────────────────────────────────────────────────────
     # callbacks anyone may use (the public project / section / group navigation)
     _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard", "gcard", "quote",
-                  "dl", "dlf", "dlp", "dlall", "dlrange", "dlgo"}
+                  "dl", "dla", "dlf", "dlp", "dlall", "dlrange", "dlgo"}
 
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -809,7 +809,9 @@ class BotApp:
                                       parse_mode=ParseMode.HTML,
                                       disable_web_page_preview=True)
         elif head == "dl":
-            await self._dl_open(q, context, int(parts[1]))
+            await self._dl_open(q, context, int(parts[1]), back=f"card:{parts[1]}")
+        elif head == "dla":   # opened from the admin project view
+            await self._dl_open(q, context, int(parts[1]), back=f"p:{parts[1]}")
         elif head == "dlf":
             context.user_data.get("dl", {})["fmt"] = parts[1]
             await self._dl_render(q, context)
@@ -831,7 +833,7 @@ class BotApp:
             await self._dl_enqueue(q, context)
 
     # ── download panel (everyone) ─────────────────────────────────────────────
-    async def _dl_open(self, q, context, pid: int) -> None:
+    async def _dl_open(self, q, context, pid: int, *, back: str = "") -> None:
         p = await self.db.get_project(pid)
         if not p:
             await q.message.reply_text("Проект не найден.")
@@ -848,7 +850,7 @@ class BotApp:
             "pid": pid, "name": p["canonical_name"], "kind": kind,
             "fmt": fmts[0], "packaging": "single",
             "numbers": None, "scope_label": "все главы",
-            "total": len(chapters),
+            "total": len(chapters), "back": back or f"card:{pid}",
         }
         await self._dl_render(q, context)
 
@@ -881,7 +883,8 @@ class BotApp:
             InlineKeyboardButton(mark(st["numbers"] is not None) + "Диапазон…",
                                  callback_data="dlrange")])
         kb.append([InlineKeyboardButton("⬇️ Собрать и прислать", callback_data="dlgo")])
-        kb.append([InlineKeyboardButton("⬅️ К тайтлу", callback_data=f"card:{st['pid']}")])
+        kb.append([InlineKeyboardButton("⬅️ К тайтлу",
+                                        callback_data=st.get("back", f"card:{st['pid']}"))])
         markup = InlineKeyboardMarkup(kb)
         if new:
             await q.message.reply_text(text, reply_markup=markup,
@@ -1440,7 +1443,7 @@ class BotApp:
             [InlineKeyboardButton("📖 Главы и арки", callback_data=f"pchaps:{pid}"),
              InlineKeyboardButton("🏷 Хэштеги проекта", callback_data=f"ptags:{pid}")],
             [InlineKeyboardButton("🏬 Группа", callback_data=f"pgrp:{pid}"),
-             InlineKeyboardButton("📥 Скачать", callback_data=f"dl:{pid}")],
+             InlineKeyboardButton("📥 Скачать", callback_data=f"dla:{pid}")],
             [InlineKeyboardButton("🗑 Удалить проект", callback_data=f"pdel:{pid}"),
              InlineKeyboardButton("⬅️ К проектам", callback_data="proj")],
         ]
