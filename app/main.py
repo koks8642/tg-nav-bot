@@ -20,23 +20,13 @@ from .backup_check import validate_sqlite_database
 from .bot import BotApp
 from .config import PROJECT_ROOT, load_config
 from .db import Database
+from .housekeeping import cleanup_data_dir, prune_backup_dir
 from .rebuild import Rebuilder, enqueue_full_rebuild
 from .seed import seed_registry
 from .telegraph import TelegraphClient
 
 WORKER_POLL_SECONDS = 3  # natural debounce for bursts of posts
 BACKUP_CHECK_SECONDS = 3600
-BACKUP_KEEP = 10         # latest valid local backups; admins receive daily copies
-
-
-def _prune_backup_dir(backups, *, keep: int = BACKUP_KEEP) -> int:
-    """Keep the newest daily backups and remove SQLite sidecar files."""
-    kept = sorted(backups.glob("rqm.*.db"))
-    for old in kept[:-keep]:
-        old.unlink(missing_ok=True)
-    for junk in backups.glob("rqm.*.db-*"):
-        junk.unlink(missing_ok=True)
-    return len(sorted(backups.glob("rqm.*.db")))
 
 
 def _warn_env_permissions(log: logging.Logger) -> None:
@@ -110,6 +100,7 @@ async def run() -> None:
     _warn_env_permissions(log)
 
     db = Database(cfg.db_path)
+    cleanup_data_dir(cfg.db_path)
     await db.connect()
     await seed_registry(db)
 
@@ -178,7 +169,7 @@ async def run() -> None:
     reconciler_task = asyncio.create_task(reconciler())
 
     async def backup_worker() -> None:
-        """Daily on-disk snapshot of the DB, keeping the last BACKUP_KEEP files
+        """Daily on-disk snapshot of the DB, keeping the last daily backup files
         under <db_dir>/backups/. Defends against accidental wipes / corruption,
         not just restarts (the volume already survives restarts). Also DMs the
         snapshot to admins once per UTC day."""
@@ -207,7 +198,7 @@ async def run() -> None:
                     await bot_app.notify_owners_throttled(
                         "backup_not_delivered",
                         "⚠️ Ежедневный бэкап создан, но не отправился ни одному админу.")
-                kept_count = _prune_backup_dir(backups)
+                kept_count = prune_backup_dir(backups)["daily"]
                 await db.prune_operational_logs()
                 log.info("backup written and sent to %d admin(s) (%d kept)",
                          sent, kept_count)

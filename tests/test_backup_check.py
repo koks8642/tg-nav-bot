@@ -8,7 +8,7 @@ import pytest
 
 from app.backup_check import BackupCheckError, validate_sqlite_database
 from app.db import Database
-from app.main import _prune_backup_dir
+from app.housekeeping import cleanup_data_dir, prune_backup_dir
 from app.seed import seed_registry
 
 
@@ -97,8 +97,35 @@ def test_prune_backup_dir_keeps_ten_newest_daily_backups(tmp_path):
     (backups / "rqm.20260606-120010.db-wal").write_text("wal", encoding="utf-8")
     (backups / "rqm.20260606-120010.db-shm").write_text("shm", encoding="utf-8")
 
-    assert _prune_backup_dir(backups, keep=10) == 10
+    assert prune_backup_dir(backups, daily_keep=10)["daily"] == 10
 
     names = sorted(p.name for p in backups.iterdir())
     assert "rqm.20260606-120000.db" not in names
     assert names == [f"rqm.20260606-1200{i:02d}.db" for i in range(1, 11)]
+
+
+def test_cleanup_data_dir_removes_stale_manual_snapshots(tmp_path):
+    data = tmp_path / "data"
+    backups = data / "backups"
+    backups.mkdir(parents=True)
+    stale_root = data / "rqm.1700000000.backup.db"
+    stale_root_sidecar = data / "rqm.1700000000.backup.db-wal"
+    stale_manual = backups / "rqm.manual.1700000000.db"
+    stale_manual_sidecar = backups / "rqm.manual.1700000000.db-shm"
+    daily = backups / "rqm.20260606-120000.db"
+    preop_old = backups / "rqm.preop.1.bak"
+    preop_new = backups / "rqm.preop.2.bak"
+    for path in (
+            stale_root, stale_root_sidecar, stale_manual, stale_manual_sidecar,
+            daily, preop_old, preop_new):
+        path.write_text("x", encoding="utf-8")
+
+    cleanup_data_dir(data / "rqm.db")
+
+    assert not stale_root.exists()
+    assert not stale_root_sidecar.exists()
+    assert not stale_manual.exists()
+    assert not stale_manual_sidecar.exists()
+    assert daily.exists()
+    assert not preop_old.exists()
+    assert preop_new.exists()

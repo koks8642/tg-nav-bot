@@ -45,6 +45,7 @@ from telegram.ext import (
 from .config import Config
 from .backup_check import validate_sqlite_database
 from .db import Database
+from .housekeeping import prune_backup_dir
 from .download import (
     FORMAT_LABELS,
     DownloadJob,
@@ -706,8 +707,8 @@ class BotApp:
         """Snapshot the DB and DM it to the admin who pressed the button."""
         import time
         await q.edit_message_text("💾 Готовлю бэкап…", reply_markup=self._back())
-        dest = self.cfg.db_path.with_name(
-            f"{self.cfg.db_path.stem}.{int(time.time())}.backup.db")
+        backups = self.cfg.db_path.parent / "backups"
+        dest = backups / f"{self.cfg.db_path.stem}.manual.{int(time.time())}.db"
         try:
             await self.db.snapshot(dest)
             validate_sqlite_database(dest)
@@ -720,7 +721,9 @@ class BotApp:
             await q.message.reply_text(f"❌ Не удалось сделать бэкап: {esc(e)}")
         finally:
             try:
-                dest.unlink(missing_ok=True)
+                for junk in dest.parent.glob(dest.name + "*"):
+                    junk.unlink(missing_ok=True)
+                prune_backup_dir(backups)
             except Exception:  # noqa: BLE001
                 pass
 

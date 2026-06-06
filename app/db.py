@@ -19,6 +19,8 @@ from typing import Any, AsyncIterator, Sequence
 
 import aiosqlite
 
+from .housekeeping import prune_backup_dir
+
 FUZZY_CUTOFF = 0.72   # min similarity for typo-tolerant title matching
 
 SCHEMA_VERSION = 6
@@ -357,13 +359,14 @@ class Database:
             return None
         backup_dir = self.path.parent / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
-        for old in backup_dir.glob(f"{self.path.stem}.preop.*.bak"):
-            old.unlink(missing_ok=True)
-        dest = backup_dir / f"{self.path.stem}.preop.{time.time_ns()}.bak"
+        prune_backup_dir(backup_dir, preop_keep=0)
+        nonce = time.time_ns()
+        dest = backup_dir / f"{self.path.stem}.preop.{nonce}.bak"
+        while dest.exists():
+            nonce += 1
+            dest = backup_dir / f"{self.path.stem}.preop.{nonce}.bak"
         shutil.copy2(self.path, dest)
-        for old in backup_dir.glob(f"{self.path.stem}.preop.*.bak"):
-            if old != dest:
-                old.unlink(missing_ok=True)
+        prune_backup_dir(backup_dir)
         return dest
 
     async def snapshot(self, dest: Path) -> Path:
