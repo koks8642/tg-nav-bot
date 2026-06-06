@@ -24,12 +24,14 @@ import aiohttp
 
 from .db import Database
 from .parser import is_teletype_url, is_telegraph_url
-from .quote import fetch_paragraphs
+from .quote import CACHE_TTL_SEC, nodes_to_paragraphs
 from .telegraph import TelegraphClient
 
 MAX_PART_BYTES = 45 * 1024 * 1024     # safety margin under Telegram's 50 MB
 _RAW_TEXT_LIMIT = 30 * 1024 * 1024    # raw novel text per volume (file stays small)
 _IMG_CONCURRENCY = 4
+_TEXT_CONCURRENCY = 6                  # parallel Telegraph reads when building novels
+_TELEGRAPH_GETPAGE = "https://api.telegra.ph/getPage"
 
 NOVEL_FORMATS = ("txt", "md", "fb2", "epub")
 MANGA_FORMATS = ("cbz", "pdf")
@@ -296,21 +298,48 @@ class Downloader:
                 yield part
 
     # ── novel ────────────────────────────────────────────────────────────────
+    async def _novel_paragraphs(self, session, url: str) -> list[str] | None:
+        """Read one Telegraph chapter's text (cached, with light retries). Uses
+        the passed session directly so reads run concurrently, instead of going
+        through the shared TelegraphClient lock (which serialises everything)."""
+        cached = await self.db.get_chapter_cache(url, max_age_sec=CACHE_TTL_SEC)
+        if cached is not None:
+            return cached
+        path = url.rstrip("/").rsplit("/", 1)[-1]
+        for attempt in range(3):
+            try:
+                async with session.post(
+                        _TELEGRAPH_GETPAGE,
+                        data={"path": path, "return_content": "true"}) as r:
+                    payload = await r.json(content_type=None)
+                if payload.get("ok"):
+                    paras = nodes_to_paragraphs(payload["result"].get("content", []))
+                    await self.db.set_chapter_cache(url, paras)
+                    return paras
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.8 * (attempt + 1))
+        return None
+
     async def _produce_novel(self, job, chapters, session, progress):
         builder = _NOVEL_BUILDERS[job.fmt]
         ext = _NOVEL_EXT[job.fmt]
         base = _safe(job.project_name)
-        fetched: list[dict] = []
-        for i, ch in enumerate(chapters):
-            try:
-                paras = await fetch_paragraphs(self.db, self.tg, ch["telegraph_url"])
-            except Exception:  # noqa: BLE001 — skip a broken chapter, keep going
-                paras = None
-            if paras:
-                fetched.append({"number": ch["number"], "title": ch["title"],
-                                "paragraphs": paras})
+        sem = asyncio.Semaphore(_TEXT_CONCURRENCY)
+        done = [0]
+
+        async def fetch_one(ch):
+            async with sem:
+                paras = await self._novel_paragraphs(session, ch["telegraph_url"])
+            done[0] += 1
             if progress:
-                await progress(i + 1, len(chapters))
+                await progress(done[0], len(chapters))
+            return ch, paras
+
+        results = await asyncio.gather(*(fetch_one(ch) for ch in chapters))
+        fetched: list[dict] = [
+            {"number": ch["number"], "title": ch["title"], "paragraphs": p}
+            for ch, p in results if p]
         if not fetched:
             return
 

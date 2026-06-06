@@ -18,6 +18,8 @@ import logging
 import re
 import time
 
+import aiohttp
+
 from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -992,25 +994,38 @@ class BotApp:
             + ". Соберу и пришлю файлы сюда.")
 
     async def download_worker(self) -> None:
-        """Single consumer: build downloads one at a time and send the files."""
-        timeout = aiohttp.ClientTimeout(total=180)
-        async with aiohttp.ClientSession(
-                timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as session:
-            while True:
-                job = await self._dl_queue.get()
-                try:
-                    await self._run_download(job, session)
-                except Exception as e:  # noqa: BLE001
-                    log.exception("download failed")
-                    try:
-                        await self.application.bot.send_message(
-                            job.chat_id, f"❌ Не удалось собрать загрузку: {esc(e)}")
-                    except Exception:  # noqa: BLE001
-                        pass
-                finally:
-                    if job.user_id is not None:
-                        self._dl_users.discard(job.user_id)
-                    self._dl_queue.task_done()
+        """Single consumer: build downloads one at a time and send the files.
+
+        Wrapped so a fatal error (e.g. the session dying) is logged and the
+        worker restarts instead of silently leaving the queue stuck forever."""
+        log.info("download worker started")
+        while True:
+            try:
+                timeout = aiohttp.ClientTimeout(total=180)
+                async with aiohttp.ClientSession(
+                        timeout=timeout,
+                        headers={"User-Agent": "Mozilla/5.0"}) as session:
+                    while True:
+                        job = await self._dl_queue.get()
+                        try:
+                            await self._run_download(job, session)
+                        except Exception as e:  # noqa: BLE001
+                            log.exception("download failed")
+                            try:
+                                await self.application.bot.send_message(
+                                    job.chat_id,
+                                    f"❌ Не удалось собрать загрузку: {esc(e)}")
+                            except Exception:  # noqa: BLE001
+                                pass
+                        finally:
+                            if job.user_id is not None:
+                                self._dl_users.discard(job.user_id)
+                            self._dl_queue.task_done()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.exception("download worker crashed — restarting in 3s")
+                await asyncio.sleep(3)
 
     async def _run_download(self, job: DownloadJob, session) -> None:
         bot = self.application.bot
