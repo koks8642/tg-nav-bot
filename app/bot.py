@@ -260,9 +260,16 @@ class BotApp:
         u = update.effective_user
         return bool(u and await self.is_admin(u.id))
 
+    def _redact(self, s) -> str:
+        """Strip the bot token from any string before it's stored or shown."""
+        s = "" if s is None else str(s)
+        tok = self.cfg.bot_token
+        return s.replace(tok, "<BOT_TOKEN>") if tok and tok in s else s
+
     async def notify_owners(self, text: str) -> None:
         if not self.application:
             return
+        text = self._redact(text)
         targets = set(self.cfg.owner_user_ids) | await self._channel_admin_ids()
         for uid in targets:
             try:
@@ -287,8 +294,10 @@ class BotApp:
         try:
             result = await process_post(self.db, self.cfg, post, is_edit=is_edit)
         except Exception as e:  # noqa: BLE001
-            await self.db.log("ERROR", "watcher", f"msg {msg.message_id}: {e}")
-            await self.notify_owners(f"⚠️ Ошибка обработки поста {msg.message_id}: {e}")
+            await self.db.log("ERROR", "watcher",
+                              self._redact(f"msg {msg.message_id}: {e}"))
+            await self.notify_owners(
+                f"⚠️ Ошибка обработки поста {msg.message_id}: {self._redact(e)}")
             return
         if result.notify:
             await self.notify_owners(result.notify)
@@ -469,9 +478,9 @@ class BotApp:
                                          reply_markup=InlineKeyboardMarkup(kb))
                 return
             html = await self._search_html(res, query)
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             log.exception("search failed")
-            html = f"Ошибка поиска: {esc(e)}"
+            html = "Не удалось выполнить поиск. Попробуйте ещё раз чуть позже."
         await message.reply_text(html, parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
 
@@ -751,8 +760,11 @@ class BotApp:
             try:
                 await self._route_public(q, context, data)
             except Exception as e:  # noqa: BLE001
+                if "not modified" in str(e).lower():
+                    return  # user double-tapped a button → content unchanged
                 log.exception("public callback failed")
-                await self._safe_answer(q, f"Ошибка: {e}", show_alert=True)
+                await self._safe_answer(
+                    q, "Что-то пошло не так. Попробуйте ещё раз.", show_alert=True)
             return
         if not await self.is_admin(q.from_user.id):
             await self._safe_answer(q, "Нет доступа", show_alert=True)
@@ -761,8 +773,10 @@ class BotApp:
         try:
             await self._route(q, context, data)
         except Exception as e:  # noqa: BLE001
+            if "not modified" in str(e).lower():
+                return  # double-tap on an unchanged screen — ignore
             log.exception("callback failed")
-            await q.message.reply_text(f"Ошибка: {esc(e)}")
+            await q.message.reply_text(f"Ошибка: {esc(self._redact(e))}")
 
     @staticmethod
     async def _safe_answer(q, text: str | None = None, show_alert: bool = False) -> None:
@@ -774,9 +788,9 @@ class BotApp:
             log.debug("callback answer skipped: %s", e)
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-        log.warning("update error: %s", context.error)
+        log.warning("update error: %s", self._redact(context.error))
         try:
-            await self.db.log("WARNING", "bot", str(context.error)[:500])
+            await self.db.log("WARNING", "bot", self._redact(context.error)[:500])
         except Exception:  # noqa: BLE001
             pass
 
@@ -1012,12 +1026,13 @@ class BotApp:
                         job = await self._dl_queue.get()
                         try:
                             await self._run_download(job, session)
-                        except Exception as e:  # noqa: BLE001
+                        except Exception:  # noqa: BLE001
                             log.exception("download failed")
                             try:
                                 await self.application.bot.send_message(
                                     job.chat_id,
-                                    f"❌ Не удалось собрать загрузку: {esc(e)}")
+                                    "❌ Не удалось собрать загрузку. Попробуйте "
+                                    "позже или меньший диапазон глав.")
                             except Exception:  # noqa: BLE001
                                 pass
                         finally:

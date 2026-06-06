@@ -42,11 +42,41 @@ async def _ensure_telegraph_token(db: Database, tg: TelegraphClient,
         "set TELEGRAPH_TOKEN=%s in the environment.", token)
 
 
+class _TokenRedactor(logging.Filter):
+    """Strip the bot token (and any Bot API URL secret) from every log record,
+    so it can never leak to the console or the hosting platform's log viewer."""
+
+    def __init__(self, token: str):
+        super().__init__()
+        self._token = token
+
+    def _clean(self, value):
+        if isinstance(value, str) and self._token and self._token in value:
+            return value.replace(self._token, "<BOT_TOKEN>")
+        return value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._clean(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._clean(a) for a in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {k: self._clean(v) for k, v in record.args.items()}
+        return True
+
+
 async def run() -> None:
     cfg = load_config(require_bot=True)
     logging.basicConfig(
         level=getattr(logging, cfg.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # httpx logs every Bot API request URL — which contains the token — at INFO.
+    # Silence it (and httpcore) and additionally redact the token everywhere.
+    for noisy in ("httpx", "httpcore", "aiohttp.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    if cfg.bot_token:
+        redactor = _TokenRedactor(cfg.bot_token)
+        for handler in logging.getLogger().handlers:
+            handler.addFilter(redactor)
     log = logging.getLogger("main")
 
     db = Database(cfg.db_path)
