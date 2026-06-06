@@ -26,7 +26,17 @@ from .telegraph import TelegraphClient
 
 WORKER_POLL_SECONDS = 3  # natural debounce for bursts of posts
 BACKUP_CHECK_SECONDS = 3600
-BACKUP_KEEP = 1          # latest valid local backup; admins receive daily copies
+BACKUP_KEEP = 10         # latest valid local backups; admins receive daily copies
+
+
+def _prune_backup_dir(backups, *, keep: int = BACKUP_KEEP) -> int:
+    """Keep the newest daily backups and remove SQLite sidecar files."""
+    kept = sorted(backups.glob("rqm.*.db"))
+    for old in kept[:-keep]:
+        old.unlink(missing_ok=True)
+    for junk in backups.glob("rqm.*.db-*"):
+        junk.unlink(missing_ok=True)
+    return len(sorted(backups.glob("rqm.*.db")))
 
 
 def _warn_env_permissions(log: logging.Logger) -> None:
@@ -197,14 +207,10 @@ async def run() -> None:
                     await bot_app.notify_owners_throttled(
                         "backup_not_delivered",
                         "⚠️ Ежедневный бэкап создан, но не отправился ни одному админу.")
-                kept = sorted(backups.glob("rqm.*.db"))
-                for old in kept[:-BACKUP_KEEP]:
-                    old.unlink(missing_ok=True)
-                for junk in backups.glob("rqm.*.db-*"):
-                    junk.unlink(missing_ok=True)
+                kept_count = _prune_backup_dir(backups)
                 await db.prune_operational_logs()
                 log.info("backup written and sent to %d admin(s) (%d kept)",
-                         sent, min(len(kept), BACKUP_KEEP))
+                         sent, kept_count)
                 await asyncio.wait_for(stop.wait(), timeout=BACKUP_CHECK_SECONDS)
             except asyncio.TimeoutError:
                 pass

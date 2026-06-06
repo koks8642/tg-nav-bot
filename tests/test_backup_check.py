@@ -8,6 +8,7 @@ import pytest
 
 from app.backup_check import BackupCheckError, validate_sqlite_database
 from app.db import Database
+from app.main import _prune_backup_dir
 from app.seed import seed_registry
 
 
@@ -86,3 +87,18 @@ def test_database_connect_repairs_legacy_orphan_aliases(tmp_path):
 
     assert asyncio.run(reopen()) == []
     assert validate_sqlite_database(db_path)["user_version"] >= 6
+
+
+def test_prune_backup_dir_keeps_ten_newest_daily_backups(tmp_path):
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    for i in range(11):
+        (backups / f"rqm.20260606-1200{i:02d}.db").write_text(str(i), encoding="utf-8")
+    (backups / "rqm.20260606-120010.db-wal").write_text("wal", encoding="utf-8")
+    (backups / "rqm.20260606-120010.db-shm").write_text("shm", encoding="utf-8")
+
+    assert _prune_backup_dir(backups, keep=10) == 10
+
+    names = sorted(p.name for p in backups.iterdir())
+    assert "rqm.20260606-120000.db" not in names
+    assert names == [f"rqm.20260606-1200{i:02d}.db" for i in range(1, 11)]
