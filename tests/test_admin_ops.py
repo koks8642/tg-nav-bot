@@ -132,3 +132,19 @@ def test_operational_log_pruning(tmp_path):
         finally:
             await db.close()
     asyncio.run(go())
+
+
+def test_preop_backup_keeps_only_latest_file(tmp_path):
+    async def go():
+        db, _cfg = await _fresh(tmp_path / "preop.db")
+        try:
+            first = db.backup()
+            second = db.backup()
+            assert first is not None and second is not None
+            assert not first.exists()
+            assert second.exists()
+            files = list((tmp_path / "backups").glob("preop.preop.*.bak"))
+            assert files == [second]
+        finally:
+            await db.close()
+    asyncio.run(go())

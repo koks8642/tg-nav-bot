@@ -26,7 +26,7 @@ from .telegraph import TelegraphClient
 
 WORKER_POLL_SECONDS = 3  # natural debounce for bursts of posts
 BACKUP_CHECK_SECONDS = 3600
-BACKUP_KEEP = 7          # rolling daily backups kept on disk
+BACKUP_KEEP = 1          # latest valid local backup; admins receive daily copies
 
 
 def _warn_env_permissions(log: logging.Logger) -> None:
@@ -174,6 +174,7 @@ async def run() -> None:
         snapshot to admins once per UTC day."""
         backups = cfg.db_path.parent / "backups"
         while not stop.is_set():
+            dest = None
             try:
                 now = datetime.now(timezone.utc)
                 today = now.strftime("%Y-%m-%d")
@@ -199,6 +200,8 @@ async def run() -> None:
                 kept = sorted(backups.glob("rqm.*.db"))
                 for old in kept[:-BACKUP_KEEP]:
                     old.unlink(missing_ok=True)
+                for junk in backups.glob("rqm.*.db-*"):
+                    junk.unlink(missing_ok=True)
                 await db.prune_operational_logs()
                 log.info("backup written and sent to %d admin(s) (%d kept)",
                          sent, min(len(kept), BACKUP_KEEP))
@@ -206,10 +209,20 @@ async def run() -> None:
             except asyncio.TimeoutError:
                 pass
             except Exception as e:  # noqa: BLE001
+                if dest is not None:
+                    for junk in dest.parent.glob(dest.name + "*"):
+                        try:
+                            junk.unlink(missing_ok=True)
+                        except Exception:  # noqa: BLE001
+                            log.debug("failed to remove bad backup %s", junk)
                 await db.log("ERROR", "backup", str(e))
                 await bot_app.notify_owners_throttled(
                     "backup_error",
                     f"⚠️ Ошибка ежедневного бэкапа: {bot_app._redact(e)}")
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=BACKUP_CHECK_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
 
     # start the bot — retry init, since api.telegram.org can be slow/flaky
     # (notably throttled from RU networks); give it several attempts.

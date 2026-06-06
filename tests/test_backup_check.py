@@ -55,3 +55,34 @@ def test_validate_sqlite_database_rejects_foreign_key_errors(tmp_path):
 
     with pytest.raises(BackupCheckError, match="foreign_key_check"):
         validate_sqlite_database(db_path)
+
+
+def test_database_connect_repairs_legacy_orphan_aliases(tmp_path):
+    async def create_db():
+        db_path = tmp_path / "legacy.db"
+        db = Database(db_path)
+        await db.connect()
+        await db.close()
+        return db_path
+
+    db_path = asyncio.run(create_db())
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            "INSERT INTO project_aliases(project_id,alias_pattern) "
+            "VALUES(404,'orphan')")
+        conn.execute("PRAGMA user_version=5")
+        conn.commit()
+    finally:
+        conn.close()
+
+    async def reopen():
+        db = Database(db_path)
+        await db.connect()
+        rows = await db.fetchall("SELECT * FROM project_aliases")
+        await db.close()
+        return rows
+
+    assert asyncio.run(reopen()) == []
+    assert validate_sqlite_database(db_path)["user_version"] >= 6

@@ -21,7 +21,7 @@ import aiosqlite
 
 FUZZY_CUTOFF = 0.72   # min similarity for typo-tolerant title matching
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -251,13 +251,62 @@ class Database:
             # v5: SQLite UNIQUE treats NULL as distinct, so older DBs could
             # accumulate many root/pending queue rows.
             await self._dedupe_build_queue()
+        if version < 6:
+            # v6: older admin deletes could leave orphan rows when SQLite
+            # foreign_keys was not enforced for that connection/session.
+            await self._repair_foreign_keys()
         if version < SCHEMA_VERSION:
             await self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION};")
+        await self._repair_foreign_keys()
         await self._dedupe_build_queue()
         await self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_build_queue_dedupe "
             "ON build_queue(page_kind, COALESCE(page_ref, -1), status)")
         await self.conn.commit()
+
+    async def _repair_foreign_keys(self) -> None:
+        await self.conn.execute(
+            "DELETE FROM project_aliases WHERE project_id NOT IN "
+            "(SELECT id FROM projects)")
+        await self.conn.execute(
+            "DELETE FROM chapters WHERE project_id NOT IN "
+            "(SELECT id FROM projects)")
+        await self.conn.execute(
+            "DELETE FROM external_links WHERE project_id NOT IN "
+            "(SELECT id FROM projects)")
+        await self.conn.execute(
+            "UPDATE items SET project_id=NULL WHERE project_id IS NOT NULL "
+            "AND project_id NOT IN (SELECT id FROM projects)")
+        await self.conn.execute(
+            "DELETE FROM items WHERE section_id IS NOT NULL "
+            "AND section_id NOT IN (SELECT id FROM sections)")
+        await self.conn.execute(
+            "DELETE FROM telegraph_pages WHERE kind='project' "
+            "AND ref_id NOT IN (SELECT id FROM projects)")
+        await self.conn.execute(
+            "DELETE FROM telegraph_pages WHERE kind='section' "
+            "AND ref_id NOT IN (SELECT id FROM sections)")
+        await self.conn.execute(
+            "DELETE FROM telegraph_pages WHERE kind='group' "
+            "AND ref_id NOT IN (SELECT id FROM groups)")
+        await self.conn.execute(
+            "DELETE FROM hashtag_map WHERE kind='project' "
+            "AND target_id NOT IN (SELECT id FROM projects)")
+        await self.conn.execute(
+            "DELETE FROM hashtag_map WHERE kind='category' "
+            "AND target_id NOT IN (SELECT id FROM sections)")
+        await self.conn.execute(
+            "DELETE FROM hashtag_map WHERE kind='group' "
+            "AND target_id NOT IN (SELECT id FROM groups)")
+        await self.conn.execute(
+            "DELETE FROM build_queue WHERE page_kind='project' "
+            "AND page_ref NOT IN (SELECT id FROM projects)")
+        await self.conn.execute(
+            "DELETE FROM build_queue WHERE page_kind='section' "
+            "AND page_ref NOT IN (SELECT id FROM sections)")
+        await self.conn.execute(
+            "DELETE FROM build_queue WHERE page_kind='group' "
+            "AND page_ref NOT IN (SELECT id FROM groups)")
 
     async def _dedupe_build_queue(self) -> None:
         await self.conn.execute(
@@ -306,8 +355,15 @@ class Database:
         """Copy the DB file aside before a mass operation (best-effort)."""
         if not self.path.exists():
             return None
-        dest = self.path.with_name(f"{self.path.stem}.{int(time.time())}.bak")
+        backup_dir = self.path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        for old in backup_dir.glob(f"{self.path.stem}.preop.*.bak"):
+            old.unlink(missing_ok=True)
+        dest = backup_dir / f"{self.path.stem}.preop.{time.time_ns()}.bak"
         shutil.copy2(self.path, dest)
+        for old in backup_dir.glob(f"{self.path.stem}.preop.*.bak"):
+            if old != dest:
+                old.unlink(missing_ok=True)
         return dest
 
     async def snapshot(self, dest: Path) -> Path:
@@ -771,11 +827,6 @@ class Database:
             # If the worker was cancelled mid-rebuild, those rows must not stay
             # stuck forever. The worker is single-process/serial, so resetting
             # any leftovers here is safe.
-            await self.execute(
-                "DELETE FROM build_queue WHERE status='processing' AND EXISTS ("
-                "SELECT 1 FROM build_queue b2 WHERE b2.status='pending' "
-                "AND b2.page_kind=build_queue.page_kind "
-                "AND COALESCE(b2.page_ref, -1)=COALESCE(build_queue.page_ref, -1))")
             await self.execute(
                 "UPDATE build_queue SET status='pending' WHERE status='processing'")
             rows = await self.fetchall(
