@@ -122,5 +122,23 @@ def test_root_build_queue_dedupes_null_ref(tmp_path):
     asyncio.run(go())
 
 
+def test_take_recovers_when_pending_enqueued_during_processing(tmp_path):
+    # Regression: a post enqueues root while the worker holds root 'processing';
+    # the next take() must not crash on the unique index resetting the leftover.
+    async def go():
+        db, _cfg = await _prepare(tmp_path / "r4.db")
+        try:
+            await db.execute("DELETE FROM build_queue")
+            await db.enqueue_build("root", None)
+            await db.take_pending_builds()              # root -> processing
+            await db.enqueue_build("root", None)        # new pending while processing
+            taken = await db.take_pending_builds()       # must NOT raise
+            assert [r["page_kind"] for r in taken] == ["root"]
+            assert (await db.stats())["pending_builds"] == 0
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     pass

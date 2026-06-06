@@ -830,6 +830,14 @@ class Database:
             # If the worker was cancelled mid-rebuild, those rows must not stay
             # stuck forever. The worker is single-process/serial, so resetting
             # any leftovers here is safe.
+            # First drop stale 'processing' rows that already have a fresh
+            # 'pending' for the same page — otherwise the reset below would
+            # collide on the (page_kind, page_ref, status) unique index.
+            await self.execute(
+                "DELETE FROM build_queue WHERE status='processing' AND EXISTS ("
+                "SELECT 1 FROM build_queue b2 WHERE b2.status='pending' "
+                "AND b2.page_kind=build_queue.page_kind "
+                "AND COALESCE(b2.page_ref, -1)=COALESCE(build_queue.page_ref, -1))")
             await self.execute(
                 "UPDATE build_queue SET status='pending' WHERE status='processing'")
             rows = await self.fetchall(
