@@ -102,7 +102,12 @@ async def run() -> None:
     db = Database(cfg.db_path)
     cleanup_data_dir(cfg.db_path)
     await db.connect()
-    await seed_registry(db)
+    if cfg.seed_default_registry:
+        await seed_registry(db)
+    else:
+        # Mark the fresh DB as intentionally unseeded, so a future restart with
+        # a missing env var cannot silently inject the old default registry.
+        await db.meta_set("seeded", "disabled")
 
     tg = TelegraphClient(cfg.telegraph_token, cfg.telegraph_author,
                          cfg.telegraph_author_url)

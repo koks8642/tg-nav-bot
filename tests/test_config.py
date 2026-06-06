@@ -17,3 +17,10 @@ def test_post_url_rqm_default(monkeypatch):
     monkeypatch.setenv("CHANNEL_CHAT_ID", "-1003131929652")
     cfg = load_config(require_bot=False)
     assert cfg.post_url(7) == "https://t.me/c/3131929652/7"
+
+
+def test_seed_default_registry_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "x")
+    monkeypatch.setenv("SEED_DEFAULT_REGISTRY", "0")
+    cfg = load_config(require_bot=False)
+    assert cfg.seed_default_registry is False

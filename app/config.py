@@ -52,6 +52,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -66,6 +73,7 @@ class Config:
     port: int
     db_path: Path
     export_html: Path
+    seed_default_registry: bool
     log_level: str
     unknown_hashtag_mode: str
     quote_fetch_timeout_sec: int
@@ -126,6 +134,7 @@ def load_config(*, require_bot: bool = True) -> Config:
         port=_env_int("PORT", 8080),
         db_path=db_path,
         export_html=export_html,
+        seed_default_registry=_env_bool("SEED_DEFAULT_REGISTRY", True),
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         unknown_hashtag_mode=os.environ.get(
             "UNKNOWN_HASHTAG_MODE", "conflict").strip().lower(),
