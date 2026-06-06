@@ -164,6 +164,9 @@ async def run() -> None:
     # explicitly here. setup_commands() handles its own errors.
     await bot_app.setup_commands()
 
+    # download builder/sender (serial queue → one heavy download at a time)
+    download_task = asyncio.create_task(bot_app.download_worker())
+
     # first-ever run → build all pages from whatever is in the DB
     if not await db.get_page_for("root", None):
         log.info("No root page yet — running an initial full rebuild")
@@ -188,6 +191,7 @@ async def run() -> None:
         worker_task.cancel()
         reconciler_task.cancel()
         backup_task.cancel()
+        download_task.cancel()
         await application.updater.stop()
         await application.stop()
         await application.shutdown()

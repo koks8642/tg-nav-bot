@@ -13,6 +13,7 @@ that owner is consumed as the answer.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -41,6 +42,13 @@ from telegram.ext import (
 
 from .config import Config
 from .db import Database
+from .download import (
+    FORMAT_LABELS,
+    DownloadJob,
+    Downloader,
+    formats_for,
+    project_kind,
+)
 from .parser import is_telegraph_url, parsed_post_from_message
 from .pipeline import process_post
 from .quote import (
@@ -67,6 +75,9 @@ TITLES_PER_PAGE = 8
 QUOTE_COOLDOWN = 2.0   # seconds between quote requests per user (anti-flood)
 RATE_LIMIT = 10        # max actions per RATE_WINDOW per non-admin user
 RATE_WINDOW = 60.0     # seconds
+DL_COOLDOWN = 60.0     # seconds between downloads per non-admin user
+DL_MAX_CHAPTERS = 1000 # cap chapters per single download request
+DL_QUEUE_MAX = 20      # reject new downloads if the queue is this deep
 
 PLATFORMS = [("rl", "ranobelib", "RanobeLib"), ("ml", "mangalib", "MangaLib"),
              ("sk", "senkuro", "Senkuro"), ("bo", "boosty", "Boosty")]
@@ -99,6 +110,10 @@ class BotApp:
         self._quote_seen: dict[int, float] = {}
         # per-user sliding window of recent action timestamps (rate limiting)
         self._rate: dict[int, list[float]] = {}
+        # download queue (built lazily in the running loop) + per-user guards
+        self._dl_queue: "asyncio.Queue[DownloadJob]" = asyncio.Queue()
+        self._dl_users: set[int] = set()      # users with a queued/active job
+        self._dl_last: dict[int, float] = {}  # last download start per user
 
     # ── setup ────────────────────────────────────────────────────────────────
     def build(self) -> Application:
@@ -499,6 +514,10 @@ class BotApp:
             pid = context.user_data.pop("quote_pid")
             await self._quote_from_text(msg, text, pid=pid, allow_preview=True)
             return
+        # download range input (any user, started from the «Скачать» panel)
+        if context.user_data.pop("dl_await_range", False):
+            await self._dl_set_range(msg, context, text)
+            return
         # owner mid-flow? consume as the awaited input
         if await self._owner(update) and context.user_data.get("await"):
             await self._handle_pending(update, context)
@@ -703,7 +722,8 @@ class BotApp:
 
     # ── callbacks router ────────────────────────────────────────────────────────
     # callbacks anyone may use (the public project / section / group navigation)
-    _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard", "gcard", "quote"}
+    _PUBLIC_CB = {"card", "arcs", "arc", "pcat", "seccard", "gcard", "quote",
+                  "dl", "dlf", "dlp", "dlall", "dlrange", "dlgo"}
 
     async def on_callback(self, update: Update,
                           context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -788,6 +808,215 @@ class BotApp:
             await q.edit_message_text(text, reply_markup=kb,
                                       parse_mode=ParseMode.HTML,
                                       disable_web_page_preview=True)
+        elif head == "dl":
+            await self._dl_open(q, context, int(parts[1]))
+        elif head == "dlf":
+            context.user_data.get("dl", {})["fmt"] = parts[1]
+            await self._dl_render(q, context)
+        elif head == "dlp":
+            context.user_data.get("dl", {})["packaging"] = parts[1]
+            await self._dl_render(q, context)
+        elif head == "dlall":
+            st = context.user_data.get("dl")
+            if st:
+                st["numbers"], st["scope_label"] = None, "все главы"
+            await self._dl_render(q, context)
+        elif head == "dlrange":
+            context.user_data["dl_await_range"] = True
+            await q.message.reply_text(
+                "✏️ Пришлите диапазон глав: напр. <code>10-50</code>, "
+                "<code>5</code> или <code>1-20, 40, 55-60</code>.",
+                parse_mode=ParseMode.HTML)
+        elif head == "dlgo":
+            await self._dl_enqueue(q, context)
+
+    # ── download panel (everyone) ─────────────────────────────────────────────
+    async def _dl_open(self, q, context, pid: int) -> None:
+        p = await self.db.get_project(pid)
+        if not p:
+            await q.message.reply_text("Проект не найден.")
+            return
+        chapters = await self.db.list_chapters(pid)
+        if not chapters:
+            await q.message.reply_text("У этого тайтла пока нет глав для скачивания.")
+            return
+        grp = await self.db.get_group(p["group_id"]) if p["group_id"] else None
+        kind = project_kind(grp["name"] if grp else None,
+                            [c["telegraph_url"] for c in chapters])
+        fmts = formats_for(kind)
+        context.user_data["dl"] = {
+            "pid": pid, "name": p["canonical_name"], "kind": kind,
+            "fmt": fmts[0], "packaging": "single",
+            "numbers": None, "scope_label": "все главы",
+            "total": len(chapters),
+        }
+        await self._dl_render(q, context)
+
+    async def _dl_render(self, q, context, *, new: bool = False) -> None:
+        st = context.user_data.get("dl")
+        if not st:
+            return
+        kind_ru = "Манга/манхва" if st["kind"] == "manga" else "Новелла"
+        text = (f"📥 <b>Скачать · {esc(st['name'])}</b>\n"
+                f"Тип: {kind_ru} · глав всего: {st['total']}\n"
+                f"Формат: <b>{FORMAT_LABELS.get(st['fmt'], st['fmt'])}</b> · "
+                f"упаковка: <b>{'по главам (ZIP)' if st['packaging']=='per_chapter' else 'одним файлом'}</b>\n"
+                f"Главы: <b>{esc(st['scope_label'])}</b>\n\n"
+                "Большие файлы автоматически разобьются на части ≤50 МБ.")
+
+        def mark(active: bool) -> str:
+            return "✅ " if active else ""
+        fmt_row = [InlineKeyboardButton(
+            mark(st["fmt"] == f) + FORMAT_LABELS.get(f, f), callback_data=f"dlf:{f}")
+            for f in formats_for(st["kind"])]
+        kb = [fmt_row[i:i + 2] for i in range(0, len(fmt_row), 2)]
+        kb.append([
+            InlineKeyboardButton(mark(st["packaging"] == "single") + "Одним файлом",
+                                 callback_data="dlp:single"),
+            InlineKeyboardButton(mark(st["packaging"] == "per_chapter") + "По главам (ZIP)",
+                                 callback_data="dlp:per_chapter")])
+        kb.append([
+            InlineKeyboardButton(mark(st["numbers"] is None) + "Все главы",
+                                 callback_data="dlall"),
+            InlineKeyboardButton(mark(st["numbers"] is not None) + "Диапазон…",
+                                 callback_data="dlrange")])
+        kb.append([InlineKeyboardButton("⬇️ Собрать и прислать", callback_data="dlgo")])
+        kb.append([InlineKeyboardButton("⬅️ К тайтлу", callback_data=f"card:{st['pid']}")])
+        markup = InlineKeyboardMarkup(kb)
+        if new:
+            await q.message.reply_text(text, reply_markup=markup,
+                                       parse_mode=ParseMode.HTML)
+        else:
+            try:
+                await q.edit_message_text(text, reply_markup=markup,
+                                          parse_mode=ParseMode.HTML)
+            except Exception:  # noqa: BLE001 — message unchanged / not editable
+                await q.message.reply_text(text, reply_markup=markup,
+                                           parse_mode=ParseMode.HTML)
+
+    async def _dl_set_range(self, message, context, text: str) -> None:
+        st = context.user_data.get("dl")
+        if not st:
+            return
+        chapters = await self.db.list_chapters(st["pid"])
+        available = {c["number"] for c in chapters}
+        nums: set[int] = set()
+        for part in re.split(r"[,\s]+", text.strip()):
+            m = re.match(r"^(\d+)(?:[-–—](\d+))?$", part)
+            if not m:
+                continue
+            a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+            for n in range(min(a, b), max(a, b) + 1):
+                if n in available:
+                    nums.add(n)
+        if not nums:
+            await message.reply_text(
+                "Не понял диапазон или таких глав нет. Пример: «10-50».")
+            return
+        ordered = sorted(nums)
+        st["numbers"] = ordered
+        st["scope_label"] = (f"{len(ordered)} гл. ({ordered[0]}–{ordered[-1]})"
+                             if len(ordered) > 1 else f"глава {ordered[0]}")
+
+        class _Shim:  # reuse _dl_render's "new message" path
+            def __init__(self, msg):
+                self.message = msg
+        await self._dl_render(_Shim(message), context, new=True)
+
+    async def _dl_enqueue(self, q, context) -> None:
+        st = context.user_data.get("dl")
+        if not st:
+            await q.message.reply_text("Сессия истекла, откройте «📥 Скачать» заново.")
+            return
+        uid = q.from_user.id
+        is_adm = await self.is_admin(uid)
+        n_sel = st["total"] if st["numbers"] is None else len(st["numbers"])
+        if n_sel > DL_MAX_CHAPTERS:
+            await q.message.reply_text(
+                f"Слишком много глав за раз (макс. {DL_MAX_CHAPTERS}). "
+                "Укажите диапазон поменьше.")
+            return
+        if not is_adm:
+            if uid in self._dl_users:
+                await q.message.reply_text("⏳ У вас уже есть загрузка в очереди. "
+                                           "Дождитесь её завершения.")
+                return
+            if self._dl_queue.qsize() >= DL_QUEUE_MAX:
+                await q.message.reply_text("⏳ Очередь загрузок переполнена, "
+                                           "попробуйте позже.")
+                return
+            last = self._dl_last.get(uid, 0.0)
+            if time.time() - last < DL_COOLDOWN:
+                wait = int(DL_COOLDOWN - (time.time() - last))
+                await q.message.reply_text(f"⏳ Подождите ещё {wait} с перед "
+                                           "следующей загрузкой.")
+                return
+        self._dl_last[uid] = time.time()
+        self._dl_users.add(uid)
+        job = DownloadJob(
+            project_id=st["pid"], project_name=st["name"], kind=st["kind"],
+            fmt=st["fmt"], packaging=st["packaging"], numbers=st["numbers"],
+            user_id=uid, chat_id=q.message.chat_id)
+        await self._dl_queue.put(job)
+        ahead = self._dl_queue.qsize()
+        context.user_data.pop("dl", None)
+        await q.message.reply_text(
+            f"✅ Загрузка добавлена в очередь"
+            + (f" (перед вами: {ahead - 1})" if ahead > 1 else "")
+            + ". Соберу и пришлю файлы сюда.")
+
+    async def download_worker(self) -> None:
+        """Single consumer: build downloads one at a time and send the files."""
+        timeout = aiohttp.ClientTimeout(total=180)
+        async with aiohttp.ClientSession(
+                timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}) as session:
+            while True:
+                job = await self._dl_queue.get()
+                try:
+                    await self._run_download(job, session)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("download failed")
+                    try:
+                        await self.application.bot.send_message(
+                            job.chat_id, f"❌ Не удалось собрать загрузку: {esc(e)}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                finally:
+                    if job.user_id is not None:
+                        self._dl_users.discard(job.user_id)
+                    self._dl_queue.task_done()
+
+    async def _run_download(self, job: DownloadJob, session) -> None:
+        bot = self.application.bot
+        dl = Downloader(self.db, self.tg)
+        total = await dl.total_chapters(job)
+        status = await bot.send_message(
+            job.chat_id, f"📦 Собираю «{esc(job.project_name)}» — 0/{total} глав…")
+        last = [-10]
+
+        async def progress(done: int, tot: int) -> None:
+            pct = int(done * 100 / max(tot, 1))
+            if pct - last[0] >= 15 or done == tot:
+                last[0] = pct
+                try:
+                    await bot.edit_message_text(
+                        f"📦 Собираю «{esc(job.project_name)}» — {done}/{tot} глав…",
+                        chat_id=job.chat_id, message_id=status.message_id)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        n = 0
+        async for name, data in dl.produce(job, session, progress):
+            n += 1
+            await bot.send_document(job.chat_id, document=data, filename=name,
+                                    caption=f"📥 {job.project_name}")
+        try:
+            await bot.edit_message_text(
+                (f"✅ Готово: отправил {n} файл(а/ов)." if n
+                 else "Не нашёл глав для скачивания."),
+                chat_id=job.chat_id, message_id=status.message_id)
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _card_text_kb(self, pid: int):
         p = await self.db.get_project(pid)
@@ -818,7 +1047,8 @@ class BotApp:
                 kb.append(row); row = []
         if row:
             kb.append(row)
-        kb.append([InlineKeyboardButton("📄 Цитировать главу", callback_data=f"quote:{pid}")])
+        kb.append([InlineKeyboardButton("📄 Цитировать главу", callback_data=f"quote:{pid}"),
+                   InlineKeyboardButton("📥 Скачать", callback_data=f"dl:{pid}")])
         page = await self.db.get_page_for("project", pid)
         if page:
             kb.append([InlineKeyboardButton(
