@@ -215,11 +215,16 @@ class Rebuilder:
         if not pending:
             return 0
         root_dirty = False
+        dirty_groups: set[int] = set()
         for entry in pending:
             try:
                 if entry["page_kind"] == "project":
                     await self.build_project(entry["page_ref"])
                     root_dirty = True
+                    # the project's "вид" (group) page links to it → refresh it
+                    proj = await self.db.get_project(entry["page_ref"])
+                    if proj and proj["group_id"]:
+                        dirty_groups.add(proj["group_id"])
                 elif entry["page_kind"] == "group":
                     await self.build_group(entry["page_ref"])
                     root_dirty = True
@@ -233,6 +238,15 @@ class Rebuilder:
                 await self.db.mark_build(entry["id"], "error", str(e))
                 await self.db.log("ERROR", "rebuild",
                                   f"{entry['page_kind']}:{entry['page_ref']} {e}")
+        # rebuild the kind pages whose member projects changed (so their links
+        # to freshly (re)built project pages are never stale). Content-hash
+        # dedup makes this a no-op when nothing actually changed.
+        for gid in dirty_groups:
+            try:
+                await self.build_group(gid)
+                root_dirty = True
+            except Exception as e:  # noqa: BLE001
+                await self.db.log("ERROR", "rebuild", f"group:{gid} {e}")
         if root_dirty:
             try:
                 await self.build_root()

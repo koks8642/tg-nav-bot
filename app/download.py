@@ -17,7 +17,7 @@ import asyncio
 import io
 import re
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import aiohttp
@@ -25,7 +25,6 @@ import aiohttp
 from .db import Database
 from .parser import is_teletype_url, is_telegraph_url
 from .quote import CACHE_TTL_SEC, nodes_to_paragraphs
-from .telegraph import TelegraphClient
 
 MAX_PART_BYTES = 45 * 1024 * 1024     # safety margin under Telegram's 50 MB
 _RAW_TEXT_LIMIT = 30 * 1024 * 1024    # raw novel text per volume (file stays small)
@@ -270,9 +269,8 @@ def _img_ext(data: bytes) -> str:
 # ── the streaming part producer ───────────────────────────────────────────────
 
 class Downloader:
-    def __init__(self, db: Database, telegraph: TelegraphClient):
+    def __init__(self, db: Database):
         self.db = db
-        self.tg = telegraph
 
     async def _chapters(self, job: DownloadJob) -> list:
         rows = await self.db.list_chapters(job.project_id)
@@ -352,7 +350,7 @@ class Downloader:
             return
 
         # single document, split into volumes by accumulated raw text size
-        vol, vol_bytes, vidx = [], 0, 0
+        vol, vol_bytes = [], 0
         parts_meta: list[bytes] = []
         for c in fetched:
             size = sum(len(p) for p in c["paragraphs"]) + 64
@@ -390,7 +388,7 @@ class Downloader:
 
         # single combined file, split at image granularity into volumes
         cur: list[tuple[str, bytes]] = []
-        cur_bytes, vidx, emitted = 0, 0, []
+        cur_bytes, emitted = 0, []
         ext = "pdf" if job.fmt == "pdf" else "cbz"
 
         async def flush():
