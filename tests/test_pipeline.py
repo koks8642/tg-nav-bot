@@ -210,6 +210,30 @@ def test_edit_updates_same_chapter(tmp_path):
     asyncio.run(go())
 
 
+def test_edit_retag_moves_chapter_to_new_project(tmp_path):
+    async def go():
+        db, cfg = await _fresh_db(tmp_path / "retag.db")
+        try:
+            wrong = [("https://telegra.ph/pokr-Glava-135-06-06", "Глава 135")]
+            await process_post(db, cfg, _post(610, "#гений Глава 135", wrong))
+
+            geniy = await db.get_project_by_key("geniy")
+            pokr = await db.get_project_by_key("pokrovitel")
+            assert [c["number"] for c in await db.list_chapters(geniy["id"])] == [135]
+            assert await db.list_chapters(pokr["id"]) == []
+
+            await process_post(db, cfg, _post(610, "#покровитель Глава 135", wrong),
+                               is_edit=True)
+
+            assert await db.list_chapters(geniy["id"]) == []
+            pokr_chapters = await db.list_chapters(pokr["id"])
+            assert [c["number"] for c in pokr_chapters] == [135]
+            assert pokr_chapters[0]["post_id"] == 610
+        finally:
+            await db.close()
+    asyncio.run(go())
+
+
 def test_edit_removes_dropped_chapter(tmp_path):
     async def go():
         db, cfg = await _fresh_db(tmp_path / "ed.db")

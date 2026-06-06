@@ -1,4 +1,4 @@
-"""DB-level tests for admin operations: arc rename/merge/split, item edits."""
+"""DB-level tests for admin operations: arc rename/merge/split/delete, item edits."""
 from __future__ import annotations
 
 import asyncio
@@ -61,6 +61,12 @@ def test_arc_rename_merge_split(tmp_path):
             assert n == 2
             arcs = {a["arc"]: a["n"] for a in await db.list_arcs(pid)}
             assert arcs == {"Пролог": 3, "Финал": 2}
+
+            # delete one arc with all chapters inside it
+            deleted = await db.delete_arc(pid, "Финал")
+            assert deleted == 2
+            arcs = {a["arc"]: a["n"] for a in await db.list_arcs(pid)}
+            assert arcs == {"Пролог": 3}
         finally:
             await db.close()
     asyncio.run(go())

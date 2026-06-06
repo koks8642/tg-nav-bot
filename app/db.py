@@ -692,7 +692,19 @@ class Database:
     async def delete_chapter(self, chapter_id: int) -> None:
         await self.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
 
-    # ── arc operations (rename / merge / split) ──────────────────────────────
+    # ── arc operations (rename / merge / split / delete) ─────────────────────
+    async def delete_arc(self, project_id: int, arc: str) -> int:
+        """Delete every chapter in one project arc. Returns affected rows."""
+        if arc == "Без арки":
+            cur = await self.execute(
+                "DELETE FROM chapters WHERE project_id=? AND arc IS NULL",
+                (project_id,))
+        else:
+            cur = await self.execute(
+                "DELETE FROM chapters WHERE project_id=? AND arc=?",
+                (project_id, arc))
+        return cur.rowcount
+
     async def rename_arc(self, project_id: int, old_arc: str, new_arc: str) -> int:
         """Rename an arc for all its chapters. Merging = rename onto an existing
         arc. Returns the number of chapters affected."""

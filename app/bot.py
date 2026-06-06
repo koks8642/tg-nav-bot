@@ -1432,6 +1432,10 @@ class BotApp:
             await self._show_arc_merge(q, int(parts[1]), parts[2])
         elif head == "arcmrg2":
             await self._do_arc_merge(q, int(parts[1]), parts[2], parts[3])
+        elif head == "arcdel":
+            await self._confirm_arc_delete(q, int(parts[1]), parts[2])
+        elif head == "arcdelyes":
+            await self._do_arc_delete(q, int(parts[1]), parts[2])
         elif head == "c":
             await self._show_chapter(q, int(parts[1]))
         elif head == "ce":
@@ -1730,6 +1734,7 @@ class BotApp:
             [InlineKeyboardButton("✏️ Переименовать", callback_data=f"arcren:{pid}:{arc_token}"),
              InlineKeyboardButton("✂️ Разбить", callback_data=f"arcsplit:{pid}:{arc_token}")],
             [InlineKeyboardButton("🔗 Объединить с…", callback_data=f"arcmrg:{pid}:{arc_token}")],
+            [InlineKeyboardButton("🗑 Удалить арку", callback_data=f"arcdel:{pid}:{arc_token}")],
             [InlineKeyboardButton("⬅️ К аркам", callback_data=f"pchaps:{pid}")],
         ]
         one = a['first_num'] == a['last_num']
@@ -1797,6 +1802,37 @@ class BotApp:
         await self._enqueue_project(pid)
         await q.edit_message_text(f"✅ Объединено: {n} глав → «{esc(dst)}».",
                                   reply_markup=self._back(f"pchaps:{pid}"))
+
+    async def _confirm_arc_delete(self, q, pid: int, token: str) -> None:
+        arcs = await self.db.list_arcs(pid)
+        row = self._arc_by_token(arcs, token)
+        if row is None:
+            await self._show_arc_admin(q, pid)
+            return
+        arc_token = self._arc_token(row)
+        await q.edit_message_text(
+            f"⚠️ Удалить арку <b>{esc(row['arc'])}</b> и все главы внутри нее?\n"
+            f"Глав: {row['n']} · номера {_num_range(row['first_num'], row['last_num'])}\n\n"
+            "Это действие нельзя отменить кнопкой.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Да, удалить арку",
+                                      callback_data=f"arcdelyes:{pid}:{arc_token}")],
+                [InlineKeyboardButton("⬅️ Отмена", callback_data=f"parc:{pid}:{arc_token}")],
+            ]),
+            parse_mode=ParseMode.HTML)
+
+    async def _do_arc_delete(self, q, pid: int, token: str) -> None:
+        arcs = await self.db.list_arcs(pid)
+        row = self._arc_by_token(arcs, token)
+        if row is None:
+            await self._show_arc_admin(q, pid)
+            return
+        n = await self.db.delete_arc(pid, row["arc"])
+        await self._enqueue_project(pid)
+        await q.edit_message_text(
+            f"🗑 Арка «{esc(row['arc'])}» удалена. Глав удалено: {n}.",
+            reply_markup=self._back(f"pchaps:{pid}"),
+            parse_mode=ParseMode.HTML)
 
     # ── items management (admin) ──────────────────────────────────────────────
     async def _show_items(self, q, sid: int) -> None:
@@ -1963,9 +1999,10 @@ class BotApp:
         if not c:
             return
         if field == "del":
+            back = f"pchaps:{c['project_id']}"
             await self.db.delete_chapter(cid)
             await self._enqueue_project(c["project_id"])
-            await q.edit_message_text("🗑 Глава удалена.", reply_markup=self._back())
+            await q.edit_message_text("🗑 Глава удалена.", reply_markup=self._back(back))
             return
         prompts = {"num": "новый номер главы", "arc": "новую арку",
                    "title": "новый заголовок", "url": "новый Telegraph URL"}

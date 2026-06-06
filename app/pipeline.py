@@ -93,6 +93,10 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
     res.project_id = project_id
     res.hashtag = project_tag or (tags[0] if tags else None)
     builds: set[tuple[str, int | None]] = set()
+    previous_post = await db.get_post(post.message_id) if is_edit else None
+    previous_project_id = (
+        previous_post["project_id"] if previous_post and previous_post["project_id"] else None
+    )
 
     # a group tag (#новелла) assigns the post's project to that group
     if project_id is not None and group_id is not None:
@@ -106,6 +110,18 @@ async def process_post(db: Database, cfg: Config, post: ParsedPost,
 
     # ── chapters (only a project post with Telegraph links) ───────────────────
     chapters = extract_chapters(post) if project_id else []
+    if is_edit and previous_project_id is not None and previous_project_id != project_id:
+        # The post was retagged from one project to another. Remove chapters
+        # that belonged to the old project, otherwise a mistaken hashtag edit
+        # leaves stale chapters in the previous title forever.
+        old_rows = await db.fetchall(
+            "SELECT id FROM chapters WHERE post_id=? AND project_id=?",
+            (post.message_id, previous_project_id))
+        for row in old_rows:
+            await db.delete_chapter(row["id"])
+        if old_rows:
+            builds.add(("project", previous_project_id))
+
     if project_id is not None:
         for platform, url in extract_external_links(post.all_urls):
             await db.add_external_link(project_id, platform, url)
