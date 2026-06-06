@@ -514,10 +514,15 @@ class BotApp:
             pid = context.user_data.pop("quote_pid")
             await self._quote_from_text(msg, text, pid=pid, allow_preview=True)
             return
-        # download range input (any user, started from the «Скачать» panel)
-        if context.user_data.pop("dl_await_range", False):
-            await self._dl_set_range(msg, context, text)
-            return
+        # download range input (any user, started from the «Скачать» panel).
+        # Only digits/dashes/commas are treated as a range attempt (and _dl_set_range
+        # keeps the mode on failure so a retry works); anything else exits range
+        # mode and falls through to normal handling (search etc.).
+        if context.user_data.get("dl_await_range"):
+            if re.fullmatch(r"[\d\s,\-–—]+", text):
+                await self._dl_set_range(msg, context, text)
+                return
+            context.user_data.pop("dl_await_range", None)
         # owner mid-flow? consume as the awaited input
         if await self._owner(update) and context.user_data.get("await"):
             await self._handle_pending(update, context)
@@ -824,10 +829,18 @@ class BotApp:
                 st["numbers"], st["scope_label"] = None, "все главы"
             await self._dl_render(q, context)
         elif head == "dlrange":
+            st = context.user_data.get("dl")
             context.user_data["dl_await_range"] = True
+            hint = ""
+            if st:
+                chs = await self.db.list_chapters(st["pid"])
+                if chs:
+                    nums = sorted(c["number"] for c in chs)
+                    hint = (f"\nДоступны главы <b>{nums[0]}–{nums[-1]}</b> "
+                            f"(всего {len(nums)}).")
             await q.message.reply_text(
-                "✏️ Пришлите диапазон глав: напр. <code>10-50</code>, "
-                "<code>5</code> или <code>1-20, 40, 55-60</code>.",
+                "✏️ Пришлите номера глав: напр. <code>10-50</code>, "
+                "<code>5</code> или <code>1-20, 40, 55-60</code>." + hint,
                 parse_mode=ParseMode.HTML)
         elif head == "dlgo":
             await self._dl_enqueue(q, context)
@@ -898,11 +911,15 @@ class BotApp:
                                            parse_mode=ParseMode.HTML)
 
     async def _dl_set_range(self, message, context, text: str) -> None:
+        """Parse a typed chapter range. On success render the panel and leave
+        range mode; on failure keep range mode so the user can simply retry."""
         st = context.user_data.get("dl")
         if not st:
+            context.user_data.pop("dl_await_range", None)
             return
         chapters = await self.db.list_chapters(st["pid"])
-        available = {c["number"] for c in chapters}
+        available = sorted(c["number"] for c in chapters)
+        avail = set(available)
         nums: set[int] = set()
         for part in re.split(r"[,\s]+", text.strip()):
             m = re.match(r"^(\d+)(?:[-–—](\d+))?$", part)
@@ -910,16 +927,22 @@ class BotApp:
                 continue
             a, b = int(m.group(1)), int(m.group(2) or m.group(1))
             for n in range(min(a, b), max(a, b) + 1):
-                if n in available:
+                if n in avail:
                     nums.add(n)
         if not nums:
+            rng = f"{available[0]}–{available[-1]}" if available else "—"
+            total = len(available)
             await message.reply_text(
-                "Не понял диапазон или таких глав нет. Пример: «10-50».")
-            return
+                f"В этом тайтле {total} "
+                f"{'глава' if total == 1 else 'глав'} (номера {rng}). "
+                "Пришлите номера из этого диапазона — или нажмите «Все главы» "
+                "в панели выше. Любой другой текст отменит выбор диапазона.")
+            return  # keep dl_await_range so the next message retries the range
         ordered = sorted(nums)
         st["numbers"] = ordered
         st["scope_label"] = (f"{len(ordered)} гл. ({ordered[0]}–{ordered[-1]})"
                              if len(ordered) > 1 else f"глава {ordered[0]}")
+        context.user_data.pop("dl_await_range", None)
 
         class _Shim:  # reuse _dl_render's "new message" path
             def __init__(self, msg):
