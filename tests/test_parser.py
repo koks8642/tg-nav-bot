@@ -25,6 +25,16 @@ def _post(text="", anchors=(), plain=()):
     )
 
 
+def test_teletype_chapter_and_zero_number():
+    # a manga chapter on Teletype, numbered 0 (Глава 0 must not be dropped)
+    post = _post("Писюн, Глава 0 (в поисках кимчи)\n#манга #писюн",
+                 anchors=[("https://teletype.in/@shin_yong_su/cPGL0CZyl44", "Глава 0")])
+    chs = extract_chapters(post)
+    assert len(chs) == 1
+    assert chs[0].number == 0
+    assert "teletype.in" in chs[0].telegraph_url
+
+
 # ── telegraph / external detection ───────────────────────────────────────────
 
 def test_is_telegraph_both_domains():

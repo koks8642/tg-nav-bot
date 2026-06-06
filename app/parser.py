@@ -247,7 +247,7 @@ def extract_chapters(post: ParsedPost) -> list[ChapterRef]:
     for anchor in post.chapter_anchors:
         label = (anchor.label or "").strip()
         m = _CHAPTER_NUM_RE.search(label)
-        number: int | None = m and int(m.group(1)) or None
+        number: int | None = int(m.group(1)) if m else None  # 0 is valid (Глава 0)
         if number is None:
             # fall back to the number embedded in the slug
             sm = re.search(r"-Glava-(\d+)", anchor.url)
