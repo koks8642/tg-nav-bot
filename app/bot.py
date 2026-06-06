@@ -1439,7 +1439,8 @@ class BotApp:
              InlineKeyboardButton("🙈 Скрыть/Показать", callback_data=f"ptoggle:{pid}")],
             [InlineKeyboardButton("📖 Главы и арки", callback_data=f"pchaps:{pid}"),
              InlineKeyboardButton("🏷 Хэштеги проекта", callback_data=f"ptags:{pid}")],
-            [InlineKeyboardButton("🏬 Группа", callback_data=f"pgrp:{pid}")],
+            [InlineKeyboardButton("🏬 Группа", callback_data=f"pgrp:{pid}"),
+             InlineKeyboardButton("📥 Скачать", callback_data=f"dl:{pid}")],
             [InlineKeyboardButton("🗑 Удалить проект", callback_data=f"pdel:{pid}"),
              InlineKeyboardButton("⬅️ К проектам", callback_data="proj")],
         ]
