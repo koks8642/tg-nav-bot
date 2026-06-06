@@ -13,5 +13,6 @@ Recommended rule:
 - Restrict who can push to matching branches: enabled if you want `master` to
   be deploy-only
 
-The deploy job is gated behind the `Test` job in `.github/workflows/deploy.yml`.
-A push to `master` deploys only after tests pass.
+Production deploy is handled by the server-side `rqm-auto-deploy.timer`, which
+polls `origin/master` and runs `scripts/update_server.sh` when a new commit is
+available.

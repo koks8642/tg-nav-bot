@@ -157,11 +157,11 @@ fly deploy
 ### Разработка → production
 Разрабатывай и проверяй изменения в ветке `developer`. Когда версия готова:
 `git checkout master && git merge developer && git push origin master`.
-Push в `master` запускает GitHub Actions deploy: сервер подтягивает
-`origin/master`, пересобирает Docker-контейнер, прогоняет smoke-check и
-перезапускает бота. Если smoke-check после обновления падает, серверный скрипт
-пытается откатиться на предыдущий commit. Deploy запускается только после
-зелёного CI job `Test`.
+Push в `master` проверяется GitHub Actions job `Test`. Production-сервер раз в
+минуту проверяет `origin/master` через systemd timer `rqm-auto-deploy.timer`; при
+новом commit он подтягивает код, пересобирает Docker-контейнер, прогоняет
+smoke-check и перезапускает бота. Если smoke-check после обновления падает,
+серверный скрипт пытается откатиться на предыдущий commit.
 
 Секреты, `.env` и SQLite-БД хранятся только на сервере. Ежедневный snapshot БД
 сохраняется в `/data/backups/` и отправляется владельцам/админам канала в личку.

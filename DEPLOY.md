@@ -131,23 +131,22 @@ started`. **Токен в логах не светится** — это норм
    `docker compose up -d --build`.
 3. Когда версия готова, вливаешь изменения в `master` и пушишь:
    `git checkout master && git merge developer && git push origin master`.
-4. GitHub Actions запускает `.github/workflows/deploy.yml`, заходит на сервер по
-   SSH и выполняет `bash scripts/update_server.sh`.
-5. Серверный скрипт подтягивает `origin/master`, пересобирает контейнер,
+4. GitHub Actions запускает `.github/workflows/deploy.yml` и прогоняет job
+   `Test`.
+5. Production-сервер сам раз в минуту проверяет `origin/master` через systemd
+   timer `rqm-auto-deploy.timer`. Если появился новый commit, сервер выполняет
+   `bash scripts/update_server.sh`.
+6. Серверный скрипт подтягивает `origin/master`, пересобирает контейнер,
    перезапускает бота и прогоняет smoke-check. Если smoke-check не проходит,
    скрипт пытается откатить контейнер на предыдущий commit. `.env` и
    SQLite-данные остаются на сервере.
 
-Для авто-деплоя добавь в GitHub → Settings → Secrets and variables → Actions:
+Проверить server-side авто-деплой:
 
-| Secret | Что внутри |
-|---|---|
-| `SSH_HOST` | публичный IP или домен сервера |
-| `SSH_PORT` | SSH-порт, обычно `22` |
-| `SSH_USER` | отдельный deploy-пользователь, например `deploy` |
-| `SSH_KEY` | приватный SSH-ключ, которому разрешён вход на сервер |
-| `SSH_KNOWN_HOSTS` | pinned host key сервера из `ssh-keyscan -p PORT HOST` |
-| `APP_DIR` | путь к клону проекта на сервере, например `/home/ubuntu/rqm` |
+```bash
+systemctl status rqm-auto-deploy.timer
+journalctl -u rqm-auto-deploy.service -n 100 --no-pager
+```
 
 На сервере клон должен быть подключён к GitHub-репозиторию и иметь доступ к
 `origin/master`. В рабочем дереве на сервере не редактируй код вручную:
