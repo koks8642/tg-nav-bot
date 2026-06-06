@@ -11,7 +11,7 @@ services:
       DB_PATH: /data/rqm.db
       PORT: "8080"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - rqm-data:/data        # persistent SQLite — survives redeploys
     security_opt:
