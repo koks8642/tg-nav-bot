@@ -106,11 +106,29 @@ def _num_range(first, last) -> str:
     return str(first) if first == last else f"{first}–{last}"
 
 
+def _ai_to_html(reply: str) -> str:
+    """Model output → safe HTML. Everything is escaped, then the one tag the
+    persona is allowed to use (<tg-spoiler>) is restored."""
+    html = esc(reply)
+    html = html.replace("&lt;tg-spoiler&gt;", "<tg-spoiler>")
+    html = html.replace("&lt;/tg-spoiler&gt;", "</tg-spoiler>")
+    # an unbalanced spoiler tag would make Telegram reject the message
+    if html.count("<tg-spoiler>") != html.count("</tg-spoiler>"):
+        html = html.replace("<tg-spoiler>", "").replace("</tg-spoiler>", "")
+    return html
+
+
+def _strip_spoiler(reply: str) -> str:
+    return reply.replace("<tg-spoiler>", "").replace("</tg-spoiler>", "")
+
+
 class BotApp:
-    def __init__(self, db: Database, cfg: Config, telegraph=None):
+    def __init__(self, db: Database, cfg: Config, telegraph=None,
+                 ai_engine=None):
         self.db = db
         self.cfg = cfg
         self.tg = telegraph          # TelegraphClient, for reading chapter text
+        self.ai = ai_engine          # AiEngine (group persona chat), optional
         self.application: Application | None = None
         # cache of channel admin user ids (creator + administrators)
         self._admin_ids: set[int] = set()
@@ -158,8 +176,18 @@ class BotApp:
         # private free text → reply-keyboard nav / quote flow / owner / search
         app.add_handler(MessageHandler(priv & filters.TEXT & ~filters.COMMAND,
                                        self.on_text))
-        # in GROUPS the bot reacts ONLY to /quote (+/rqmbot) — handled above by
-        # the command handlers. No other group message triggers anything.
+        # AI persona chat: admin commands + the group watcher. Without an
+        # engine the group handler is not even registered, so the bot keeps
+        # its historical behaviour (groups react only to /quote and /rqmbot).
+        if self.ai is not None:
+            grp = filters.ChatType.GROUPS
+            app.add_handler(CommandHandler("ai", self.cmd_ai))
+            app.add_handler(CommandHandler("ai_on", self.cmd_ai_on,
+                                           filters=grp))
+            app.add_handler(CommandHandler("ai_off", self.cmd_ai_off,
+                                           filters=grp))
+            app.add_handler(MessageHandler(
+                grp & filters.TEXT & ~filters.COMMAND, self.on_group_text))
 
         self.application = app
         return app
@@ -423,6 +451,173 @@ class BotApp:
         u, c = update.effective_user, update.effective_chat
         await update.message.reply_text(
             f"user_id: `{u.id}`\nchat_id: `{c.id}`", parse_mode=ParseMode.MARKDOWN)
+
+    # ── AI persona chat (groups) ──────────────────────────────────────────────
+    async def on_group_text(self, update: Update,
+                            context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Every group message goes through the AI engine: it records the
+        message into the chat memory and decides whether the persona answers."""
+        msg = update.effective_message
+        if self.ai is None or msg is None or not msg.text:
+            return
+        u = update.effective_user
+        reply_to = msg.reply_to_message
+        reply_to_is_bot = bool(
+            reply_to and reply_to.from_user
+            and context.bot.id == reply_to.from_user.id)
+        try:
+            reply = await self.ai.on_group_message(
+                chat_id=msg.chat_id, msg_id=msg.message_id,
+                user_id=u.id if u else None,
+                username=(u.first_name or u.username) if u else None,
+                text=msg.text,
+                reply_to=reply_to.message_id if reply_to else None,
+                reply_to_is_bot=reply_to_is_bot)
+        except Exception:  # noqa: BLE001 — the persona must never break the bot
+            log.exception("ai engine failed on group message")
+            return
+        if not reply:
+            return
+        try:
+            sent = await msg.reply_text(
+                _ai_to_html(reply), parse_mode=ParseMode.HTML)
+        except Exception:  # noqa: BLE001 — e.g. broken HTML from the model
+            try:
+                sent = await msg.reply_text(_strip_spoiler(reply))
+            except Exception:  # noqa: BLE001
+                log.exception("ai reply send failed")
+                return
+        persona = await self.ai.active_persona()
+        await self.ai.record_bot_message(
+            msg.chat_id, sent.message_id, _strip_spoiler(reply),
+            msg.message_id, persona.key if persona else "")
+
+    async def cmd_ai_on(self, update: Update,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+        if self.ai is None or not await self.is_admin(update.effective_user.id):
+            return
+        chats = await self.ai.store.enabled_chats()
+        chats.add(update.effective_chat.id)
+        await self.ai.store.set_enabled_chats(chats)
+        persona = await self.ai.active_persona()
+        who = persona.name if persona else "не выбран (используй /ai persona …)"
+        await update.message.reply_text(
+            f"🤖 ИИ-персонаж включён в этом чате. Персонаж: {who}")
+
+    async def cmd_ai_off(self, update: Update,
+                         context: ContextTypes.DEFAULT_TYPE) -> None:
+        if self.ai is None or not await self.is_admin(update.effective_user.id):
+            return
+        chats = await self.ai.store.enabled_chats()
+        chats.discard(update.effective_chat.id)
+        await self.ai.store.set_enabled_chats(chats)
+        await update.message.reply_text("🤖 ИИ-персонаж выключен в этом чате.")
+
+    async def cmd_ai(self, update: Update,
+                     context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Admin control: /ai, /ai persona <key>, /ai set <key> <val>,
+        /ai ban <uid> [часов], /ai unban <uid>, /ai test <текст>."""
+        if self.ai is None or not await self.is_admin(update.effective_user.id):
+            return
+        args = context.args or []
+        store = self.ai.store
+        if not args:
+            await update.message.reply_text(await self._ai_status_text(),
+                                            parse_mode=ParseMode.HTML)
+            return
+        cmd = args[0].lower()
+        if cmd == "persona" and len(args) >= 2:
+            key = args[1].lower()
+            if key in ("off", "none", "-"):
+                await store.set("active_persona", "")
+                await update.message.reply_text("Персонаж снят.")
+                return
+            p = self.ai.personas.get(key)
+            if p is None:
+                known = ", ".join(sorted(self.ai.personas))
+                await update.message.reply_text(
+                    f"Не знаю «{esc(key)}». Есть: {known}")
+                return
+            await store.set("active_persona", key)
+            await update.message.reply_text(
+                f"Теперь в чате говорит: {p.name} — {p.one_liner}")
+        elif cmd == "set" and len(args) >= 3:
+            from .ai.engine import DEFAULTS
+            key, val = args[1].lower(), args[2]
+            if key not in DEFAULTS:
+                await update.message.reply_text(
+                    "Доступные параметры: " + ", ".join(sorted(DEFAULTS)))
+                return
+            try:
+                float(val)
+            except ValueError:
+                await update.message.reply_text("Значение должно быть числом.")
+                return
+            await store.set(key, val)
+            await update.message.reply_text(f"{key} = {val}")
+        elif cmd == "ban" and len(args) >= 2:
+            try:
+                uid = int(args[1])
+            except ValueError:
+                await update.message.reply_text("Нужен числовой user_id.")
+                return
+            hours = None
+            if len(args) >= 3:
+                try:
+                    hours = float(args[2])
+                except ValueError:
+                    hours = None
+            await store.ignore(uid, hours, reason="manual")
+            label = f"{hours}ч" if hours else "навсегда"
+            await update.message.reply_text(f"Пользователь {uid} в игноре ({label}).")
+        elif cmd == "unban" and len(args) >= 2:
+            try:
+                await store.unignore(int(args[1]))
+                await update.message.reply_text("Разбанен.")
+            except ValueError:
+                await update.message.reply_text("Нужен числовой user_id.")
+        elif cmd == "test" and len(args) >= 2:
+            text = " ".join(args[1:])
+            persona = await self.ai.active_persona()
+            if persona is None:
+                await update.message.reply_text(
+                    "Сначала выбери персонажа: /ai persona <ключ>")
+                return
+            try:
+                reply = await self.ai.gemini.generate(
+                    persona.full_system_prompt(),
+                    f"Сообщение от тестера: {text}\n"
+                    "Ответь ОДНИМ сообщением в своём характере.")
+                await update.message.reply_text(
+                    _ai_to_html(reply), parse_mode=ParseMode.HTML)
+            except Exception as e:  # noqa: BLE001
+                await update.message.reply_text(f"Не вышло: {self._redact(e)}")
+        else:
+            await update.message.reply_text(
+                "Команды: /ai · /ai persona <ключ|off> · /ai set <параметр> "
+                "<число> · /ai ban <id> [часов] · /ai unban <id> · "
+                "/ai test <текст>\nВ группе: /ai_on, /ai_off")
+
+    async def _ai_status_text(self) -> str:
+        from .ai.engine import DEFAULTS
+        store = self.ai.store
+        persona = await self.ai.active_persona()
+        chats = await store.enabled_chats()
+        left = await self.ai.gemini.generation_budget_left()
+        kb = await store.kb_count()
+        lines = [
+            "🤖 <b>ИИ-персонаж</b>",
+            f"Персонаж: <b>{esc(persona.name) if persona else '—'}</b>",
+            f"Чаты: {', '.join(map(str, chats)) or '—'}",
+            f"Бюджет генерации на сегодня: {left}",
+            f"База знаний: {kb} глав",
+            f"Маски: {', '.join(sorted(self.ai.personas))}",
+            "",
+            "Параметры (/ai set …):",
+        ]
+        for k in sorted(DEFAULTS):
+            lines.append(f"  {k} = {await store.get_float(k, float(DEFAULTS[k])):g}")
+        return "\n".join(lines)
 
     # ── search (everyone) ─────────────────────────────────────────────────────
     @staticmethod

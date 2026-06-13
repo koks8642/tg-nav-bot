@@ -15,6 +15,8 @@ RUN addgroup --system app && adduser --system --ingroup app app \
 # volume and is populated live from channel posts (hashtags). Operator scripts
 # stay outside the image; smoke checks live in app/ so Docker can run them.
 COPY --chown=app:app app ./app
+# Persona cards + trigger lexicon for the AI group chat (read-only data)
+COPY --chown=app:app personas ./personas
 
 # DB lives on a persistent volume mounted at /data (see deploy docs)
 ENV DB_PATH=/data/rqm.db \

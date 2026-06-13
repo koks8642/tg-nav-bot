@@ -115,7 +115,25 @@ async def run() -> None:
     redactor.add_secret(tg.access_token)
     rebuilder = Rebuilder(db, tg, cfg)
 
-    bot_app = BotApp(db, cfg, telegraph=tg)
+    # AI persona chat (optional): only assembled when a key is configured.
+    ai_engine = None
+    if cfg.ai_gemini_key:
+        from .ai.engine import AiEngine
+        from .ai.gemini import GeminiClient
+        from .ai.personas import load_lexicon, load_personas
+        from .ai.store import AiStore
+
+        redactor.add_secret(cfg.ai_gemini_key)
+        ai_store = AiStore(cfg.ai_db_path)
+        await ai_store.connect()
+        personas = load_personas(cfg.ai_personas_dir)
+        lexicon = load_lexicon(cfg.ai_personas_dir)
+        gemini = GeminiClient(cfg.ai_gemini_key, ai_store)
+        ai_engine = AiEngine(ai_store, gemini, personas, lexicon)
+        log.info("AI persona chat ready: %d personas, %d lexicon entities",
+                 len(personas), len(lexicon.entities))
+
+    bot_app = BotApp(db, cfg, telegraph=tg, ai_engine=ai_engine)
     application = bot_app.build()
 
     # HTTP health server (liveness probe for hosting platforms)
@@ -247,6 +265,9 @@ async def run() -> None:
                   "TELEGRAM_PROXY in .env (see README).")
         raise SystemExit(1)
     await application.start()
+    if ai_engine is not None and application.bot.username:
+        ai_engine.set_bot_identity(application.bot.username,
+                                   application.bot.id)
     await application.updater.start_polling(
         allowed_updates=["channel_post", "edited_channel_post",
                          "message", "callback_query"],
@@ -296,6 +317,9 @@ async def run() -> None:
         await application.shutdown()
         await runner.cleanup()
         await tg.close()
+        if ai_engine is not None:
+            await ai_engine.gemini.close()
+            await ai_engine.store.close()
         await db.close()
 
 

@@ -1,0 +1,488 @@
+{
+ "version": 1,
+ "entities": [
+  {
+   "canonical": "Алон",
+   "pattern": "алон\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 8418
+  },
+  {
+   "canonical": "Ютия",
+   "pattern": "юти[яюие]\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 814
+  },
+  {
+   "canonical": "Эван",
+   "pattern": "эван\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 1066
+  },
+  {
+   "canonical": "Сольранг",
+   "pattern": "сольранг\\w*|сеолран\\w*|сольгак\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 1082
+  },
+  {
+   "canonical": "Деус",
+   "pattern": "деус\\w*|маккалиан\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 1012
+  },
+  {
+   "canonical": "Пения",
+   "pattern": "пени[яюие]й?",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 860
+  },
+  {
+   "canonical": "Рине",
+   "pattern": "рине",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 718
+  },
+  {
+   "canonical": "Радан",
+   "pattern": "радан\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 482
+  },
+  {
+   "canonical": "Блэки",
+   "pattern": "блэки",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 228
+  },
+  {
+   "canonical": "Сили",
+   "pattern": "\\bсили\\b",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 220
+  },
+  {
+   "canonical": "Каланон",
+   "pattern": "каланон\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 238
+  },
+  {
+   "canonical": "Хидан",
+   "pattern": "хидан\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 173
+  },
+  {
+   "canonical": "Юна",
+   "pattern": "\\bюна\\b|\\bюны\\b|\\bюне\\b|\\bюну\\b",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 32
+  },
+  {
+   "canonical": "Хейнкель",
+   "pattern": "хейнкель\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 181
+  },
+  {
+   "canonical": "Базилиора",
+   "pattern": "базилиор\\w*",
+   "category": "character",
+   "weight": 3,
+   "corpus_hits": 310
+  },
+  {
+   "canonical": "Лиян",
+   "pattern": "лиян\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 194
+  },
+  {
+   "canonical": "Рория",
+   "pattern": "рори[яюие]\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 49
+  },
+  {
+   "canonical": "Филиан",
+   "pattern": "филиан\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 120
+  },
+  {
+   "canonical": "Закурак",
+   "pattern": "закурак\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 125
+  },
+  {
+   "canonical": "Рейнхард",
+   "pattern": "рейнхард\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 206
+  },
+  {
+   "canonical": "Карсем",
+   "pattern": "карсем\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 79
+  },
+  {
+   "canonical": "Товетт",
+   "pattern": "товетт\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 30
+  },
+  {
+   "canonical": "Комалон",
+   "pattern": "комалон\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 143
+  },
+  {
+   "canonical": "Сиркал",
+   "pattern": "сиркал\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 70
+  },
+  {
+   "canonical": "Сиан",
+   "pattern": "\\bсиан\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 119
+  },
+  {
+   "canonical": "Фелин",
+   "pattern": "фелин\\w*",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 99
+  },
+  {
+   "canonical": "Малиан",
+   "pattern": "малиан\\w*",
+   "category": "character",
+   "weight": 1,
+   "corpus_hits": 54
+  },
+  {
+   "canonical": "Сергиус",
+   "pattern": "сергиус\\w*|\\bсергий\\b",
+   "category": "character",
+   "weight": 1,
+   "corpus_hits": 96
+  },
+  {
+   "canonical": "Наблюдатель",
+   "pattern": "наблюдатель\\w*",
+   "category": "character",
+   "weight": 1,
+   "corpus_hits": 46
+  },
+  {
+   "canonical": "Королева Ста Призраков",
+   "pattern": "хякки|королев\\w+ ста призраков",
+   "category": "character",
+   "weight": 2,
+   "corpus_hits": 35
+  },
+  {
+   "canonical": "Голубая Луна",
+   "pattern": "голуб[аоы]\\w* лун\\w*",
+   "category": "org",
+   "weight": 3,
+   "corpus_hits": 77
+  },
+  {
+   "canonical": "Великая Луна",
+   "pattern": "велик\\w* лун\\w*",
+   "category": "org",
+   "weight": 3,
+   "corpus_hits": 221
+  },
+  {
+   "canonical": "Пять Грехов",
+   "pattern": "пят\\w* (велик\\w* )?грех\\w*|грех гнева|грех гордыни|грех жадности|грех лени|грех зависти",
+   "category": "org",
+   "weight": 3,
+   "corpus_hits": 180
+  },
+  {
+   "canonical": "Кровавый Род",
+   "pattern": "кровав\\w* род\\w*|кровав\\w* королев\\w*",
+   "category": "org",
+   "weight": 2,
+   "corpus_hits": 6
+  },
+  {
+   "canonical": "Сто Призраков",
+   "pattern": "ст[ао] призраков",
+   "category": "org",
+   "weight": 2,
+   "corpus_hits": 27
+  },
+  {
+   "canonical": "Розарио",
+   "pattern": "розарио|росарио",
+   "category": "org",
+   "weight": 2,
+   "corpus_hits": 155
+  },
+  {
+   "canonical": "Апостолы",
+   "pattern": "апостол\\w*",
+   "category": "org",
+   "weight": 1,
+   "corpus_hits": 290
+  },
+  {
+   "canonical": "Племя Золотой Гривы",
+   "pattern": "золот\\w* грив\\w*",
+   "category": "org",
+   "weight": 2,
+   "corpus_hits": 40
+  },
+  {
+   "canonical": "Синяя Башня",
+   "pattern": "син\\w+ башн\\w*",
+   "category": "org",
+   "weight": 2,
+   "corpus_hits": 88
+  },
+  {
+   "canonical": "Красная Башня",
+   "pattern": "красн\\w+ башн\\w*",
+   "category": "org",
+   "weight": 1,
+   "corpus_hits": 39
+  },
+  {
+   "canonical": "Ассоциация Магов",
+   "pattern": "ассоциаци\\w+ магов",
+   "category": "org",
+   "weight": 1,
+   "corpus_hits": 6
+  },
+  {
+   "canonical": "Внешние боги",
+   "pattern": "внешн\\w+ бог\\w*",
+   "category": "org",
+   "weight": 2,
+   "corpus_hits": 302
+  },
+  {
+   "canonical": "Психоделия",
+   "pattern": "психодели\\w*",
+   "category": "world",
+   "weight": 3,
+   "corpus_hits": 223
+  },
+  {
+   "canonical": "Покровитель злодеев",
+   "pattern": "покровител\\w* злоде\\w*|#покровитель",
+   "category": "world",
+   "weight": 3,
+   "corpus_hits": 332
+  },
+  {
+   "canonical": "Ампелан",
+   "pattern": "ампелан\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 2
+  },
+  {
+   "canonical": "Астерия",
+   "pattern": "астери\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 135
+  },
+  {
+   "canonical": "Палатио",
+   "pattern": "палатио",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 908
+  },
+  {
+   "canonical": "Калибан",
+   "pattern": "калибан\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 193
+  },
+  {
+   "canonical": "Ашталон",
+   "pattern": "ашталон\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 99
+  },
+  {
+   "canonical": "Колония",
+   "pattern": "\\bколони[яюие]\\w*",
+   "category": "place",
+   "weight": 1,
+   "corpus_hits": 227
+  },
+  {
+   "canonical": "Люксибл",
+   "pattern": "люксибл\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 44
+  },
+  {
+   "canonical": "Ронавелли",
+   "pattern": "рон[ао]велли",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 16
+  },
+  {
+   "canonical": "Святое Королевство",
+   "pattern": "свят\\w+ королевств\\w*",
+   "category": "place",
+   "weight": 1,
+   "corpus_hits": 100
+  },
+  {
+   "canonical": "Грейнифра",
+   "pattern": "грейнифр\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 111
+  },
+  {
+   "canonical": "Божественная Земля",
+   "pattern": "божественн\\w+ земл\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 82
+  },
+  {
+   "canonical": "Эстрован",
+   "pattern": "эстрован\\w*",
+   "category": "place",
+   "weight": 2,
+   "corpus_hits": 4
+  },
+  {
+   "canonical": "Терн",
+   "pattern": "\\bтерн[еау]?\\b",
+   "category": "place",
+   "weight": 1,
+   "corpus_hits": 17
+  },
+  {
+   "canonical": "Эссенция Бездны",
+   "pattern": "эссенци\\w+ бездны|сущност\\w+ бездны",
+   "category": "term",
+   "weight": 2,
+   "corpus_hits": 35
+  },
+  {
+   "canonical": "Уровневая Магия",
+   "pattern": "уровнев\\w+ маги\\w*",
+   "category": "term",
+   "weight": 2,
+   "corpus_hits": 26
+  },
+  {
+   "canonical": "Странные Врата",
+   "pattern": "странн\\w+ врат\\w*",
+   "category": "term",
+   "weight": 2,
+   "corpus_hits": 23
+  },
+  {
+   "canonical": "Баба-Яга",
+   "pattern": "баба[- ]яг\\w*",
+   "category": "term",
+   "weight": 2,
+   "corpus_hits": 45
+  },
+  {
+   "canonical": "Духовный Дракон",
+   "pattern": "духовн\\w+ дракон\\w*",
+   "category": "term",
+   "weight": 2,
+   "corpus_hits": 56
+  },
+  {
+   "canonical": "Резонанс Разума",
+   "pattern": "резонанс\\w* разума",
+   "category": "term",
+   "weight": 2,
+   "corpus_hits": 13
+  },
+  {
+   "canonical": "маркиз",
+   "pattern": "маркиз\\w*",
+   "category": "term",
+   "weight": 1,
+   "corpus_hits": 1247
+  },
+  {
+   "canonical": "кардинал",
+   "pattern": "кардинал\\w*",
+   "category": "term",
+   "weight": 1,
+   "corpus_hits": 234
+  },
+  {
+   "canonical": "новелла",
+   "pattern": "новелл\\w*",
+   "category": "meta",
+   "weight": 1,
+   "corpus_hits": 10
+  },
+  {
+   "canonical": "глава",
+   "pattern": "\\bглав[аыеу]\\b|\\bглавы\\b",
+   "category": "meta",
+   "weight": 1,
+   "corpus_hits": 618
+  },
+  {
+   "canonical": "кимчи",
+   "pattern": "кимчи",
+   "category": "meta",
+   "weight": 2,
+   "corpus_hits": 0
+  },
+  {
+   "canonical": "RQM",
+   "pattern": "\\brqm\\b|рькьюэм",
+   "category": "meta",
+   "weight": 2,
+   "corpus_hits": 0
+  }
+ ]
+}

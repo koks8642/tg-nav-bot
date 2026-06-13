@@ -1,0 +1,45 @@
+# Isolated TEST instance of the bot, for trying the AI persona feature WITHOUT
+# touching the running production container.
+#
+# Full isolation from prod (rqm-bot): different container, network, named
+# volume (rqm-test-data, NOT rqm-data), and NO published host port. It MUST use
+# a DIFFERENT BOT_TOKEN — two pollers on the same token break each other.
+#
+# Run from the test checkout (e.g. /opt/rqm-bot-test) on the foreign server:
+#   docker compose -f docker-compose.test.yml -p rqm-test up -d --build
+#   docker compose -f docker-compose.test.yml -p rqm-test logs -f
+# Stop:
+#   docker compose -f docker-compose.test.yml -p rqm-test down   # keeps volume
+services:
+  rqm-test:
+    build: .
+    restart: unless-stopped
+    env_file: .env.test
+    environment:
+      DB_PATH: /data/rqm.db          # separate volume, separate DB from prod
+      PORT: "8080"                    # internal only — not published to host
+      SEED_DEFAULT_REGISTRY: "0"      # no RQM registry; this is an AI-chat stand
+    volumes:
+      - rqm-test-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  rqm-test-data:
