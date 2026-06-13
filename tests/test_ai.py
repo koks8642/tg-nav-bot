@@ -334,6 +334,26 @@ def test_store_user_thread_separates_people(tmp_path):
     asyncio.run(go())
 
 
+def test_store_context_reset_scopes_recent(tmp_path):
+    async def go():
+        s = AiStore(tmp_path / "ai.db")
+        await s.connect()
+        await s.record(-1, 1, 1, "a", "до сброса", None, is_bot=False)
+        import time as _t
+        _t.sleep(1.05)  # ensure a later ts (ISO seconds granularity)
+        await s.mark_context_reset()
+        marker = await s.get("context_reset_ts")
+        _t.sleep(1.05)
+        await s.record(-1, 2, 1, "a", "после сброса", None, is_bot=False)
+        scoped = await s.recent(-1, since_ts=marker)
+        assert [r["text"] for r in scoped] == ["после сброса"]
+        # the per-user view is scoped too
+        ut = await s.user_thread(-1, 1, since_ts=marker)
+        assert [r["text"] for r in ut] == ["после сброса"]
+        await s.close()
+    asyncio.run(go())
+
+
 def test_engine_run_job_sends_and_records(tmp_path):
     async def go():
         gem = FakeGemini(generate_result="Ты пожалеешь, милый.")

@@ -538,6 +538,7 @@ class BotApp:
             key = args[1].lower()
             if key in ("off", "none", "-"):
                 await store.set("active_persona", "")
+                await store.mark_context_reset()
                 await update.message.reply_text("Персонаж снят.")
                 return
             p = self.ai.personas.get(key) or self._resolve_persona(args[1])
@@ -548,6 +549,9 @@ class BotApp:
                     f"Не знаю «{esc(args[1])}». Есть: {known}")
                 return
             await store.set("active_persona", p.key)
+            # wipe conversational context so the new persona starts clean and
+            # never inherits or imitates the previous persona's dialogue
+            await store.mark_context_reset()
             await update.message.reply_text(
                 f"Теперь в чате говорит: {p.name} — {p.one_liner}")
         elif cmd == "set" and len(args) >= 3:

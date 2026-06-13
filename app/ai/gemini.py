@@ -17,13 +17,14 @@ log = logging.getLogger("ai.gemini")
 
 API = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-# (model, daily request cap we allow ourselves). Caps are set slightly under
-# Google's published free-tier RPD so a counter drift never causes 429 storms.
+# (model, our daily cap PER KEY). Gemini 2.5 Flash / Flash-Lite free tier is
+# 15 RPM and ~1500 RPD per project — generous. The 429-failover handles the
+# real ceiling, so these caps are just a soft guard, multiplied by key count.
 GENERATION_CASCADE = [
-    ("gemini-2.5-flash", 240),
-    ("gemini-2.5-flash-lite", 950),
+    ("gemini-2.5-flash", 1500),
+    ("gemini-2.5-flash-lite", 1500),
 ]
-CLASSIFIER_MODEL = ("gemini-2.5-flash-lite", 950)  # shares the lite budget
+CLASSIFIER_MODEL = ("gemini-2.5-flash-lite", 1500)  # cheap gate on the lite model
 
 SAFETY_OFF = [
     {"category": c, "threshold": "BLOCK_NONE"}

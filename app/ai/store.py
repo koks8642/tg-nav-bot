@@ -129,6 +129,12 @@ class AiStore:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
         await self.conn.commit()
 
+    async def mark_context_reset(self) -> None:
+        """Move the context boundary to now. Called on a persona switch so the
+        new persona starts with a clean slate and never inherits or mimics the
+        previous persona's conversation."""
+        await self.set("context_reset_ts", _now())
+
     async def get_int(self, key: str, default: int) -> int:
         raw = await self.get(key)
         try:
@@ -176,10 +182,16 @@ class AiStore:
             (chat_id, chat_id, BUFFER_KEEP))
         await self.conn.commit()
 
-    async def recent(self, chat_id: int, limit: int = 12) -> list[dict]:
-        cur = await self.conn.execute(
-            "SELECT * FROM buffer WHERE chat_id=? ORDER BY id DESC LIMIT ?",
-            (chat_id, limit))
+    async def recent(self, chat_id: int, limit: int = 12,
+                     since_ts: str | None = None) -> list[dict]:
+        if since_ts:
+            cur = await self.conn.execute(
+                "SELECT * FROM buffer WHERE chat_id=? AND ts>? "
+                "ORDER BY id DESC LIMIT ?", (chat_id, since_ts, limit))
+        else:
+            cur = await self.conn.execute(
+                "SELECT * FROM buffer WHERE chat_id=? ORDER BY id DESC LIMIT ?",
+                (chat_id, limit))
         rows = [dict(r) for r in await cur.fetchall()]
         rows.reverse()
         return rows
@@ -192,17 +204,20 @@ class AiStore:
         return dict(row) if row else None
 
     async def user_thread(self, chat_id: int, user_id: int,
-                          limit: int = 20) -> list[dict]:
+                          limit: int = 20,
+                          since_ts: str | None = None) -> list[dict]:
         """The persona's private conversation with ONE user: that user's own
         messages plus the bot's replies addressed to them (oldest first). Lets
         the persona keep a separate dialog and mood per person instead of
-        blending everyone into one thread."""
+        blending everyone into one thread. ``since_ts`` scopes it to the
+        current persona session (everything after the last persona switch)."""
+        since = since_ts or "0000"
         cur = await self.conn.execute(
-            "SELECT * FROM buffer WHERE chat_id=? AND ("
+            "SELECT * FROM buffer WHERE chat_id=? AND ts>? AND ("
             "  user_id=? OR (is_bot=1 AND reply_to IN ("
             "    SELECT msg_id FROM buffer WHERE chat_id=? AND user_id=?)))"
             " ORDER BY id DESC LIMIT ?",
-            (chat_id, user_id, chat_id, user_id, limit))
+            (chat_id, since, user_id, chat_id, user_id, limit))
         rows = [dict(r) for r in await cur.fetchall()]
         rows.reverse()
         return rows
