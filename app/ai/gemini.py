@@ -111,6 +111,10 @@ class GeminiClient:
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_tokens,
+                # penalise verbatim repetition so personas don't loop on a
+                # single catch-phrase across consecutive replies
+                "frequencyPenalty": 1.2,
+                "presencePenalty": 0.5,
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }

@@ -532,13 +532,14 @@ class BotApp:
                 await store.set("active_persona", "")
                 await update.message.reply_text("Персонаж снят.")
                 return
-            p = self.ai.personas.get(key)
+            p = self.ai.personas.get(key) or self._resolve_persona(args[1])
             if p is None:
-                known = ", ".join(sorted(self.ai.personas))
+                known = ", ".join(f"{v.name} ({k})"
+                                  for k, v in sorted(self.ai.personas.items()))
                 await update.message.reply_text(
-                    f"Не знаю «{esc(key)}». Есть: {known}")
+                    f"Не знаю «{esc(args[1])}». Есть: {known}")
                 return
-            await store.set("active_persona", key)
+            await store.set("active_persona", p.key)
             await update.message.reply_text(
                 f"Теперь в чате говорит: {p.name} — {p.one_liner}")
         elif cmd == "set" and len(args) >= 3:
@@ -597,6 +598,17 @@ class BotApp:
                 "Команды: /ai · /ai persona <ключ|off> · /ai set <параметр> "
                 "<число> · /ai ban <id> [часов] · /ai unban <id> · "
                 "/ai test <текст>\nВ группе: /ai_on, /ai_off")
+
+    def _resolve_persona(self, query: str):
+        """Match a user-typed persona by key, Russian name, or alias
+        (so «/ai persona ютия» works as well as «/ai persona yutia»)."""
+        q = query.strip().lower()
+        for cand in self.ai.personas.values():
+            if cand.key.lower() == q or cand.name.lower() == q:
+                return cand
+            if any(q == a.lower() for a in cand.aliases):
+                return cand
+        return None
 
     async def _ai_status_text(self) -> str:
         from .ai.engine import DEFAULTS
