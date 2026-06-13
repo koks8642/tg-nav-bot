@@ -117,23 +117,24 @@ async def run() -> None:
 
     # AI persona chat (optional): only assembled when a key is configured.
     ai_engine = None
-    if cfg.ai_gemini_key:
+    if cfg.ai_enabled:
         from .ai.engine import AiEngine
         from .ai.gemini import GeminiClient
         from .ai.personas import load_lexicon, load_lore, load_personas
         from .ai.store import AiStore
 
-        redactor.add_secret(cfg.ai_gemini_key)
+        for key in cfg.ai_gemini_keys:
+            redactor.add_secret(key)
         ai_store = AiStore(cfg.ai_db_path)
         await ai_store.connect()
         personas = load_personas(cfg.ai_personas_dir)
         lexicon = load_lexicon(cfg.ai_personas_dir)
         lore = load_lore(cfg.ai_personas_dir)
-        gemini = GeminiClient(cfg.ai_gemini_key, ai_store)
+        gemini = GeminiClient(cfg.ai_gemini_keys, ai_store)
         ai_engine = AiEngine(ai_store, gemini, personas, lexicon, lore)
         log.info("AI persona chat ready: %d personas, %d lexicon entities, "
-                 "lore %d chars", len(personas), len(lexicon.entities),
-                 len(lore))
+                 "lore %d chars, %d gemini key(s)", len(personas),
+                 len(lexicon.entities), len(lore), len(cfg.ai_gemini_keys))
 
     bot_app = BotApp(db, cfg, telegraph=tg, ai_engine=ai_engine)
     application = bot_app.build()

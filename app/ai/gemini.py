@@ -38,11 +38,31 @@ class QuotaExhausted(Exception):
 
 
 class GeminiClient:
-    def __init__(self, api_key: str, store, *, timeout_sec: int = 45):
-        self.api_key = api_key
+    def __init__(self, api_keys, store, *, timeout_sec: int = 45):
+        # accept a single key (str) or several (list/tuple) — multiple free
+        # keys multiply the per-minute headroom; we rotate through them and
+        # fail over on a 429.
+        if isinstance(api_keys, str):
+            api_keys = [api_keys]
+        self.api_keys: list[str] = [k for k in api_keys if k]
+        self._rr = 0  # round-robin pointer
         self.store = store  # AiStore — quota counters
         self._timeout = aiohttp.ClientTimeout(total=timeout_sec)
         self._session: aiohttp.ClientSession | None = None
+
+    @property
+    def num_keys(self) -> int:
+        return max(1, len(self.api_keys))
+
+    def _keys_in_order(self) -> list[str]:
+        """Keys starting from the round-robin pointer, so load spreads and a
+        429 on one key immediately falls over to the next."""
+        if not self.api_keys:
+            return [""]
+        n = len(self.api_keys)
+        start = self._rr % n
+        self._rr = (self._rr + 1) % n
+        return [self.api_keys[(start + i) % n] for i in range(n)]
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -55,11 +75,26 @@ class GeminiClient:
 
     # ── low level ─────────────────────────────────────────────────────────
     async def _call(self, model: str, payload: dict) -> str:
-        """One generateContent call. Some hosting IPs are intermittently
-        mis-geolocated by Google («User location is not supported» on a
-        fraction of calls) — those get a few quick retries."""
+        """One generateContent attempt for a model: try each key in turn,
+        failing over on a 429. Raises QuotaExhausted only if EVERY key is
+        rate-limited. Also retries the flaky-geo 4xx a few times per key."""
+        last_err: Exception | None = None
+        for key in self._keys_in_order():
+            try:
+                return await self._call_with_key(model, payload, key)
+            except QuotaExhausted as e:
+                last_err = e
+                continue  # this key is rate-limited — try the next key
+            except RuntimeError as e:
+                # transient per-key trouble (e.g. flaky geo-IP 400, a 5xx) —
+                # fail over to the next key rather than failing the message
+                last_err = e
+                continue
+        raise last_err or QuotaExhausted(f"{model}: all keys failed")
+
+    async def _call_with_key(self, model: str, payload: dict, key: str) -> str:
         for attempt in range(4):
-            data, status = await self._post(model, payload)
+            data, status = await self._post(model, payload, key)
             if status == 200:
                 break
             if status == 429:
@@ -82,16 +117,18 @@ class GeminiClient:
             raise RefusedError(f"{model}: empty response ({reason})")
         return text
 
-    async def _post(self, model: str, payload: dict) -> tuple[dict, int]:
+    async def _post(self, model: str, payload: dict,
+                    key: str) -> tuple[dict, int]:
         sess = await self.session()
         url = API.format(model=model)
-        async with sess.post(url, params={"key": self.api_key},
+        async with sess.post(url, params={"key": key},
                              json=payload) as resp:
             data = await resp.json(content_type=None)
             return data or {}, resp.status
 
     async def _budget_left(self, model: str, cap: int) -> int:
-        return cap - await self.store.quota_used(model)
+        # each extra key brings its own daily quota
+        return cap * self.num_keys - await self.store.quota_used(model)
 
     # ── public ────────────────────────────────────────────────────────────
     async def generation_budget_left(self) -> int:
@@ -117,30 +154,39 @@ class GeminiClient:
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
-        last_refusal: Exception | None = None
-        for model, cap in GENERATION_CASCADE:
-            if await self._budget_left(model, cap) <= 0:
+        # Retry the whole cascade a few times when everything is rate-limited:
+        # the per-MINUTE window clears within seconds, so a short backoff
+        # rescues most burst-throttled messages instead of going silent.
+        for attempt in range(3):
+            last_refusal: Exception | None = None
+            saw_429 = False
+            for model, cap in GENERATION_CASCADE:
+                if await self._budget_left(model, cap) <= 0:
+                    continue
+                try:
+                    result = await self._call(model, payload)
+                except QuotaExhausted:
+                    # per-minute limit on every key for this model — do NOT
+                    # poison the daily counter; try the next model, then retry
+                    saw_429 = True
+                    continue
+                except RefusedError as e:
+                    await self.store.quota_bump(model)  # a real (empty) response
+                    last_refusal = e
+                    continue  # a laxer model may answer
+                except (aiohttp.ClientError, asyncio.TimeoutError,
+                        RuntimeError) as e:
+                    log.warning("gemini %s call error: %s", model, e)
+                    continue
+                await self.store.quota_bump(model)
+                return result
+            if last_refusal is not None:
+                raise last_refusal
+            if saw_429 and attempt < 2:
+                await asyncio.sleep(3.0 * (attempt + 1))  # 3s, then 6s
                 continue
-            try:
-                result = await self._call(model, payload)
-            except QuotaExhausted:
-                # A 429 here is almost always the per-MINUTE rate limit, not
-                # the daily cap. Do NOT poison the daily budget — just try the
-                # next model and recover on the next message once the minute
-                # window clears. Only successful calls count toward the cap.
-                continue
-            except RefusedError as e:
-                await self.store.quota_bump(model)  # a real (if empty) response
-                last_refusal = e
-                continue  # a laxer model down the cascade may answer
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.warning("gemini %s network error: %s", model, e)
-                continue
-            await self.store.quota_bump(model)
-            return result
-        if last_refusal is not None:
-            raise last_refusal
-        raise QuotaExhausted("generation cascade exhausted")
+            break
+        raise QuotaExhausted("generation cascade rate-limited")
 
     async def classify(self, system: str, user: str) -> dict | None:
         """Cheap JSON classifier on the lite model. Returns None when out of

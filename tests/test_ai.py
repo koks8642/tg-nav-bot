@@ -240,9 +240,22 @@ def test_engine_classifier_no_disables_reply(tmp_path):
     async def go():
         gem = FakeGemini(classify_result={"respond": False, "heat": 0})
         eng = await make_engine(tmp_path, gem)
+        # weak hit (score 1, not direct) → the classifier is consulted and
+        # its "no" suppresses the reply
         reply = await eng.on_group_message(
-            **msg_kwargs(text="алон опять в главе тупит"))
-        assert reply is None
+            **msg_kwargs(text="перечитываю эту главу"))
+        assert reply is None and gem.classify_calls == 1
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_strong_hit_skips_classifier(tmp_path):
+    async def go():
+        gem = FakeGemini(generate_result="ответ")
+        eng = await make_engine(tmp_path, gem)
+        # strong lexicon hit (Алон, score 3) answers WITHOUT a classifier call
+        reply = await eng.on_group_message(**msg_kwargs(text="Алон лошара"))
+        assert reply == "ответ" and gem.classify_calls == 0
         await eng.store.close()
     asyncio.run(go())
 

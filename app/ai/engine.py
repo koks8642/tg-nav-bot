@@ -135,15 +135,18 @@ class AiEngine:
                     now - last_user < await self.setting("user_cooldown_sec"):
                 return None
 
-        # ── cheap classifier ─────────────────────────────────────────────
-        verdict = await self._classify(persona, chat_id, text, hits)
-        if verdict is None:
-            # no budget / parse fail: only obvious cases proceed
-            if not (direct or score >= 3):
-                return None
+        # ── decide whether/how to answer ─────────────────────────────────
+        # Skip the paid classifier when the prefilter is already confident
+        # (direct address or a strong lexicon hit) — saves an API call per
+        # message, which matters a lot against the per-minute rate limit.
+        if direct or score >= 3:
             verdict = {"respond": True,
-                       "mode": "insult" if score >= 3 else "casual",
-                       "heat": 2 if score >= 3 else 1}
+                       "mode": self._quick_mode(text, score),
+                       "heat": 3 if score >= 3 else 2}
+        else:
+            verdict = await self._classify(persona, chat_id, text, hits)
+            if verdict is None:
+                return None  # ambiguous + no classifier budget → skip
         if not verdict.get("respond") and not direct:
             return None
         heat = int(verdict.get("heat", 1) or 0)
@@ -161,7 +164,9 @@ class AiEngine:
             reply = random.choice(persona.fallback_lines) \
                 if persona.fallback_lines and (direct or heat >= 2) else None
         except QuotaExhausted:
-            log.info("generation budget exhausted; staying silent")
+            # transient per-minute rate limit (or genuine daily cap) — silent
+            # for this message, recovers on the next once the window clears
+            log.info("generation rate-limited; staying silent (will recover)")
             return None
         except Exception as e:  # noqa: BLE001 — never crash the bot loop
             log.warning("generation failed: %s", e)
@@ -215,6 +220,18 @@ class AiEngine:
     async def _in_reserve(self) -> bool:
         left = await self.gemini.generation_budget_left()
         return left <= await self.setting("reserve")
+
+    _PLOT_HINTS = ("глав", "что было", "что произош", "что они дел",
+                   "что он дел", "что случил", "почему", "зачем", "когда ",
+                   "как ты относ", "расскажи")
+
+    def _quick_mode(self, text: str, score: int) -> str:
+        """Cheap intent guess when the LLM classifier is skipped, so plot
+        questions still reach the knowledge-base path."""
+        low = text.lower()
+        if any(h in low for h in self._PLOT_HINTS):
+            return "plot"
+        return "insult" if score >= 3 else "casual"
 
     async def _classify(self, persona: Persona, chat_id: int, text: str,
                         hits: list[str]) -> dict | None:
