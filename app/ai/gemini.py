@@ -121,22 +121,23 @@ class GeminiClient:
         for model, cap in GENERATION_CASCADE:
             if await self._budget_left(model, cap) <= 0:
                 continue
-            await self.store.quota_bump(model)
             try:
-                return await self._call(model, payload)
+                result = await self._call(model, payload)
             except QuotaExhausted:
-                # server says the cap is hit even if our counter disagrees —
-                # burn the local budget so we stop trying this model today
-                used = await self.store.quota_used(model)
-                if used < cap:
-                    await self.store.quota_bump(model, cap - used)
+                # A 429 here is almost always the per-MINUTE rate limit, not
+                # the daily cap. Do NOT poison the daily budget — just try the
+                # next model and recover on the next message once the minute
+                # window clears. Only successful calls count toward the cap.
                 continue
             except RefusedError as e:
+                await self.store.quota_bump(model)  # a real (if empty) response
                 last_refusal = e
                 continue  # a laxer model down the cascade may answer
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 log.warning("gemini %s network error: %s", model, e)
                 continue
+            await self.store.quota_bump(model)
+            return result
         if last_refusal is not None:
             raise last_refusal
         raise QuotaExhausted("generation cascade exhausted")
@@ -158,12 +159,12 @@ class GeminiClient:
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
-        await self.store.quota_bump(model)
         try:
             raw = await self._call(model, payload)
         except Exception as e:  # noqa: BLE001 — classifier must never crash flow
             log.debug("classifier failed: %s", e)
             return None
+        await self.store.quota_bump(model)  # count only successful calls
         return parse_json_block(raw)
 
 
