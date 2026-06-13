@@ -268,9 +268,12 @@ async def run() -> None:
                   "TELEGRAM_PROXY in .env (see README).")
         raise SystemExit(1)
     await application.start()
-    if ai_engine is not None and application.bot.username:
-        ai_engine.set_bot_identity(application.bot.username,
-                                   application.bot.id)
+    if ai_engine is not None:
+        if application.bot.username:
+            ai_engine.set_bot_identity(application.bot.username,
+                                       application.bot.id)
+        ai_engine.send_callback = bot_app._ai_send_callback
+        ai_engine.start()  # paced reply worker
     await application.updater.start_polling(
         allowed_updates=["channel_post", "edited_channel_post",
                          "message", "callback_query"],
@@ -321,6 +324,7 @@ async def run() -> None:
         await runner.cleanup()
         await tg.close()
         if ai_engine is not None:
+            await ai_engine.stop()
             await ai_engine.gemini.close()
             await ai_engine.store.close()
         await db.close()

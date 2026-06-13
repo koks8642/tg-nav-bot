@@ -86,6 +86,35 @@ class Lexicon:
                 hits.append(e["canonical"])
         return score, hits
 
+    def scan_split(self, text: str, active_aliases: list[str]
+                   ) -> tuple[bool, int, list[str]]:
+        """Split a scan into the active persona vs. the rest.
+
+        Returns (active_name_hit, other_score, other_hits). The active
+        persona's own name (matched by its lexicon entity OR any of its
+        aliases) is reported separately so the decision core can treat being
+        named as a direct address, distinct from a passing entity mention.
+        """
+        active = {a.lower() for a in active_aliases}
+        active_hit = False
+        other_score, other_hits = 0, []
+        for rx, e in self._compiled:
+            if not rx.search(text):
+                continue
+            if e["canonical"].lower() in active:
+                active_hit = True
+            else:
+                other_score += int(e.get("weight", 1))
+                other_hits.append(e["canonical"])
+        # also catch name forms an alias lists but the lexicon may not
+        if not active_hit:
+            low = text.lower()
+            for a in active:
+                if len(a) >= 3 and a in low:
+                    active_hit = True
+                    break
+        return active_hit, other_score, other_hits
+
 
 def load_personas(dir_path: Path) -> dict[str, Persona]:
     out: dict[str, Persona] = {}

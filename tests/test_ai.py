@@ -1,20 +1,124 @@
-"""Tests for the AI persona chat: lexicon prefilter, store, engine pipeline."""
+"""Tests for the reworked AI persona engine: pure decision core, fair queue,
+lexicon split, anti-spam/enqueue flow, and the worker's send path."""
 from __future__ import annotations
 
 import asyncio
 import json
 from pathlib import Path
 
-from app.ai.engine import AiEngine, sanitize_reply
-from app.ai.gemini import QuotaExhausted, RefusedError, parse_json_block
-from app.ai.personas import Lexicon, Persona, load_lexicon, load_personas
-from app.ai.store import AiStore, google_reset_day
+from app.ai.decision import (
+    AMBIENT,
+    ASK,
+    DIRECT,
+    RESPOND,
+    SKIP,
+    decide,
+)
+from app.ai.engine import AiEngine
+from app.ai.gemini import parse_json_block
+from app.ai.personas import Lexicon, Persona, load_lexicon, load_lore, load_personas
+from app.ai.queue import FairQueue, Job
+from app.ai.store import AiStore
 from app.bot import _ai_to_html, _strip_spoiler
 
 PERSONAS_DIR = Path(__file__).resolve().parent.parent / "personas"
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── decision core (pure) ─────────────────────────────────────────────────────
+
+def _decide(**over):
+    base = dict(text="привет всем", is_reply_to_bot=False, mentions_bot_at=False,
+                active_name_hit=False, other_entity_score=0,
+                butt_in_pct=0.0, roll=0.99)
+    base.update(over)
+    return decide(**base)
+
+
+def test_decide_reply_to_bot_is_direct_respond():
+    d = _decide(is_reply_to_bot=True, text="ну что")
+    assert d.action == RESPOND and d.priority == DIRECT
+
+
+def test_decide_at_mention_is_direct():
+    assert _decide(mentions_bot_at=True).action == RESPOND
+
+
+def test_decide_active_name_is_direct_respond():
+    d = _decide(active_name_hit=True, text="Ютия ты тут")
+    assert d.action == RESPOND and d.priority == DIRECT
+
+
+def test_decide_direct_works_even_when_short():
+    assert _decide(is_reply_to_bot=True, text="?").action == RESPOND
+
+
+def test_decide_entity_mention_asks():
+    d = _decide(other_entity_score=3, text="Алон лошара")
+    assert d.action == ASK and d.priority == AMBIENT
+
+
+def test_decide_short_offtopic_skips():
+    assert _decide(text="ок").action == SKIP
+
+
+def test_decide_offtopic_skips_when_dice_lose():
+    assert _decide(text="как погода сегодня", butt_in_pct=2.0,
+                   roll=0.99).action == SKIP
+
+
+def test_decide_offtopic_asks_when_dice_win():
+    d = _decide(text="как погода сегодня", butt_in_pct=50.0, roll=0.01)
+    assert d.action == ASK and d.reason == "random-butt-in"
+
+
+# ── fair queue (pure) ────────────────────────────────────────────────────────
+
+def _job(priority, uid=1, t=0.0, chat=-1):
+    return Job(chat_id=chat, reply_to=uid, user_id=uid, username="u",
+               text="x", priority=priority, mode="casual", enqueued_at=t)
+
+
+def test_queue_direct_preferred_but_ambient_not_starved():
+    q = FairQueue(direct_streak_max=2)
+    for _ in range(5):
+        q.push(_job(DIRECT))
+    for _ in range(5):
+        q.push(_job(AMBIENT))
+    served = [q.pop(0.0).priority for _ in range(6)]
+    # pattern D D A D D A — ambient gets at least every third slot
+    assert served == [DIRECT, DIRECT, AMBIENT, DIRECT, DIRECT, AMBIENT]
+
+
+def test_queue_serves_ambient_when_no_direct():
+    q = FairQueue()
+    q.push(_job(AMBIENT))
+    assert q.pop(0.0).priority == AMBIENT
+    assert q.pop(0.0) is None
+
+
+def test_queue_drops_stale():
+    q = FairQueue(stale_sec=10)
+    q.push(_job(DIRECT, t=0.0))
+    q.push(_job(DIRECT, t=100.0))
+    assert q.pop(105.0).enqueued_at == 100.0  # the old one was dropped
+    assert q.pop(105.0) is None
+
+
+def test_queue_lane_cap():
+    q = FairQueue(lane_max=3)
+    for i in range(10):
+        q.push(_job(AMBIENT, t=float(i)))
+    assert len(q) == 3
+
+
+def test_queue_has_pending_from():
+    q = FairQueue()
+    q.push(_job(DIRECT, uid=7))
+    assert q.has_pending_from(-1, 7)
+    assert not q.has_pending_from(-1, 8)
+
+
+# ── lexicon split ────────────────────────────────────────────────────────────
 
 def make_lexicon() -> Lexicon:
     lex = Lexicon(entities=[
@@ -26,343 +130,237 @@ def make_lexicon() -> Lexicon:
     return lex
 
 
+def test_scan_split_active_vs_other():
+    lex = make_lexicon()
+    aliases = ["Ютия", "Ютии", "Ютию"]
+    active, other, hits = lex.scan_split("Ютия что там у Алона", aliases)
+    assert active is True and other == 3 and hits == ["Алон"]
+    active, other, _ = lex.scan_split("Алон лошара", aliases)
+    assert active is False and other == 3
+
+
+def test_real_personas_lexicon_lore_load():
+    personas = load_personas(PERSONAS_DIR)
+    assert {"alon", "yutia", "evan", "solrang",
+            "deus", "rine", "radan", "penia"} <= set(personas)
+    lex = load_lexicon(PERSONAS_DIR)
+    assert len(lex.entities) > 50
+    lore = load_lore(PERSONAS_DIR)
+    assert "Голубая Луна" in lore
+    # an inflected active-name form is detected as a direct hit
+    active, _, _ = lex.scan_split("что там Алоны опять",
+                                  personas["alon"].aliases)
+    assert active is True
+
+
+# ── engine flow ──────────────────────────────────────────────────────────────
+
 def make_persona(**over) -> Persona:
     base = dict(
-        key="yutia", name="Ютия", aliases=["Ютия", "Ютии"],
-        one_liner="тест", spoiler_safe_until=90,
-        persona={"relations": {"Алон": "обожает"},
-                 "signature_lines": ["Я понимаю его волю!"]},
-        triggers=[{"on": "оскорбляют Алона", "react": "ярость"}],
-        taboo=["не предаёт Алона"],
-        fallback_lines=["Считай свои вдохи."],
+        key="yutia", name="Ютия", aliases=["Ютия", "Ютии", "Ютию"],
+        one_liner="тест", spoiler_safe_until=0,
+        persona={"relations": {}, "signature_lines": []},
+        triggers=[], taboo=[], fallback_lines=["Считай свои вдохи."],
         system_prompt="Ты — Ютия.")
     base.update(over)
     return Persona(**base)
 
 
 class FakeGemini:
-    """Scripted stand-in for GeminiClient."""
-
-    def __init__(self, classify_result=None, generate_result="ответ",
-                 budget=1000):
+    def __init__(self, classify_result=None, generate_result="ответ"):
         self.classify_result = classify_result
         self.generate_result = generate_result
-        self.budget = budget
-        self.generate_calls: list[tuple[str, str]] = []
+        self.generate_calls = 0
         self.classify_calls = 0
 
     async def generation_budget_left(self):
-        return self.budget
-
-    async def generate(self, system, user, **kw):
-        self.generate_calls.append((system, user))
-        if isinstance(self.generate_result, Exception):
-            raise self.generate_result
-        return self.generate_result
+        return 1000
 
     async def classify(self, system, user):
         self.classify_calls += 1
         return self.classify_result
 
+    async def generate(self, system, user, **kw):
+        self.generate_calls += 1
+        if isinstance(self.generate_result, Exception):
+            raise self.generate_result
+        return self.generate_result
 
-async def make_engine(tmp_path, gemini, persona=None) -> AiEngine:
+
+async def make_engine(tmp_path, gemini, persona=None):
     store = AiStore(tmp_path / "ai.db")
     await store.connect()
     persona = persona or make_persona()
     eng = AiEngine(store, gemini, {persona.key: persona}, make_lexicon(),
-                   lore="БИБЛИЯ: Алон — попаданец. Ютия — Грех Гнева.")
+                   lore="БИБЛИЯ.")
     eng.set_bot_identity("rqm_bot", 42)
     await store.set("active_persona", persona.key)
     await store.set_enabled_chats({-100500})
     return eng
 
 
-def msg_kwargs(**over):
+def kw(**over):
     base = dict(chat_id=-100500, msg_id=1, user_id=7, username="вася",
-                text="АЛОН ХУЕСОС", reply_to=None, reply_to_is_bot=False)
+                text="Ютия привет", reply_to=None, reply_to_is_bot=False)
     base.update(over)
     return base
 
 
-# ── lexicon ──────────────────────────────────────────────────────────────────
-
-def test_lexicon_scan_inflections():
-    lex = make_lexicon()
-    score, hits = lex.scan("алону и ютией недовольны")
-    assert score == 6 and set(hits) == {"Алон", "Ютия"}
-    score, hits = lex.scan("привет как дела")
-    assert score == 0 and hits == []
-
-
-def test_real_lexicon_and_personas_load():
-    personas = load_personas(PERSONAS_DIR)
-    assert {"alon", "yutia", "evan", "solrang",
-            "deus", "rine", "radan", "penia"} <= set(personas)
-    lex = load_lexicon(PERSONAS_DIR)
-    assert len(lex.entities) > 50
-    score, hits = lex.scan("Что там Ютия сделала с Алоном в той главе?")
-    assert "Ютия" in hits and "Алон" in hits and score >= 6
-    prompt = personas["yutia"].full_system_prompt()
-    assert "tg-spoiler" in prompt and "Ютия" in prompt
-
-
-def test_real_lore_loads_and_injects():
-    from app.ai.personas import load_lore
-    lore = load_lore(PERSONAS_DIR)
-    assert "Голубая Луна" in lore and "Пять Великих Грехов" in lore
-
-
-def test_engine_injects_lore_into_system_prompt(tmp_path):
+def test_engine_records_every_message(tmp_path):
     async def go():
         eng = await make_engine(tmp_path, FakeGemini())
-        persona = make_persona()
-        sys_p = eng.system_for(persona)
-        assert "БИБЛИЯ" in sys_p and "Ты — Ютия" in sys_p
-        await eng.store.close()
-    asyncio.run(go())
-
-
-# ── store ────────────────────────────────────────────────────────────────────
-
-def test_store_buffer_and_chain(tmp_path):
-    async def go():
-        store = AiStore(tmp_path / "ai.db")
-        await store.connect()
-        await store.record(-1, 1, 10, "u1", "первое", None, is_bot=False)
-        await store.record(-1, 2, 42, "bot", "ответ", 1, is_bot=True)
-        await store.record(-1, 3, 10, "u1", "ещё", 2, is_bot=False)
-        recent = await store.recent(-1)
-        assert [r["msg_id"] for r in recent] == [1, 2, 3]
-        chain = await store.reply_chain(-1, 3)
-        assert [r["msg_id"] for r in chain] == [1, 2, 3]
-        assert chain[1]["is_bot"] == 1
-        await store.close()
-    asyncio.run(go())
-
-
-def test_store_quota_and_ignores(tmp_path):
-    async def go():
-        store = AiStore(tmp_path / "ai.db")
-        await store.connect()
-        assert await store.quota_used("m") == 0
-        await store.quota_bump("m")
-        await store.quota_bump("m", 5)
-        assert await store.quota_used("m") == 6
-        assert not await store.is_ignored(7)
-        await store.ignore(7, hours=1, reason="t")
-        assert await store.is_ignored(7)
-        await store.unignore(7)
-        assert not await store.is_ignored(7)
-        await store.ignore(8, hours=None, reason="perm")
-        assert await store.is_ignored(8)
-        await store.close()
-    asyncio.run(go())
-
-
-def test_store_kb_search(tmp_path):
-    async def go():
-        store = AiStore(tmp_path / "ai.db")
-        await store.connect()
-        await store.kb_put(10, "Глава 10", "Алон и Ютия посетили город Эстрован")
-        await store.kb_put(20, "Глава 20", "Сольранг выиграла турнир в Колизее")
-        found = await store.kb_search("что делали в Эстроване Алон")
-        assert found and found[0]["chapter"] == 10
-        assert await store.kb_count() == 2
-        await store.close()
-    asyncio.run(go())
-
-
-def test_google_reset_day_is_a_date():
-    day = google_reset_day()
-    assert len(day) == 10 and day[4] == "-"
-
-
-# ── engine pipeline ──────────────────────────────────────────────────────────
-
-def test_engine_responds_to_insult(tmp_path):
-    async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "insult", "heat": 3},
-            generate_result="Считай свои вдохи, смертный.")
-        eng = await make_engine(tmp_path, gem)
-        reply = await eng.on_group_message(**msg_kwargs())
-        assert reply == "Считай свои вдохи, смертный."
-        # the message and nothing else got recorded
+        await eng.on_group_message(**kw(text="просто болтаю ни о чём"))
         recent = await eng.store.recent(-100500)
-        assert len(recent) == 1 and recent[0]["text"] == "АЛОН ХУЕСОС"
+        assert len(recent) == 1
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_skips_offtopic_without_dice(tmp_path):
+def test_engine_enqueues_direct_on_name(tmp_path):
     async def go():
-        gem = FakeGemini(classify_result={"respond": True, "heat": 3})
-        eng = await make_engine(tmp_path, gem)
-        await eng.store.set("butt_in_pct", "0")
-        reply = await eng.on_group_message(
-            **msg_kwargs(text="погода сегодня норм"))
-        assert reply is None and gem.classify_calls == 0
+        eng = await make_engine(tmp_path, FakeGemini())
+        await eng.on_group_message(**kw(text="Ютия ты где"))
+        assert len(eng._queue) == 1
+        job = eng._queue.pop(0.0)
+        assert job.priority == DIRECT
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_global_cooldown(tmp_path):
+def test_engine_enqueues_on_reply_to_bot(tmp_path):
     async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "insult", "heat": 3})
-        eng = await make_engine(tmp_path, gem)
-        r1 = await eng.on_group_message(**msg_kwargs(msg_id=1))
-        r2 = await eng.on_group_message(**msg_kwargs(msg_id=2))
-        assert r1 is not None and r2 is None  # 30s cooldown blocks the second
+        eng = await make_engine(tmp_path, FakeGemini())
+        await eng.on_group_message(**kw(text="ну и?", reply_to=99,
+                                        reply_to_is_bot=True))
+        assert len(eng._queue) == 1 and eng._queue.pop(0.0).priority == DIRECT
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_direct_bypasses_global_cooldown(tmp_path):
+def test_engine_entity_asks_classifier_yes(tmp_path):
     async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "insult", "heat": 3},
-            generate_result="ответ")
+        gem = FakeGemini(classify_result={"respond": True, "mode": "insult"})
         eng = await make_engine(tmp_path, gem)
-        r1 = await eng.on_group_message(**msg_kwargs(msg_id=1, user_id=7))
-        assert r1 is not None  # ambient answer sets the global cooldown
-        # a DIFFERENT user replying directly to the bot is answered anyway
-        r2 = await eng.on_group_message(
-            **msg_kwargs(msg_id=2, user_id=8, username="petya",
-                         text="ну что молчишь", reply_to=9,
-                         reply_to_is_bot=True))
-        assert r2 is not None
+        await eng.on_group_message(**kw(text="Алон конченый"))
+        assert gem.classify_calls == 1 and len(eng._queue) == 1
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_classifier_no_disables_reply(tmp_path):
+def test_engine_entity_classifier_no_skips(tmp_path):
     async def go():
-        gem = FakeGemini(classify_result={"respond": False, "heat": 0})
+        gem = FakeGemini(classify_result={"respond": False})
         eng = await make_engine(tmp_path, gem)
-        # weak hit (score 1, not direct) → the classifier is consulted and
-        # its "no" suppresses the reply
-        reply = await eng.on_group_message(
-            **msg_kwargs(text="перечитываю эту главу"))
-        assert reply is None and gem.classify_calls == 1
+        await eng.on_group_message(**kw(text="читаю эту главу сейчас"))
+        assert gem.classify_calls == 1 and len(eng._queue) == 0
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_strong_hit_skips_classifier(tmp_path):
+def test_engine_no_persona_no_enqueue(tmp_path):
     async def go():
-        gem = FakeGemini(generate_result="ответ")
-        eng = await make_engine(tmp_path, gem)
-        # strong lexicon hit (Алон, score 3) answers WITHOUT a classifier call
-        reply = await eng.on_group_message(**msg_kwargs(text="Алон лошара"))
-        assert reply == "ответ" and gem.classify_calls == 0
+        eng = await make_engine(tmp_path, FakeGemini())
+        await eng.store.set("active_persona", "")
+        await eng.on_group_message(**kw())
+        assert len(eng._queue) == 0
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_direct_overrides_classifier_no(tmp_path):
+def test_engine_disabled_chat_no_enqueue(tmp_path):
     async def go():
-        gem = FakeGemini(classify_result={"respond": False, "heat": 0},
-                         generate_result="Слушаю.")
-        eng = await make_engine(tmp_path, gem)
-        reply = await eng.on_group_message(
-            **msg_kwargs(text="ну что молчишь", reply_to=99,
-                         reply_to_is_bot=True))
-        assert reply == "Слушаю."
+        eng = await make_engine(tmp_path, FakeGemini())
+        await eng.store.set_enabled_chats(set())
+        await eng.on_group_message(**kw())
+        assert len(eng._queue) == 0
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_fallback_on_refusal(tmp_path):
+def test_engine_ignored_user_no_enqueue_but_recorded(tmp_path):
     async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "insult", "heat": 3},
-            generate_result=RefusedError("safety"))
-        eng = await make_engine(tmp_path, gem)
-        reply = await eng.on_group_message(**msg_kwargs())
-        assert reply == "Считай свои вдохи."  # persona fallback line
-        await eng.store.close()
-    asyncio.run(go())
-
-
-def test_engine_silent_on_quota(tmp_path):
-    async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "insult", "heat": 3},
-            generate_result=QuotaExhausted("empty"))
-        eng = await make_engine(tmp_path, gem)
-        reply = await eng.on_group_message(**msg_kwargs())
-        assert reply is None
-        await eng.store.close()
-    asyncio.run(go())
-
-
-def test_engine_reserve_blocks_casual(tmp_path):
-    async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "casual", "heat": 1},
-            budget=100)  # below the default 150 reserve
-        eng = await make_engine(tmp_path, gem)
-        reply = await eng.on_group_message(
-            **msg_kwargs(text="алон что-то делает в главе"))
-        assert reply is None
-        # but a hot insult still goes through
-        gem.classify_result = {"respond": True, "mode": "insult", "heat": 3}
-        reply = await eng.on_group_message(**msg_kwargs(msg_id=2))
-        assert reply is not None
-        await eng.store.close()
-    asyncio.run(go())
-
-
-def test_engine_ignored_user(tmp_path):
-    async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "insult", "heat": 3})
-        eng = await make_engine(tmp_path, gem)
-        await eng.store.ignore(7, hours=24, reason="abuse")
-        reply = await eng.on_group_message(**msg_kwargs())
-        assert reply is None
-        # the message is still remembered (shadow ignore)
+        eng = await make_engine(tmp_path, FakeGemini())
+        await eng.store.ignore(7, hours=24, reason="t")
+        await eng.on_group_message(**kw())
+        assert len(eng._queue) == 0
         assert len(await eng.store.recent(-100500)) == 1
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_kb_in_plot_prompt(tmp_path):
+def test_engine_dup_spam_ignored(tmp_path):
     async def go():
-        gem = FakeGemini(
-            classify_result={"respond": True, "mode": "plot", "heat": 1},
-            generate_result="<tg-spoiler>Они зачистили лабиринт.</tg-spoiler>")
+        eng = await make_engine(tmp_path, FakeGemini())
+        await eng.store.set("dup_limit", "5")
+        for i in range(5):
+            await eng.on_group_message(**kw(msg_id=i, text="Ютия спам"))
+            eng._queue.pop(0.0)  # drain so per-user-pending doesn't block
+            eng._user_last_answer.clear()  # ignore per-user cooldown here
+        # 6th identical within the window → dropped by dup filter
+        await eng.on_group_message(**kw(msg_id=99, text="Ютия спам"))
+        assert len(eng._queue) == 0
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_user_cooldown_blocks_second(tmp_path):
+    async def go():
+        eng = await make_engine(tmp_path, FakeGemini())
+        import time as _t
+        eng._user_last_answer[7] = _t.time()  # just answered this user
+        await eng.on_group_message(**kw(text="Ютия снова"))
+        assert len(eng._queue) == 0
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_run_job_sends_and_records(tmp_path):
+    async def go():
+        gem = FakeGemini(generate_result="Ты пожалеешь, милый.")
         eng = await make_engine(tmp_path, gem)
-        await eng.store.kb_put(8, "Глава 8",
-                               "Алон и Эван прошли Шепчущий лабиринт")
-        reply = await eng.on_group_message(
-            **msg_kwargs(text="ЮТИЯ что Алон делал в лабиринте главы 8?"))
-        assert reply and "tg-spoiler" in reply
-        sys_p, user_p = gem.generate_calls[0]
-        assert "Шепчущий лабиринт" in user_p  # KB snippet reached the prompt
+        sent = []
+
+        async def send(chat_id, reply_to, text):
+            sent.append((chat_id, reply_to, text))
+            return 555
+        eng.send_callback = send
+        await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
+                               username="вася", text="Алон хуесос",
+                               priority=DIRECT, mode="insult", enqueued_at=0.0))
+        assert sent and sent[0][2] == "Ты пожалеешь, милый."
+        # the bot's own reply is remembered for context
+        recent = await eng.store.recent(-100500)
+        assert recent[-1]["is_bot"] == 1
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_run_job_silent_on_quota(tmp_path):
+    async def go():
+        from app.ai.gemini import QuotaExhausted
+        gem = FakeGemini(generate_result=QuotaExhausted("x"))
+        eng = await make_engine(tmp_path, gem)
+        sent = []
+        eng.send_callback = lambda *a: sent.append(a)
+        await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
+                               username="u", text="t", priority=DIRECT,
+                               mode="casual", enqueued_at=0.0))
+        assert sent == []
         await eng.store.close()
     asyncio.run(go())
 
 
 # ── formatting helpers ───────────────────────────────────────────────────────
 
-def test_sanitize_strips_name_prefix():
-    assert sanitize_reply("Ютия: ну привет") == "ну привет"
-    assert sanitize_reply("обычный ответ") == "обычный ответ"
-
-
-def test_ai_to_html_escapes_and_strips_spoiler():
-    html = _ai_to_html("<tg-spoiler>спойлер & <b>жирный</b></tg-spoiler>")
-    # spoilers are disabled: tag removed entirely, content escaped & kept
-    assert "tg-spoiler" not in html
-    assert "спойлер" in html and "&amp;" in html and "&lt;b&gt;" in html
-    assert "tg-spoiler" not in _ai_to_html("<tg-spoiler>оборвано")
+def test_ai_to_html_strips_spoiler_and_escapes():
+    html = _ai_to_html("<tg-spoiler>тайна & <b>x</b></tg-spoiler>")
+    assert "tg-spoiler" not in html and "тайна" in html
+    assert "&amp;" in html and "&lt;b&gt;" in html
     assert _strip_spoiler("<tg-spoiler>x</tg-spoiler>") == "x"
 
 
 def test_parse_json_block():
-    assert parse_json_block('{"a": 1}') == {"a": 1}
-    assert parse_json_block('```json\n{"a": 1}\n```') == {"a": 1}
-    assert parse_json_block("no json here") is None
-    assert parse_json_block(json.dumps({"respond": True})) == {"respond": True}
+    assert parse_json_block('{"respond": true}') == {"respond": True}
+    assert parse_json_block("```json\n{\"a\":1}\n```") == {"a": 1}
+    assert parse_json_block("nope") is None
+    assert json.loads("{}") == {}

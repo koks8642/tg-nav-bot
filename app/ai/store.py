@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS summaries (
 );
 """
 
-BUFFER_KEEP = 300  # messages kept per chat
+# kept per chat: enough to reconstruct reply threads and feed the context
+# window (50) while staying small so the DB never bloats.
+BUFFER_KEEP = 200
 
 
 def _now() -> str:

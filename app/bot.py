@@ -450,42 +450,49 @@ class BotApp:
     # ── AI persona chat (groups) ──────────────────────────────────────────────
     async def on_group_text(self, update: Update,
                             context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Every group message goes through the AI engine: it records the
-        message into the chat memory and decides whether the persona answers."""
-        msg = update.effective_message
-        if self.ai is None or msg is None or not msg.text:
+        """Hand every fresh group text message to the AI engine. The engine
+        records it, decides, and (if it answers) sends via _ai_send_callback
+        on its own paced worker — nothing is sent inline here."""
+        if self.ai is None:
+            return
+        # only brand-new text messages: skip edits, bots, and non-text
+        if update.edited_message is not None:
+            return
+        msg = update.message
+        if msg is None or not msg.text:
             return
         u = update.effective_user
+        if u is not None and u.is_bot:
+            return
         reply_to = msg.reply_to_message
         reply_to_is_bot = bool(
             reply_to and reply_to.from_user
             and context.bot.id == reply_to.from_user.id)
+        await self.ai.on_group_message(
+            chat_id=msg.chat_id, msg_id=msg.message_id,
+            user_id=u.id if u else None,
+            username=(u.first_name or u.username) if u else None,
+            text=msg.text,
+            reply_to=reply_to.message_id if reply_to else None,
+            reply_to_is_bot=reply_to_is_bot)
+
+    async def _ai_send_callback(self, chat_id: int, reply_to: int,
+                                raw_text: str) -> int | None:
+        """Engine → Telegram. Format and send one persona reply, returning the
+        sent message id (so the engine can remember it). Never raises."""
+        bot = self.application.bot
         try:
-            reply = await self.ai.on_group_message(
-                chat_id=msg.chat_id, msg_id=msg.message_id,
-                user_id=u.id if u else None,
-                username=(u.first_name or u.username) if u else None,
-                text=msg.text,
-                reply_to=reply_to.message_id if reply_to else None,
-                reply_to_is_bot=reply_to_is_bot)
-        except Exception:  # noqa: BLE001 — the persona must never break the bot
-            log.exception("ai engine failed on group message")
-            return
-        if not reply:
-            return
-        try:
-            sent = await msg.reply_text(
-                _ai_to_html(reply), parse_mode=ParseMode.HTML)
-        except Exception:  # noqa: BLE001 — e.g. broken HTML from the model
+            sent = await bot.send_message(
+                chat_id, _ai_to_html(raw_text),
+                reply_to_message_id=reply_to, parse_mode=ParseMode.HTML)
+            return sent.message_id
+        except Exception:  # noqa: BLE001 — bad HTML, deleted msg, etc.
             try:
-                sent = await msg.reply_text(_strip_spoiler(reply))
+                sent = await bot.send_message(chat_id, _strip_spoiler(raw_text))
+                return sent.message_id
             except Exception:  # noqa: BLE001
-                log.exception("ai reply send failed")
-                return
-        persona = await self.ai.active_persona()
-        await self.ai.record_bot_message(
-            msg.chat_id, sent.message_id, _strip_spoiler(reply),
-            msg.message_id, persona.key if persona else "")
+                log.warning("ai reply send failed in chat %s", chat_id)
+                return None
 
     async def cmd_ai_on(self, update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
