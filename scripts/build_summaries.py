@@ -34,11 +34,33 @@ API = ("https://generativelanguage.googleapis.com/v1beta/models/"
        f"{MODEL}:generateContent")
 RPM_SLEEP = 7.0  # stay safely under the free-tier per-minute cap for flash-lite
 
+# Canonical spellings injected so the same entity is written the same way
+# across all chapters (the source MTL spells names inconsistently, which
+# would otherwise fragment the knowledge base and break search).
+CANON = (
+    "Алон, Ютия, Эван, Сольранг, Деус, Пения, Рине, Радан, Блэки, Сили, "
+    "Каланон, Хидан, Юна, Хейнкель, Базилиора, Лиян, Рория, Филиан, Закурак, "
+    "Рейнхард, Карсем, Товетт, Комалон, Сиркал, Сиан, Фелин, Голубая Луна, "
+    "Великая Луна, Пять Грехов, Кровавый Род, Сто Призраков, Розарио, "
+    "Племя Золотой Гривы, Синяя Башня, Красная Башня, Внешние боги, Ампелан, "
+    "Астерия, Палатио, Калибан, Ашталон, Колония, Люксибл, Ронавелли, "
+    "Грейнифра, Божественная Земля, Эстрован")
+
 PROMPT = """\
 Сожми главу веб-новеллы «Стал покровителем злодеев» в справку для базы знаний.
 Формат: 3-6 предложений фактов — какие события произошли, кто участвовал,
 где (локации), чем закончилось. Затем строка «Персонажи: …» и строка
 «Места: …». Без оценок и воды, только факты. Пиши по-русски.
+
+ВАЖНЫЕ ПРАВИЛА:
+- Пиши ТОЛЬКО факты, прямо изложенные в тексте главы. Не достраивай и не
+  домысливай события.
+- НЕ ВЫДУМЫВАЙ имена, фамилии, названия организаций и мест, которых нет в
+  тексте. Если персонаж не назван по имени — пиши его роль («рыцарь»,
+  «купец»), а не придуманное имя.
+- Для перечисленных персонажей и мест используй РОВНО эти написания (в
+  тексте перевода они могут писаться по-разному — приводи к этим):
+  {canon}
 
 ГЛАВА {num}:
 {text}
@@ -143,7 +165,8 @@ def main() -> int:
         title = title_m.group(1).strip() if title_m else f"Глава {num}"
         body = re.sub(r"\s+", " ", text)[:24000]
         try:
-            summary = call_gemini(args.key, PROMPT.format(num=num, text=body),
+            summary = call_gemini(args.key,
+                                  PROMPT.format(num=num, text=body, canon=CANON),
                                   ssh_prefix)
         except Exception as e:  # noqa: BLE001
             print(f"  ch{num}: FAILED {e}", flush=True)
