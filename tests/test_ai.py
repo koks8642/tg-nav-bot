@@ -201,6 +201,24 @@ def test_engine_global_cooldown(tmp_path):
     asyncio.run(go())
 
 
+def test_engine_direct_bypasses_global_cooldown(tmp_path):
+    async def go():
+        gem = FakeGemini(
+            classify_result={"respond": True, "mode": "insult", "heat": 3},
+            generate_result="ответ")
+        eng = await make_engine(tmp_path, gem)
+        r1 = await eng.on_group_message(**msg_kwargs(msg_id=1, user_id=7))
+        assert r1 is not None  # ambient answer sets the global cooldown
+        # a DIFFERENT user replying directly to the bot is answered anyway
+        r2 = await eng.on_group_message(
+            **msg_kwargs(msg_id=2, user_id=8, username="petya",
+                         text="ну что молчишь", reply_to=9,
+                         reply_to_is_bot=True))
+        assert r2 is not None
+        await eng.store.close()
+    asyncio.run(go())
+
+
 def test_engine_classifier_no_disables_reply(tmp_path):
     async def go():
         gem = FakeGemini(classify_result={"respond": False, "heat": 0})

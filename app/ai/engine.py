@@ -23,12 +23,13 @@ log = logging.getLogger("ai.engine")
 
 # defaults; all overridable via settings table
 DEFAULTS = {
-    "cooldown_sec": 30,        # global pause between answers
-    "user_cooldown_sec": 120,  # pause between answers to the same user
-    "butt_in_pct": 2.0,        # % chance to consider an off-topic message
-    "reserve": 150,            # generation requests kept for the evening
-    "abuse_limit_hour": 6,     # answers to one user per hour before shadow-ban
-    "context_messages": 10,    # recent buffer messages in the prompt
+    "cooldown_sec": 30,         # global pause between AMBIENT (triggered) answers
+    "user_cooldown_sec": 120,   # pause between ambient answers to the same user
+    "direct_cooldown_sec": 8,   # per-user floor when addressed directly
+    "butt_in_pct": 2.0,         # % chance to consider an off-topic message
+    "reserve": 150,             # generation requests kept for the evening
+    "abuse_limit_hour": 6,      # answers to one user per hour before shadow-ban
+    "context_messages": 10,     # recent buffer messages in the prompt
 }
 
 CLASSIFIER_SYSTEM = """\
@@ -104,13 +105,22 @@ class AiEngine:
 
         # ── cooldowns / quota ────────────────────────────────────────────
         now = time.time()
-        cooldown = await self._adaptive_cooldown()
         in_reserve = await self._in_reserve()
-        if now - self._last_answer_ts < cooldown:
-            return None
-        if user_id is not None:
-            ucd = await self.setting("user_cooldown_sec")
-            if not direct and now - self._user_last_answer.get(user_id, 0) < ucd:
+        last_user = self._user_last_answer.get(user_id, 0) if user_id else 0
+        if direct:
+            # someone is talking to the persona directly (named it or replied
+            # to it) — answer even if we just replied to someone else; only a
+            # short per-user floor stops one person rapid-firing.
+            floor = await self.setting("direct_cooldown_sec")
+            if user_id is not None and now - last_user < floor:
+                return None
+        else:
+            # ambient trigger: respect the global pause and the long per-user
+            # cooldown so the bot doesn't flood an active chat.
+            if now - self._last_answer_ts < await self._adaptive_cooldown():
+                return None
+            if user_id is not None and \
+                    now - last_user < await self.setting("user_cooldown_sec"):
                 return None
 
         # ── cheap classifier ─────────────────────────────────────────────
