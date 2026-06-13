@@ -55,11 +55,13 @@ CLASSIFIER_SYSTEM = """\
 
 class AiEngine:
     def __init__(self, store: AiStore, gemini: GeminiClient,
-                 personas: dict[str, Persona], lexicon: Lexicon):
+                 personas: dict[str, Persona], lexicon: Lexicon,
+                 lore: str = ""):
         self.store = store
         self.gemini = gemini
         self.personas = personas
         self.lexicon = lexicon
+        self.lore = lore  # shared universe bible, injected into every prompt
         self.bot_username: str = ""
         self.bot_user_id: int | None = None
         self._last_answer_ts: float = 0.0
@@ -69,6 +71,16 @@ class AiEngine:
     def set_bot_identity(self, username: str, user_id: int) -> None:
         self.bot_username = (username or "").lstrip("@").lower()
         self.bot_user_id = user_id
+
+    def system_for(self, persona: Persona) -> str:
+        """Persona prompt + the shared universe bible, so the character
+        actually knows the world and the other characters."""
+        sp = persona.full_system_prompt()
+        if self.lore:
+            sp += ("\n\n# СПРАВКА ПО ВСЕЛЕННОЙ (твои фактические знания о мире "
+                   "и других персонажах — опирайся на них, но говори своим "
+                   "голосом):\n" + self.lore)
+        return sp
 
     # ── settings helpers ──────────────────────────────────────────────────
     async def setting(self, key: str) -> float:
@@ -144,7 +156,7 @@ class AiEngine:
             mode=str(verdict.get("mode", "casual")))
         try:
             reply = await self.gemini.generate(
-                persona.full_system_prompt(), prompt)
+                self.system_for(persona), prompt)
         except RefusedError:
             reply = random.choice(persona.fallback_lines) \
                 if persona.fallback_lines and (direct or heat >= 2) else None

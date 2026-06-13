@@ -586,7 +586,7 @@ class BotApp:
                 return
             try:
                 reply = await self.ai.gemini.generate(
-                    persona.full_system_prompt(),
+                    self.ai.system_for(persona),
                     f"Сообщение от тестера: {text}\n"
                     "Ответь ОДНИМ сообщением в своём характере.")
                 await update.message.reply_text(

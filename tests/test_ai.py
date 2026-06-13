@@ -69,7 +69,8 @@ async def make_engine(tmp_path, gemini, persona=None) -> AiEngine:
     store = AiStore(tmp_path / "ai.db")
     await store.connect()
     persona = persona or make_persona()
-    eng = AiEngine(store, gemini, {persona.key: persona}, make_lexicon())
+    eng = AiEngine(store, gemini, {persona.key: persona}, make_lexicon(),
+                   lore="БИБЛИЯ: Алон — попаданец. Ютия — Грех Гнева.")
     eng.set_bot_identity("rqm_bot", 42)
     await store.set("active_persona", persona.key)
     await store.set_enabled_chats({-100500})
@@ -103,6 +104,22 @@ def test_real_lexicon_and_personas_load():
     assert "Ютия" in hits and "Алон" in hits and score >= 6
     prompt = personas["yutia"].full_system_prompt()
     assert "tg-spoiler" in prompt and "Ютия" in prompt
+
+
+def test_real_lore_loads_and_injects():
+    from app.ai.personas import load_lore
+    lore = load_lore(PERSONAS_DIR)
+    assert "Голубая Луна" in lore and "Пять Великих Грехов" in lore
+
+
+def test_engine_injects_lore_into_system_prompt(tmp_path):
+    async def go():
+        eng = await make_engine(tmp_path, FakeGemini())
+        persona = make_persona()
+        sys_p = eng.system_for(persona)
+        assert "БИБЛИЯ" in sys_p and "Ты — Ютия" in sys_p
+        await eng.store.close()
+    asyncio.run(go())
 
 
 # ── store ────────────────────────────────────────────────────────────────────

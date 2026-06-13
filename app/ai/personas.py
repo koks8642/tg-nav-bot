@@ -113,6 +113,16 @@ def load_personas(dir_path: Path) -> dict[str, Persona]:
     return out
 
 
+def load_lore(dir_path: Path) -> str:
+    """Read the shared universe bible (personas/lore.md) injected into every
+    persona prompt so characters actually know the world and each other."""
+    f = Path(dir_path) / "lore.md"
+    try:
+        return f.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def load_lexicon(dir_path: Path) -> Lexicon:
     f = Path(dir_path) / "lexicon.json"
     lex = Lexicon()
