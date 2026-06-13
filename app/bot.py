@@ -517,17 +517,23 @@ class BotApp:
 
     async def cmd_ai(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Admin control: /ai, /ai persona <key>, /ai set <key> <val>,
-        /ai ban <uid> [часов], /ai unban <uid>, /ai test <текст>."""
-        if self.ai is None or not await self.is_admin(update.effective_user.id):
+        """Everyone (in the group) can read status, switch the persona, and
+        test it; only admins can change settings or ban users."""
+        if self.ai is None:
             return
         args = context.args or []
         store = self.ai.store
+        cmd = args[0].lower() if args else ""
+        # config / moderation commands stay admin-only; the rest are open
+        if cmd in ("set", "ban", "unban") and \
+                not await self.is_admin(update.effective_user.id):
+            await update.message.reply_text(
+                "Эта команда только для админов чата.")
+            return
         if not args:
             await update.message.reply_text(await self._ai_status_text(),
                                             parse_mode=ParseMode.HTML)
             return
-        cmd = args[0].lower()
         if cmd == "persona" and len(args) >= 2:
             key = args[1].lower()
             if key in ("off", "none", "-"):
