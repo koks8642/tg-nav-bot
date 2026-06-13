@@ -19,13 +19,14 @@ from .decision import AMBIENT, DIRECT
 @dataclass
 class Job:
     chat_id: int
-    reply_to: int          # message id to reply to
+    reply_to: int          # message id the bot replies to (the trigger msg)
     user_id: int | None
     username: str | None
     text: str
     priority: str          # DIRECT | AMBIENT
     mode: str              # insult | plot | lore | casual
     enqueued_at: float
+    replied_to: int | None = None  # msg id the USER replied to (if any)
 
 
 class FairQueue:

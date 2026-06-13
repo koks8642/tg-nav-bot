@@ -32,7 +32,7 @@ DEFAULTS = {
     "cooldown_jitter_sec": 3.0,  # ± jitter on the pace (natural, not instant)
     "user_cooldown_sec": 5.0,   # min seconds between answers to the same user
     "butt_in_pct": 2.5,         # % chance to butt into an off-topic message
-    "context_messages": 50,     # recent messages shown to the persona
+    "context_messages": 25,     # recent messages shown to the persona
     "thread_depth": 20,         # reply-thread messages reconstructed
     "dup_limit": 5,             # identical msgs/min from one user before ignore
 }
@@ -168,7 +168,7 @@ class AiEngine:
         self._queue.push(Job(
             chat_id=chat_id, reply_to=msg_id, user_id=user_id,
             username=username, text=text, priority=d.priority, mode=mode,
-            enqueued_at=time.time()))
+            enqueued_at=time.time(), replied_to=reply_to))
 
     # ── anti-spam ─────────────────────────────────────────────────────────
     def _is_dup_spam(self, chat_id: int, user_id: int, text: str,
@@ -269,30 +269,26 @@ class AiEngine:
         speaker = job.username or "собеседник"
         parts: list[str] = []
 
-        # 1) the persona's PRIVATE history with THIS user (own dialog & mood)
-        if job.user_id is not None:
-            mine = await self.store.user_thread(
-                job.chat_id, job.user_id,
-                limit=int(await self.setting("thread_depth")))
-            if len(mine) > 1:
-                parts.append(f"Твоя личная переписка именно с {speaker} "
-                             f"(вы двое):\n" + _fmt(mine[:-1]))
+        # recent chat with names — situational awareness. Each line is labelled
+        # with who said it (ТЫ = the persona's own past replies), which is what
+        # lets the model both follow the conversation and tell people apart.
+        recent = await self.store.recent(
+            job.chat_id, limit=int(await self.setting("context_messages")))
+        convo = [r for r in recent if r["msg_id"] != job.reply_to]
+        if convo:
+            parts.append("Недавний разговор в чате (у каждого своё имя; "
+                         "ТЫ — твои собственные прошлые реплики):\n"
+                         + _fmt(convo))
 
-        # 2) if replying to someone ELSE's message, show it with attribution
-        if job.reply_to:
-            tgt = await self.store.get_msg(job.chat_id, job.reply_to)
-            if tgt and not tgt["is_bot"] and tgt.get("user_id") != job.user_id:
-                who = tgt["username"] or "кто-то"
-                parts.append(f"{speaker} отвечает на сообщение от {who}: "
+        # what the current speaker is replying to, if anything
+        if job.replied_to:
+            tgt = await self.store.get_msg(job.chat_id, job.replied_to)
+            if tgt:
+                src = ("твоё сообщение" if tgt["is_bot"]
+                       else f"сообщение от {tgt['username'] or 'кого-то'}")
+                parts.append(f"{speaker} отвечает на {src}: "
                              f"«{tgt['text'][:200]}»")
 
-        # 3) light general background (other people) for situational awareness
-        recent = await self.store.recent(job.chat_id, limit=8)
-        bg = [r for r in recent if r["msg_id"] != job.reply_to][:-1]
-        if len(bg) > 1:
-            parts.append("Фон чата (РАЗНЫЕ люди, не путай их):\n" + _fmt(bg))
-
-        # 4) knowledge base for plot questions
         if job.mode in ("plot", "lore"):
             found = await self.store.kb_search(job.text, limit=4)
             if found:
@@ -301,12 +297,12 @@ class AiEngine:
                 parts.append("Выжимки из глав (факты; если пересказываешь "
                              "события — укажи «📖 гл. N»):\n" + kb)
 
-        parts.append(f"СЕЙЧАС тебе пишет {speaker}: {job.text[:800]}")
+        parts.append(f"Сейчас тебе пишет {speaker}: «{job.text[:800]}»")
         parts.append(
-            f"Отвечай ИМЕННО {speaker}. У каждого в чате своё имя и своя "
-            f"история с тобой — НЕ путай {speaker} с другими людьми и НЕ "
-            f"считай его тем, кем он себя сам не называл. Ответь ОДНИМ живым "
-            f"сообщением в своём характере.")
+            f"Ответь {speaker} по СУТИ его сообщения, коротко и в своём "
+            f"характере. Обращайся к нему по имени и не путай с другими. НЕ "
+            f"повторяй свои прошлые реплики (помечены ТЫ) и не зацикливайся на "
+            f"одной и той же реакции — каждый ответ свежий и по делу.")
         return "\n\n".join(parts)
 
     async def _sleep(self, seconds: float) -> None:
