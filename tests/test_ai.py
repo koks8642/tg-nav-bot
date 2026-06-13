@@ -314,6 +314,26 @@ def test_engine_user_cooldown_blocks_second(tmp_path):
     asyncio.run(go())
 
 
+def test_store_user_thread_separates_people(tmp_path):
+    async def go():
+        s = AiStore(tmp_path / "ai.db")
+        await s.connect()
+        # kimchi (user 1) talks to the bot; bot replies to kimchi
+        await s.record(-1, 1, 1, "kimchi", "я твой брат", None, is_bot=False)
+        await s.record(-1, 2, 42, "bot", "ой, брат", 1, is_bot=True)
+        # koks (user 2) replies into the same area
+        await s.record(-1, 3, 2, "koks", "отпиздили", 2, is_bot=False)
+        kimchi = await s.user_thread(-1, 1)
+        koks = await s.user_thread(-1, 2)
+        # kimchi's thread has his line + the bot's reply to him; NOT koks's
+        assert [r["msg_id"] for r in kimchi] == [1, 2]
+        assert all(r["username"] != "koks" for r in kimchi)
+        # koks's thread has only koks's own message (bot hasn't replied to him)
+        assert [r["msg_id"] for r in koks] == [3]
+        await s.close()
+    asyncio.run(go())
+
+
 def test_engine_run_job_sends_and_records(tmp_path):
     async def go():
         gem = FakeGemini(generate_result="Ты пожалеешь, милый.")

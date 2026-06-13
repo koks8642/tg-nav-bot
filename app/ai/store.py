@@ -191,6 +191,22 @@ class AiStore:
         row = await cur.fetchone()
         return dict(row) if row else None
 
+    async def user_thread(self, chat_id: int, user_id: int,
+                          limit: int = 20) -> list[dict]:
+        """The persona's private conversation with ONE user: that user's own
+        messages plus the bot's replies addressed to them (oldest first). Lets
+        the persona keep a separate dialog and mood per person instead of
+        blending everyone into one thread."""
+        cur = await self.conn.execute(
+            "SELECT * FROM buffer WHERE chat_id=? AND ("
+            "  user_id=? OR (is_bot=1 AND reply_to IN ("
+            "    SELECT msg_id FROM buffer WHERE chat_id=? AND user_id=?)))"
+            " ORDER BY id DESC LIMIT ?",
+            (chat_id, user_id, chat_id, user_id, limit))
+        rows = [dict(r) for r in await cur.fetchall()]
+        rows.reverse()
+        return rows
+
     async def reply_chain(self, chat_id: int, msg_id: int,
                           max_depth: int = 12) -> list[dict]:
         """Walk reply_to links back from a message (oldest first)."""

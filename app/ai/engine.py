@@ -266,18 +266,33 @@ class AiEngine:
                                 is_bot=True, persona=persona_key)
 
     async def _build_prompt(self, persona: Persona, job: Job) -> str:
+        speaker = job.username or "собеседник"
         parts: list[str] = []
-        chain = (await self.store.reply_chain(
-            job.chat_id, job.reply_to,
-            max_depth=int(await self.setting("thread_depth")))
-            if job.reply_to else [])
-        if len(chain) > 1:
-            parts.append("Ветка диалога:\n" + _fmt(chain))
-        else:
-            recent = await self.store.recent(
-                job.chat_id, limit=int(await self.setting("context_messages")))
-            if len(recent) > 1:
-                parts.append("Последние сообщения чата:\n" + _fmt(recent[:-1]))
+
+        # 1) the persona's PRIVATE history with THIS user (own dialog & mood)
+        if job.user_id is not None:
+            mine = await self.store.user_thread(
+                job.chat_id, job.user_id,
+                limit=int(await self.setting("thread_depth")))
+            if len(mine) > 1:
+                parts.append(f"Твоя личная переписка именно с {speaker} "
+                             f"(вы двое):\n" + _fmt(mine[:-1]))
+
+        # 2) if replying to someone ELSE's message, show it with attribution
+        if job.reply_to:
+            tgt = await self.store.get_msg(job.chat_id, job.reply_to)
+            if tgt and not tgt["is_bot"] and tgt.get("user_id") != job.user_id:
+                who = tgt["username"] or "кто-то"
+                parts.append(f"{speaker} отвечает на сообщение от {who}: "
+                             f"«{tgt['text'][:200]}»")
+
+        # 3) light general background (other people) for situational awareness
+        recent = await self.store.recent(job.chat_id, limit=8)
+        bg = [r for r in recent if r["msg_id"] != job.reply_to][:-1]
+        if len(bg) > 1:
+            parts.append("Фон чата (РАЗНЫЕ люди, не путай их):\n" + _fmt(bg))
+
+        # 4) knowledge base for plot questions
         if job.mode in ("plot", "lore"):
             found = await self.store.kb_search(job.text, limit=4)
             if found:
@@ -285,8 +300,13 @@ class AiEngine:
                                for r in found)
                 parts.append("Выжимки из глав (факты; если пересказываешь "
                              "события — укажи «📖 гл. N»):\n" + kb)
-        parts.append(f"Сообщение от {job.username or 'кто-то'}: {job.text[:800]}")
-        parts.append("Ответь ОДНИМ живым сообщением в своём характере.")
+
+        parts.append(f"СЕЙЧАС тебе пишет {speaker}: {job.text[:800]}")
+        parts.append(
+            f"Отвечай ИМЕННО {speaker}. У каждого в чате своё имя и своя "
+            f"история с тобой — НЕ путай {speaker} с другими людьми и НЕ "
+            f"считай его тем, кем он себя сам не называл. Ответь ОДНИМ живым "
+            f"сообщением в своём характере.")
         return "\n\n".join(parts)
 
     async def _sleep(self, seconds: float) -> None:
