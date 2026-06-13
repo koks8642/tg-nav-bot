@@ -101,7 +101,7 @@ class GeminiClient:
         return total
 
     async def generate(self, system: str, user: str, *,
-                       temperature: float = 0.9,
+                       temperature: float = 1.0,
                        max_tokens: int = 400) -> str:
         """Try the cascade best-first; bump the local counter per attempt."""
         payload = {
@@ -111,10 +111,9 @@ class GeminiClient:
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_tokens,
-                # penalise verbatim repetition so personas don't loop on a
-                # single catch-phrase across consecutive replies
-                "frequencyPenalty": 1.2,
-                "presencePenalty": 0.5,
+                # NB: gemini-2.5-flash / flash-lite reject frequencyPenalty /
+                # presencePenalty with HTTP 400 ("Penalty is not enabled").
+                # Repetition is curbed via prompt instructions instead.
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         }
