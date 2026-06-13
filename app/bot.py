@@ -107,19 +107,14 @@ def _num_range(first, last) -> str:
 
 
 def _ai_to_html(reply: str) -> str:
-    """Model output → safe HTML. Everything is escaped, then the one tag the
-    persona is allowed to use (<tg-spoiler>) is restored."""
-    html = esc(reply)
-    html = html.replace("&lt;tg-spoiler&gt;", "<tg-spoiler>")
-    html = html.replace("&lt;/tg-spoiler&gt;", "</tg-spoiler>")
-    # an unbalanced spoiler tag would make Telegram reject the message
-    if html.count("<tg-spoiler>") != html.count("</tg-spoiler>"):
-        html = html.replace("<tg-spoiler>", "").replace("</tg-spoiler>", "")
-    return html
+    """Model output → safe plain text. Everything is escaped; spoilers are
+    disabled, so any spoiler tags the model emits are stripped, not rendered."""
+    return esc(_strip_spoiler(reply))
 
 
 def _strip_spoiler(reply: str) -> str:
-    return reply.replace("<tg-spoiler>", "").replace("</tg-spoiler>", "")
+    return (reply.replace("<tg-spoiler>", "").replace("</tg-spoiler>", "")
+            .replace("&lt;tg-spoiler&gt;", "").replace("&lt;/tg-spoiler&gt;", ""))
 
 
 class BotApp:

@@ -352,11 +352,11 @@ def test_sanitize_strips_name_prefix():
     assert sanitize_reply("обычный ответ") == "обычный ответ"
 
 
-def test_ai_to_html_escapes_and_keeps_spoiler():
+def test_ai_to_html_escapes_and_strips_spoiler():
     html = _ai_to_html("<tg-spoiler>спойлер & <b>жирный</b></tg-spoiler>")
-    assert html.startswith("<tg-spoiler>")
-    assert "&amp;" in html and "&lt;b&gt;" in html
-    # unbalanced tag gets stripped, not sent broken
+    # spoilers are disabled: tag removed entirely, content escaped & kept
+    assert "tg-spoiler" not in html
+    assert "спойлер" in html and "&amp;" in html and "&lt;b&gt;" in html
     assert "tg-spoiler" not in _ai_to_html("<tg-spoiler>оборвано")
     assert _strip_spoiler("<tg-spoiler>x</tg-spoiler>") == "x"
 
