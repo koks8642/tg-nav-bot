@@ -617,10 +617,11 @@ class BotApp:
                     "Сначала выбери персонажа: /ai persona <ключ>")
                 return
             try:
-                reply, model_used = await self.ai.llm.generate_with_model(
+                reply, model_used = await self.ai._generate_reply(
                     self.ai.system_for(persona),
                     f"Сообщение от тестера: {text}\n"
-                    "Ответь ОДНИМ сообщением в своём характере.")
+                    "Ответь ОДНИМ сообщением в своём характере.",
+                    max_tokens=220)
                 await update.message.reply_text(
                     _ai_to_html(f"{reply}\n\nМодель: {model_used}"),
                     parse_mode=ParseMode.HTML)

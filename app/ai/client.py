@@ -204,9 +204,13 @@ def parse_json_block(raw: str) -> dict | None:
 
 
 def _add_reasoning_options(payload: dict, model: str) -> None:
-    if "gpt-oss" not in model.lower():
+    model_key = model.lower()
+    if "gpt-oss" in model_key:
+        payload["reasoning_effort"] = "low"
+        payload["reasoning_format"] = "hidden"
         return
-    payload["reasoning_effort"] = "low"
+    if "qwen" not in model_key and "deepseek" not in model_key:
+        return
     payload["reasoning_format"] = "hidden"
 
 

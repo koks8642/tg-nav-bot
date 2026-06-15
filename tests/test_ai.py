@@ -14,7 +14,7 @@ from app.ai.decision import (
     SKIP,
     decide,
 )
-from app.ai.engine import AiEngine, _has_bad_latin
+from app.ai.engine import AiEngine, _has_bad_latin, _has_thinking, _strip_thinking
 from app.ai.client import parse_json_block
 from app.ai.personas import Lexicon, Persona, load_lexicon, load_lore, load_personas
 from app.ai.queue import FairQueue, Job
@@ -182,9 +182,12 @@ class FakeAiClient:
 
     async def generate(self, system, user, **kw):
         self.generate_calls += 1
-        if isinstance(self.generate_result, Exception):
-            raise self.generate_result
-        return self.generate_result
+        result = self.generate_result
+        if isinstance(result, list):
+            result = result[min(self.generate_calls - 1, len(result) - 1)]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 async def make_engine(tmp_path, llm, persona=None):
@@ -395,6 +398,56 @@ def test_engine_run_job_uses_direct_fallback_on_rate_limit(tmp_path):
     asyncio.run(go())
 
 
+def test_engine_run_job_strips_closed_thinking(tmp_path):
+    async def go():
+        gem = FakeAiClient(generate_result="<think>служебка</think>Ты пожалеешь.")
+        eng = await make_engine(tmp_path, gem)
+        sent = []
+
+        async def send(chat_id, reply_to, text):
+            sent.append((chat_id, reply_to, text))
+            return 555
+        eng.send_callback = send
+        await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
+                               username="вася", text="Ютия привет",
+                               priority=DIRECT, mode="casual", enqueued_at=0.0))
+        assert sent and sent[0][2] == "Ты пожалеешь.\n\nМодель: test"
+        assert gem.generate_calls == 1
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_regenerates_unclosed_thinking(tmp_path):
+    async def go():
+        gem = FakeAiClient(generate_result=[
+            "<think>надо объяснить правила и тон",
+            "Смотри на меня, когда задаёшь такие вопросы.",
+        ])
+        eng = await make_engine(tmp_path, gem)
+        reply, model = await eng._generate_reply("system", "prompt",
+                                                 max_tokens=120)
+        assert reply == "Смотри на меня, когда задаёшь такие вопросы."
+        assert model == "test"
+        assert gem.generate_calls == 2
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_regenerates_bad_latin(tmp_path):
+    async def go():
+        gem = FakeAiClient(generate_result=[
+            "Ты слишком confident для такого тона.",
+            "Ты слишком смелый для такого тона.",
+        ])
+        eng = await make_engine(tmp_path, gem)
+        reply, _ = await eng._generate_reply("system", "prompt",
+                                             max_tokens=120)
+        assert reply == "Ты слишком смелый для такого тона."
+        assert gem.generate_calls == 2
+        await eng.store.close()
+    asyncio.run(go())
+
+
 def test_engine_run_job_silent_on_plot_rate_limit(tmp_path):
     async def go():
         from app.ai.client import RateLimited
@@ -434,3 +487,10 @@ def test_parse_json_block():
 def test_latin_filter_allows_abbreviations_but_catches_english():
     assert _has_bad_latin("Да, RPG тут уместно, RQM знает.") is False
     assert _has_bad_latin("Ты слишком confident для живого трупа.") is True
+
+
+def test_thinking_filter_strips_model_reasoning():
+    assert _has_thinking("<think>думаю</think>Ответ") is True
+    assert _strip_thinking("<think>думаю</think>Ответ") == "Ответ"
+    assert _strip_thinking("<think>думаю без конца") == ""
+    assert _strip_thinking("</think>\nФинальный ответ: Ответ") == "Ответ"

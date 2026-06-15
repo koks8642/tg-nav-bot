@@ -45,6 +45,10 @@ LATIN_ALLOWED = {
     "ai", "api", "bot", "dlc", "epub", "fb2", "html", "json", "pdf", "rpg",
     "rqm", "sqlite", "txt", "url",
 }
+THINK_BLOCK_RE = re.compile(
+    r"<\s*think(?:\s+[^>]*)?>.*?<\s*/\s*think\s*>", re.I | re.S)
+THINK_OPEN_RE = re.compile(r"<\s*think(?:\s+[^>]*)?>", re.I)
+THINK_CLOSE_RE = re.compile(r"<\s*/\s*think\s*>", re.I)
 
 CLASSIFIER_SYSTEM = """\
 Ты — фильтр чат-бота, отыгрывающего персонажа {name} из новеллы «Стал
@@ -288,17 +292,26 @@ class AiEngine:
                               max_tokens: int) -> tuple[str, str]:
         reply, model = await _generate_with_model(
             self.llm, system, prompt, max_tokens=max_tokens)
-        if not _has_bad_latin(reply):
+        reply = _strip_thinking(reply)
+        if reply and not _has_bad_latin(reply):
             return reply, model
-        fix = (
-            prompt
-            + "\n\nТвой предыдущий вариант содержал английские слова, что ломает "
-              "образ. Перепиши ответ полностью по-русски. Не используй английские "
-              "слова, латиницу, roleplay-команды и служебные объяснения. "
-              f"Плохой вариант: {reply[:400]}"
+        fix_reason = (
+            "Твой предыдущий вариант содержал служебные рассуждения/`<think>` "
+            "или оказался пустым после очистки."
+            if not reply else
+            "Твой предыдущий вариант содержал английские слова, что ломает образ."
         )
-        return await _generate_with_model(
+        fix = (prompt + "\n\n" + fix_reason + " Перепиши ответ: только финальная "
+               "реплика персонажа, 1-2 коротких предложения, строго по-русски. "
+               "Не используй английские слова, латиницу, roleplay-команды, "
+               "`<think>` и служебные объяснения. "
+               f"Плохой вариант: {reply[:400]}")
+        reply, model = await _generate_with_model(
             self.llm, system, fix, max_tokens=max_tokens)
+        reply = _strip_thinking(reply)
+        if not reply or _has_bad_latin(reply):
+            raise EmptyResponse("empty or invalid response after cleanup")
+        return reply, model
 
     async def record_bot_message(self, chat_id, msg_id, text, reply_to,
                                  persona_key) -> None:
@@ -386,7 +399,7 @@ def _fmt(rows: list[dict]) -> str:
 
 def _clean(reply: str) -> str:
     """Trim the reply and drop a leading 'Имя:' the model sometimes adds."""
-    reply = reply.strip()
+    reply = _strip_thinking(reply)
     head, sep, tail = reply.partition(":")
     if sep and len(head) <= 20 and head.istitle() and "\n" not in head:
         reply = tail.strip() or reply
@@ -400,6 +413,21 @@ def _has_bad_latin(reply: str) -> bool:
         if word.lower() not in LATIN_ALLOWED:
             return True
     return False
+
+
+def _has_thinking(reply: str) -> bool:
+    return bool(THINK_OPEN_RE.search(reply) or THINK_CLOSE_RE.search(reply))
+
+
+def _strip_thinking(reply: str) -> str:
+    reply = THINK_BLOCK_RE.sub("", reply or "")
+    open_match = THINK_OPEN_RE.search(reply)
+    if open_match:
+        reply = reply[:open_match.start()]
+    reply = THINK_CLOSE_RE.sub("", reply)
+    reply = re.sub(r"(?im)^\s*(?:итоговый|финальный)?\s*ответ\s*:\s*", "",
+                   reply)
+    return reply.strip()
 
 
 async def _generate_with_model(llm, system: str, prompt: str,
