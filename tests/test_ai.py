@@ -375,16 +375,41 @@ def test_engine_run_job_sends_and_records(tmp_path):
     asyncio.run(go())
 
 
-def test_engine_run_job_silent_on_rate_limit(tmp_path):
+def test_engine_run_job_uses_direct_fallback_on_rate_limit(tmp_path):
     async def go():
         from app.ai.client import RateLimited
         gem = FakeAiClient(generate_result=RateLimited("x"))
         eng = await make_engine(tmp_path, gem)
         sent = []
-        eng.send_callback = lambda *a: sent.append(a)
+
+        async def send(*args):
+            sent.append(args)
+            return 777
+
+        eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="t", priority=DIRECT,
                                mode="casual", enqueued_at=0.0))
+        assert sent and sent[0][2] == "Считай свои вдохи."
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_run_job_silent_on_plot_rate_limit(tmp_path):
+    async def go():
+        from app.ai.client import RateLimited
+        gem = FakeAiClient(generate_result=RateLimited("x"))
+        eng = await make_engine(tmp_path, gem)
+        sent = []
+
+        async def send(*args):
+            sent.append(args)
+            return 777
+
+        eng.send_callback = send
+        await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
+                               username="u", text="что было в главе",
+                               priority=DIRECT, mode="plot", enqueued_at=0.0))
         assert sent == []
         await eng.store.close()
     asyncio.run(go())

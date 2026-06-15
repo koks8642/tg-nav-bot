@@ -28,13 +28,14 @@ log = logging.getLogger("ai.engine")
 
 # defaults; all overridable at runtime via the settings table (/ai set …)
 DEFAULTS = {
-    "cooldown_sec": 5.0,        # base global pace between answers
-    "cooldown_jitter_sec": 3.0,  # ± jitter on the pace (natural, not instant)
-    "user_cooldown_sec": 5.0,   # min seconds between answers to the same user
+    "cooldown_sec": 25.0,       # base global pace between answers
+    "cooldown_jitter_sec": 8.0,  # ± jitter on the pace (natural, not instant)
+    "user_cooldown_sec": 12.0,  # min seconds between answers to the same user
     "butt_in_pct": 2.5,         # % chance to butt into an off-topic message
-    "context_messages": 50,     # general chat context shown to the persona
-    "thread_depth": 20,         # per-user conversation depth (own dialog/mood)
+    "context_messages": 30,     # general chat context shown to the persona
+    "thread_depth": 12,         # per-user conversation depth (own dialog/mood)
     "dup_limit": 5,             # identical msgs/min from one user before ignore
+    "rate_limit_cooldown_sec": 70.0,  # fallback pause after a provider 429
 }
 DUP_WINDOW_SEC = 60.0
 
@@ -70,6 +71,7 @@ class AiEngine:
         self._worker: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_answer_ts = 0.0
+        self._rate_limited_until = 0.0
         self._user_last_answer: dict[int, float] = {}
         self._dups: dict[tuple[int, int, str], list[float]] = defaultdict(list)
 
@@ -100,9 +102,9 @@ class AiEngine:
         key = await self.store.get("active_persona")
         return self.personas.get(key) if key else None
 
-    def system_for(self, persona: Persona) -> str:
+    def system_for(self, persona: Persona, *, include_lore: bool = True) -> str:
         sp = persona.full_system_prompt()
-        if self.lore:
+        if include_lore and self.lore:
             sp += ("\n\n# СПРАВКА ПО ВСЕЛЕННОЙ (твои знания о мире и других "
                    "персонажах — опирайся на них, говори своим голосом):\n"
                    + self.lore)
@@ -222,6 +224,8 @@ class AiEngine:
         log.info("ai worker stopped")
 
     async def _pace(self) -> None:
+        if time.time() < self._rate_limited_until:
+            await self._sleep(self._rate_limited_until - time.time())
         base = await self.setting("cooldown_sec")
         jitter = await self.setting("cooldown_jitter_sec")
         wait_for = max(0.0, base + random.uniform(-jitter, jitter))
@@ -237,14 +241,25 @@ class AiEngine:
             return
         prompt = await self._build_prompt(persona, job)
         try:
-            reply = await self.llm.generate(self.system_for(persona), prompt)
+            reply = await self.llm.generate(
+                self.system_for(persona, include_lore=job.mode in ("plot", "lore")),
+                prompt,
+                max_tokens=260)
         except EmptyResponse:
             reply = (random.choice(persona.fallback_lines)
                      if persona.fallback_lines and job.priority == DIRECT
                      else None)
-        except RateLimited:
-            log.info("AI API rate-limited; dropping one reply")
-            return
+        except RateLimited as e:
+            fallback = await self.setting("rate_limit_cooldown_sec")
+            delay = max(float(e.retry_after or 0), fallback)
+            self._rate_limited_until = max(self._rate_limited_until,
+                                           time.time() + delay)
+            log.info("AI API rate-limited; pausing replies for %.1fs", delay)
+            reply = (random.choice(persona.fallback_lines)
+                     if persona.fallback_lines
+                     and job.priority == DIRECT
+                     and job.mode in ("insult", "casual")
+                     else None)
         except Exception as e:  # noqa: BLE001
             log.warning("generation failed: %s", e)
             return
@@ -305,7 +320,7 @@ class AiEngine:
         if job.mode in ("plot", "lore"):
             found = await self.store.kb_search(job.text, limit=4)
             if found:
-                kb = "\n".join(f"Глава {r['chapter']}: {r['text'][:400]}"
+                kb = "\n".join(f"Глава {r['chapter']}: {r['text'][:260]}"
                                for r in found)
                 parts.append("Выжимки из глав (факты; если пересказываешь "
                              "события — укажи «📖 гл. N»):\n" + kb)
@@ -316,7 +331,7 @@ class AiEngine:
             parts.append(
                 "ТВОИ ПОСЛЕДНИЕ ОТВЕТЫ (категорически НЕ повторяй их приёмы, "
                 "фразы, шутки, смайлики и структуру — ответь СОВЕРШЕННО иначе):\n"
-                + "\n".join(f"— {t[:140]}" for t in my_recent))
+                + "\n".join(f"— {t[:110]}" for t in my_recent))
 
         parts.append(f"Сейчас тебе пишет {speaker}: «{job.text[:800]}»")
         parts.append(
@@ -337,7 +352,7 @@ def _fmt(rows: list[dict]) -> str:
     out = []
     for r in rows:
         who = "ТЫ" if r["is_bot"] else (r["username"] or "кто-то")
-        out.append(f"{who}: {r['text'][:300]}")
+        out.append(f"{who}: {r['text'][:180]}")
     return "\n".join(out)
 
 

@@ -27,6 +27,11 @@ DEFAULT_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
 class RateLimited(Exception):
     """The API rejected the request because of rate limits."""
 
+    def __init__(self, message: str = "rate limit",
+                 retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 class EmptyResponse(Exception):
     """The model returned an empty response."""
@@ -77,8 +82,10 @@ class AiApiClient:
                              json=payload) as resp:
             data = await resp.json(content_type=None)
             status = resp.status
+            resp_headers = dict(resp.headers)
         if status == 429:
-            raise RateLimited("rate limit")
+            raise RateLimited("rate limit",
+                              retry_after=_retry_after(resp_headers, data))
         if status in (401, 403):
             msg = (data or {}).get("error", {}).get("message", "auth failed")
             raise RuntimeError(f"AI API auth failed: {msg[:200]}")
@@ -115,8 +122,8 @@ class AiApiClient:
         for attempt in range(3):
             try:
                 result = await self._chat(payload)
-            except RateLimited:
-                if attempt < 2:
+            except RateLimited as e:
+                if attempt < 2 and (e.retry_after or 0) <= 6:
                     await asyncio.sleep(3.0 * (attempt + 1))
                     continue
                 raise
@@ -163,3 +170,38 @@ def _add_reasoning_options(payload: dict, model: str) -> None:
         return
     payload["reasoning_effort"] = "low"
     payload["reasoning_format"] = "hidden"
+
+
+def _retry_after(headers: dict, data: dict) -> float | None:
+    values = [
+        headers.get("retry-after"),
+        headers.get("Retry-After"),
+        headers.get("x-ratelimit-reset-tokens"),
+        headers.get("x-ratelimit-reset-requests"),
+        ((data or {}).get("error") or {}).get("message"),
+    ]
+    delays = [_parse_delay(v) for v in values if v]
+    delays = [d for d in delays if d is not None]
+    return max(delays) if delays else None
+
+
+def _parse_delay(raw) -> float | None:
+    text = str(raw).strip().lower()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    total = 0.0
+    found = False
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)", text):
+        found = True
+        n = float(value)
+        if unit == "ms":
+            total += n / 1000.0
+        elif unit == "s":
+            total += n
+        elif unit == "m":
+            total += n * 60.0
+        elif unit == "h":
+            total += n * 3600.0
+    return total if found else None
