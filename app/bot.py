@@ -525,7 +525,7 @@ class BotApp:
         store = self.ai.store
         cmd = args[0].lower() if args else ""
         # config / moderation commands stay admin-only; the rest are open
-        if cmd in ("set", "ban", "unban") and \
+        if cmd in ("set", "ban", "unban", "model") and \
                 not await self.is_admin(update.effective_user.id):
             await update.message.reply_text(
                 "Эта команда только для админов чата.")
@@ -568,6 +568,26 @@ class BotApp:
                 return
             await store.set(key, val)
             await update.message.reply_text(f"{key} = {val}")
+        elif cmd == "model":
+            from .ai.client import POWERFUL_MODELS
+            if len(args) < 2:
+                current = ", ".join(self.ai.llm.model_cascade)
+                lines = ["Текущая модель/каскад: " + current,
+                         "", "Доступные мощные модели:"]
+                lines.extend(f"• {m}" for m in POWERFUL_MODELS)
+                await update.message.reply_text("\n".join(lines))
+                return
+            picked = self._resolve_ai_model(" ".join(args[1:]), POWERFUL_MODELS)
+            if picked is None:
+                await update.message.reply_text(
+                    "Не знаю такую модель. Напиши /ai model без аргументов.")
+                return
+            cascade = (picked,) + tuple(m for m in POWERFUL_MODELS if m != picked)
+            self.ai.llm.set_models(picked, cascade)
+            await store.set("ai_model", picked)
+            await store.set("ai_model_cascade", ",".join(cascade))
+            await update.message.reply_text(
+                "Модель переключена:\n" + "\n".join(cascade))
         elif cmd == "ban" and len(args) >= 2:
             try:
                 uid = int(args[1])
@@ -597,18 +617,19 @@ class BotApp:
                     "Сначала выбери персонажа: /ai persona <ключ>")
                 return
             try:
-                reply = await self.ai.llm.generate(
+                reply, model_used = await self.ai.llm.generate_with_model(
                     self.ai.system_for(persona),
                     f"Сообщение от тестера: {text}\n"
                     "Ответь ОДНИМ сообщением в своём характере.")
                 await update.message.reply_text(
-                    _ai_to_html(reply), parse_mode=ParseMode.HTML)
+                    _ai_to_html(f"{reply}\n\nМодель: {model_used}"),
+                    parse_mode=ParseMode.HTML)
             except Exception as e:  # noqa: BLE001
                 await update.message.reply_text(f"Не вышло: {self._redact(e)}")
         else:
             await update.message.reply_text(
                 "Команды: /ai · /ai persona <ключ|off> · /ai set <параметр> "
-                "<число> · /ai ban <id> [часов] · /ai unban <id> · "
+                "<число> · /ai model [модель] · /ai ban <id> [часов] · /ai unban <id> · "
                 "/ai test <текст>\nВ группе: /ai_on, /ai_off")
 
     def _resolve_persona(self, query: str):
@@ -621,6 +642,15 @@ class BotApp:
             if any(q == a.lower() for a in cand.aliases):
                 return cand
         return None
+
+    def _resolve_ai_model(self, query: str, models: tuple[str, ...]):
+        q = query.strip().lower()
+        for model in models:
+            low = model.lower()
+            if q == low or q == low.rsplit("/", 1)[-1]:
+                return model
+        matches = [m for m in models if q in m.lower()]
+        return matches[0] if len(matches) == 1 else None
 
     async def _ai_status_text(self) -> str:
         from .ai.engine import DEFAULTS

@@ -28,6 +28,26 @@ def test_seed_default_registry_can_be_disabled(monkeypatch):
     assert cfg.seed_default_registry is False
 
 
+def test_ai_model_cascade_defaults_to_primary_plus_fast_fallback(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "x")
+    monkeypatch.delenv("AI_MODEL_CASCADE", raising=False)
+    monkeypatch.delenv("GROQ_MODEL_CASCADE", raising=False)
+    cfg = load_config(require_bot=False)
+    assert cfg.ai_model_cascade == (
+        "llama-3.3-70b-versatile",
+        "qwen/qwen3-32b",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "openai/gpt-oss-120b",
+    )
+
+
+def test_ai_model_cascade_can_be_overridden(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "x")
+    monkeypatch.setenv("AI_MODEL_CASCADE", "a,b")
+    cfg = load_config(require_bot=False)
+    assert cfg.ai_model_cascade == ("a", "b")
+
+
 def test_invalid_channel_id_blocks_bot_start(monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "x")
     monkeypatch.setenv("CHANNEL_CHAT_ID", "")

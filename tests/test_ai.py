@@ -14,7 +14,7 @@ from app.ai.decision import (
     SKIP,
     decide,
 )
-from app.ai.engine import AiEngine
+from app.ai.engine import AiEngine, _has_bad_latin
 from app.ai.client import parse_json_block
 from app.ai.personas import Lexicon, Persona, load_lexicon, load_lore, load_personas
 from app.ai.queue import FairQueue, Job
@@ -367,7 +367,7 @@ def test_engine_run_job_sends_and_records(tmp_path):
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="вася", text="Алон хуесос",
                                priority=DIRECT, mode="insult", enqueued_at=0.0))
-        assert sent and sent[0][2] == "Ты пожалеешь, милый."
+        assert sent and sent[0][2] == "Ты пожалеешь, милый.\n\nМодель: test"
         # the bot's own reply is remembered for context
         recent = await eng.store.recent(-100500)
         assert recent[-1]["is_bot"] == 1
@@ -390,7 +390,7 @@ def test_engine_run_job_uses_direct_fallback_on_rate_limit(tmp_path):
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="t", priority=DIRECT,
                                mode="casual", enqueued_at=0.0))
-        assert sent and sent[0][2] == "Считай свои вдохи."
+        assert sent and sent[0][2] == "Считай свои вдохи.\n\nМодель: fallback"
         await eng.store.close()
     asyncio.run(go())
 
@@ -429,3 +429,8 @@ def test_parse_json_block():
     assert parse_json_block("```json\n{\"a\":1}\n```") == {"a": 1}
     assert parse_json_block("nope") is None
     assert json.loads("{}") == {}
+
+
+def test_latin_filter_allows_abbreviations_but_catches_english():
+    assert _has_bad_latin("Да, RPG тут уместно, RQM знает.") is False
+    assert _has_bad_latin("Ты слишком confident для живого трупа.") is True

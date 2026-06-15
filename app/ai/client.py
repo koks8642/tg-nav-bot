@@ -22,6 +22,12 @@ CHAT_COMPLETIONS_API = "".join((
 ))
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
+POWERFUL_MODELS = (
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "openai/gpt-oss-120b",
+)
 
 
 class RateLimited(Exception):
@@ -44,15 +50,28 @@ class AiApiClient:
         store,
         *,
         model: str = DEFAULT_MODEL,
+        model_cascade: tuple[str, ...] | list[str] | None = None,
         classifier_model: str = DEFAULT_CLASSIFIER_MODEL,
         timeout_sec: int = 45,
     ):
         self.api_key = api_key.strip()
         self.store = store
         self.model = model.strip() or DEFAULT_MODEL
+        self.model_cascade = tuple(
+            m.strip() for m in (model_cascade or (self.model,))
+            if m and m.strip())
+        if not self.model_cascade:
+            self.model_cascade = (self.model,)
         self.classifier_model = classifier_model.strip() or self.model
         self._timeout = aiohttp.ClientTimeout(total=timeout_sec)
         self._session: aiohttp.ClientSession | None = None
+
+    def set_models(self, model: str,
+                   cascade: tuple[str, ...] | list[str] | None = None) -> None:
+        self.model = model.strip() or DEFAULT_MODEL
+        models = tuple(m.strip() for m in (cascade or (self.model,))
+                       if m and m.strip())
+        self.model_cascade = models or (self.model,)
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -69,8 +88,10 @@ class AiApiClient:
         Exact remaining limits are account/model specific, so we show local
         successful requests for today and rely on API backoff for live limits.
         """
-        used = await self.store.usage_today(self.model)
-        return f"{used} запросов сегодня; точный остаток смотри в Groq Limits"
+        usage = []
+        for model in self.model_cascade:
+            usage.append(f"{model}: {await self.store.usage_today(model)}")
+        return "; ".join(usage) + "; точный остаток смотри в Groq Limits"
 
     async def _chat(self, payload: dict) -> str:
         sess = await self.session()
@@ -109,27 +130,44 @@ class AiApiClient:
         temperature: float = 1.0,
         max_tokens: int = 400,
     ) -> str:
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": temperature,
-            "max_completion_tokens": max_tokens,
-        }
-        _add_reasoning_options(payload, self.model)
+        text, _model = await self.generate_with_model(
+            system, user, temperature=temperature, max_tokens=max_tokens)
+        return text
+
+    async def generate_with_model(
+        self,
+        system: str,
+        user: str,
+        *,
+        temperature: float = 1.0,
+        max_tokens: int = 400,
+    ) -> tuple[str, str]:
+        last_limit: RateLimited | None = None
         for attempt in range(3):
-            try:
-                result = await self._chat(payload)
-            except RateLimited as e:
-                if attempt < 2 and (e.retry_after or 0) <= 6:
-                    await asyncio.sleep(3.0 * (attempt + 1))
+            for model in self.model_cascade:
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "temperature": temperature,
+                    "max_completion_tokens": max_tokens,
+                }
+                _add_reasoning_options(payload, model)
+                try:
+                    result = await self._chat(payload)
+                except RateLimited as e:
+                    last_limit = e
+                    log.info("AI model %s rate-limited; trying fallback", model)
                     continue
-                raise
-            await self.store.usage_bump(self.model)
-            return result
-        raise RateLimited("rate limit")
+                await self.store.usage_bump(model)
+                return result, model
+            if last_limit and attempt < 2 and (last_limit.retry_after or 0) <= 6:
+                await asyncio.sleep(3.0 * (attempt + 1))
+                continue
+            break
+        raise last_limit or RateLimited("rate limit")
 
     async def classify(self, system: str, user: str) -> dict | None:
         payload = {

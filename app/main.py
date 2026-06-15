@@ -126,19 +126,27 @@ async def run() -> None:
         redactor.add_secret(cfg.ai_api_key)
         ai_store = AiStore(cfg.ai_db_path)
         await ai_store.connect()
+        stored_model = await ai_store.get("ai_model")
+        stored_cascade = await ai_store.get("ai_model_cascade")
+        model_cascade = tuple(
+            m.strip() for m in (stored_cascade or "").split(",") if m.strip()
+        ) or cfg.ai_model_cascade
+        model = stored_model or (model_cascade[0] if model_cascade else cfg.ai_model)
         personas = load_personas(cfg.ai_personas_dir)
         lexicon = load_lexicon(cfg.ai_personas_dir)
         lore = load_lore(cfg.ai_personas_dir)
         llm = AiApiClient(
             cfg.ai_api_key,
             ai_store,
-            model=cfg.ai_model,
+            model=model,
+            model_cascade=model_cascade,
             classifier_model=cfg.ai_classifier_model,
         )
         ai_engine = AiEngine(ai_store, llm, personas, lexicon, lore)
         log.info("AI persona chat ready: %d personas, %d lexicon entities, "
-                 "lore %d chars, model %s", len(personas),
-                 len(lexicon.entities), len(lore), cfg.ai_model)
+                 "lore %d chars, models %s", len(personas),
+                 len(lexicon.entities), len(lore),
+                 ",".join(model_cascade))
 
     bot_app = BotApp(db, cfg, telegraph=tg, ai_engine=ai_engine)
     application = bot_app.build()

@@ -59,6 +59,12 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name, "")
+    values = tuple(v.strip() for v in raw.split(",") if v.strip())
+    return values or default
+
+
 @dataclass(frozen=True)
 class Config:
     bot_token: str
@@ -81,6 +87,7 @@ class Config:
     # AI persona chat (group roleplay) settings
     ai_api_key: str
     ai_model: str
+    ai_model_cascade: tuple[str, ...]
     ai_classifier_model: str
     ai_db_path: Path
     ai_personas_dir: Path
@@ -162,6 +169,17 @@ def load_config(*, require_bot: bool = True) -> Config:
             or os.environ.get("GROQ_MODEL")
             or "llama-3.3-70b-versatile"
         ).strip(),
+        ai_model_cascade=_env_list(
+            "AI_MODEL_CASCADE",
+            _env_list("GROQ_MODEL_CASCADE", (
+                (os.environ.get("AI_MODEL")
+                 or os.environ.get("GROQ_MODEL")
+                 or "llama-3.3-70b-versatile").strip(),
+                "qwen/qwen3-32b",
+                "meta-llama/llama-4-scout-17b-16e-instruct",
+                "openai/gpt-oss-120b",
+            )),
+        ),
         ai_classifier_model=(
             os.environ.get("AI_CLASSIFIER_MODEL")
             or os.environ.get("GROQ_CLASSIFIER_MODEL")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from collections import defaultdict
 
@@ -28,16 +29,22 @@ log = logging.getLogger("ai.engine")
 
 # defaults; all overridable at runtime via the settings table (/ai set …)
 DEFAULTS = {
-    "cooldown_sec": 25.0,       # base global pace between answers
-    "cooldown_jitter_sec": 8.0,  # ± jitter on the pace (natural, not instant)
-    "user_cooldown_sec": 12.0,  # min seconds between answers to the same user
+    "cooldown_sec": 8.0,        # base global pace between answers
+    "cooldown_jitter_sec": 3.0,  # ± jitter on the pace (natural, not instant)
+    "user_cooldown_sec": 4.0,   # min seconds between answers to the same user
     "butt_in_pct": 2.5,         # % chance to butt into an off-topic message
     "context_messages": 30,     # general chat context shown to the persona
     "thread_depth": 12,         # per-user conversation depth (own dialog/mood)
     "dup_limit": 5,             # identical msgs/min from one user before ignore
-    "rate_limit_cooldown_sec": 70.0,  # fallback pause after a provider 429
+    "rate_limit_cooldown_sec": 25.0,  # fallback pause after a provider 429
+    "max_rate_limit_cooldown_sec": 90.0,  # never freeze the avatar for hours
 }
 DUP_WINDOW_SEC = 60.0
+LATIN_RETRY_RE = re.compile(r"\b[A-Za-z]{3,}\b")
+LATIN_ALLOWED = {
+    "ai", "api", "bot", "dlc", "epub", "fb2", "html", "json", "pdf", "rpg",
+    "rqm", "sqlite", "txt", "url",
+}
 
 CLASSIFIER_SYSTEM = """\
 Ты — фильтр чат-бота, отыгрывающего персонажа {name} из новеллы «Стал
@@ -240,18 +247,19 @@ class AiEngine:
         if persona is None:
             return
         prompt = await self._build_prompt(persona, job)
+        system = self.system_for(persona, include_lore=job.mode in ("plot", "lore"))
         try:
-            reply = await self.llm.generate(
-                self.system_for(persona, include_lore=job.mode in ("plot", "lore")),
-                prompt,
-                max_tokens=260)
+            reply, model_used = await self._generate_reply(
+                system, prompt, max_tokens=220)
         except EmptyResponse:
             reply = (random.choice(persona.fallback_lines)
                      if persona.fallback_lines and job.priority == DIRECT
                      else None)
+            model_used = "fallback"
         except RateLimited as e:
             fallback = await self.setting("rate_limit_cooldown_sec")
-            delay = max(float(e.retry_after or 0), fallback)
+            cap = await self.setting("max_rate_limit_cooldown_sec")
+            delay = min(max(float(e.retry_after or 0), fallback), cap)
             self._rate_limited_until = max(self._rate_limited_until,
                                            time.time() + delay)
             log.info("AI API rate-limited; pausing replies for %.1fs", delay)
@@ -260,12 +268,14 @@ class AiEngine:
                      and job.priority == DIRECT
                      and job.mode in ("insult", "casual")
                      else None)
+            model_used = "fallback"
         except Exception as e:  # noqa: BLE001
             log.warning("generation failed: %s", e)
             return
         if not reply:
             return
         reply = _clean(reply)
+        reply = f"{reply}\n\nМодель: {model_used}"
         sent_id = await self.send_callback(job.chat_id, job.reply_to, reply)
         self._last_answer_ts = time.time()
         if job.user_id is not None:
@@ -273,6 +283,22 @@ class AiEngine:
         if sent_id:
             await self.record_bot_message(job.chat_id, sent_id, reply,
                                           job.reply_to, persona.key)
+
+    async def _generate_reply(self, system: str, prompt: str,
+                              max_tokens: int) -> tuple[str, str]:
+        reply, model = await _generate_with_model(
+            self.llm, system, prompt, max_tokens=max_tokens)
+        if not _has_bad_latin(reply):
+            return reply, model
+        fix = (
+            prompt
+            + "\n\nТвой предыдущий вариант содержал английские слова, что ломает "
+              "образ. Перепиши ответ полностью по-русски. Не используй английские "
+              "слова, латиницу, roleplay-команды и служебные объяснения. "
+              f"Плохой вариант: {reply[:400]}"
+        )
+        return await _generate_with_model(
+            self.llm, system, fix, max_tokens=max_tokens)
 
     async def record_bot_message(self, chat_id, msg_id, text, reply_to,
                                  persona_key) -> None:
@@ -338,7 +364,9 @@ class AiEngine:
             f"Ответь {speaker} по сути его сообщения — живо, дерзко и в своём "
             f"характере, можно мат. Обращайся к нему по имени и не путай с "
             f"другими. КАЖДЫЙ твой ответ уникален: не копируй свои прошлые "
-            f"реплики, приёмы, присказки и смайлики, не зацикливайся.")
+            f"реплики, приёмы, присказки и смайлики, не зацикливайся. "
+            f"Пиши СТРОГО ПО-РУССКИ: никаких английских слов и латиницы, если "
+            f"это не каноническое имя/аббревиатура из контекста.")
         return "\n\n".join(parts)
 
     async def _sleep(self, seconds: float) -> None:
@@ -365,3 +393,17 @@ def _clean(reply: str) -> str:
     if len(reply) > 900:
         reply = reply[:900].rsplit(" ", 1)[0] + "…"
     return reply
+
+
+def _has_bad_latin(reply: str) -> bool:
+    for word in LATIN_RETRY_RE.findall(reply):
+        if word.lower() not in LATIN_ALLOWED:
+            return True
+    return False
+
+
+async def _generate_with_model(llm, system: str, prompt: str,
+                               max_tokens: int) -> tuple[str, str]:
+    if hasattr(llm, "generate_with_model"):
+        return await llm.generate_with_model(system, prompt, max_tokens=max_tokens)
+    return await llm.generate(system, prompt, max_tokens=max_tokens), "test"
