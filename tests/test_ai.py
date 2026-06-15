@@ -15,7 +15,7 @@ from app.ai.decision import (
     decide,
 )
 from app.ai.engine import AiEngine
-from app.ai.gemini import parse_json_block
+from app.ai.client import parse_json_block
 from app.ai.personas import Lexicon, Persona, load_lexicon, load_lore, load_personas
 from app.ai.queue import FairQueue, Job
 from app.ai.store import AiStore
@@ -166,15 +166,15 @@ def make_persona(**over) -> Persona:
     return Persona(**base)
 
 
-class FakeGemini:
+class FakeAiClient:
     def __init__(self, classify_result=None, generate_result="ответ"):
         self.classify_result = classify_result
         self.generate_result = generate_result
         self.generate_calls = 0
         self.classify_calls = 0
 
-    async def generation_budget_left(self):
-        return 1000
+    async def usage_status(self):
+        return "0 запросов сегодня"
 
     async def classify(self, system, user):
         self.classify_calls += 1
@@ -187,11 +187,11 @@ class FakeGemini:
         return self.generate_result
 
 
-async def make_engine(tmp_path, gemini, persona=None):
+async def make_engine(tmp_path, llm, persona=None):
     store = AiStore(tmp_path / "ai.db")
     await store.connect()
     persona = persona or make_persona()
-    eng = AiEngine(store, gemini, {persona.key: persona}, make_lexicon(),
+    eng = AiEngine(store, llm, {persona.key: persona}, make_lexicon(),
                    lore="БИБЛИЯ.")
     eng.set_bot_identity("rqm_bot", 42)
     await store.set("active_persona", persona.key)
@@ -208,7 +208,7 @@ def kw(**over):
 
 def test_engine_records_every_message(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         await eng.on_group_message(**kw(text="просто болтаю ни о чём"))
         recent = await eng.store.recent(-100500)
         assert len(recent) == 1
@@ -218,7 +218,7 @@ def test_engine_records_every_message(tmp_path):
 
 def test_engine_enqueues_direct_on_name(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         await eng.on_group_message(**kw(text="Ютия ты где"))
         assert len(eng._queue) == 1
         job = eng._queue.pop(0.0)
@@ -229,7 +229,7 @@ def test_engine_enqueues_direct_on_name(tmp_path):
 
 def test_engine_enqueues_on_reply_to_bot(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         await eng.on_group_message(**kw(text="ну и?", reply_to=99,
                                         reply_to_is_bot=True))
         assert len(eng._queue) == 1 and eng._queue.pop(0.0).priority == DIRECT
@@ -239,7 +239,7 @@ def test_engine_enqueues_on_reply_to_bot(tmp_path):
 
 def test_engine_entity_asks_classifier_yes(tmp_path):
     async def go():
-        gem = FakeGemini(classify_result={"respond": True, "mode": "insult"})
+        gem = FakeAiClient(classify_result={"respond": True, "mode": "insult"})
         eng = await make_engine(tmp_path, gem)
         await eng.on_group_message(**kw(text="Алон конченый"))
         assert gem.classify_calls == 1 and len(eng._queue) == 1
@@ -249,7 +249,7 @@ def test_engine_entity_asks_classifier_yes(tmp_path):
 
 def test_engine_entity_classifier_no_skips(tmp_path):
     async def go():
-        gem = FakeGemini(classify_result={"respond": False})
+        gem = FakeAiClient(classify_result={"respond": False})
         eng = await make_engine(tmp_path, gem)
         await eng.on_group_message(**kw(text="читаю эту главу сейчас"))
         assert gem.classify_calls == 1 and len(eng._queue) == 0
@@ -259,7 +259,7 @@ def test_engine_entity_classifier_no_skips(tmp_path):
 
 def test_engine_no_persona_no_enqueue(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         await eng.store.set("active_persona", "")
         await eng.on_group_message(**kw())
         assert len(eng._queue) == 0
@@ -269,7 +269,7 @@ def test_engine_no_persona_no_enqueue(tmp_path):
 
 def test_engine_disabled_chat_no_enqueue(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         await eng.store.set_enabled_chats(set())
         await eng.on_group_message(**kw())
         assert len(eng._queue) == 0
@@ -279,7 +279,7 @@ def test_engine_disabled_chat_no_enqueue(tmp_path):
 
 def test_engine_ignored_user_no_enqueue_but_recorded(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         await eng.store.ignore(7, hours=24, reason="t")
         await eng.on_group_message(**kw())
         assert len(eng._queue) == 0
@@ -290,7 +290,7 @@ def test_engine_ignored_user_no_enqueue_but_recorded(tmp_path):
 
 def test_engine_dup_spam_ignored(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         await eng.store.set("dup_limit", "5")
         for i in range(5):
             await eng.on_group_message(**kw(msg_id=i, text="Ютия спам"))
@@ -305,7 +305,7 @@ def test_engine_dup_spam_ignored(tmp_path):
 
 def test_engine_user_cooldown_blocks_second(tmp_path):
     async def go():
-        eng = await make_engine(tmp_path, FakeGemini())
+        eng = await make_engine(tmp_path, FakeAiClient())
         import time as _t
         eng._user_last_answer[7] = _t.time()  # just answered this user
         await eng.on_group_message(**kw(text="Ютия снова"))
@@ -356,7 +356,7 @@ def test_store_context_reset_scopes_recent(tmp_path):
 
 def test_engine_run_job_sends_and_records(tmp_path):
     async def go():
-        gem = FakeGemini(generate_result="Ты пожалеешь, милый.")
+        gem = FakeAiClient(generate_result="Ты пожалеешь, милый.")
         eng = await make_engine(tmp_path, gem)
         sent = []
 
@@ -375,10 +375,10 @@ def test_engine_run_job_sends_and_records(tmp_path):
     asyncio.run(go())
 
 
-def test_engine_run_job_silent_on_quota(tmp_path):
+def test_engine_run_job_silent_on_rate_limit(tmp_path):
     async def go():
-        from app.ai.gemini import QuotaExhausted
-        gem = FakeGemini(generate_result=QuotaExhausted("x"))
+        from app.ai.client import RateLimited
+        gem = FakeAiClient(generate_result=RateLimited("x"))
         eng = await make_engine(tmp_path, gem)
         sent = []
         eng.send_callback = lambda *a: sent.append(a)

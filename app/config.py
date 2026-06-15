@@ -7,7 +7,6 @@ its values are used as defaults (real environment variables always win).
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,13 +79,15 @@ class Config:
     download_job_timeout_sec: int
     rebuild_queue_timeout_sec: int
     # AI persona chat (group roleplay) settings
-    ai_gemini_keys: tuple[str, ...]
+    ai_api_key: str
+    ai_model: str
+    ai_classifier_model: str
     ai_db_path: Path
     ai_personas_dir: Path
 
     @property
     def ai_enabled(self) -> bool:
-        return bool(self.ai_gemini_keys)
+        return bool(self.ai_api_key)
 
     @property
     def channel_internal_id(self) -> str:
@@ -151,10 +152,21 @@ def load_config(*, require_bot: bool = True) -> Config:
         quote_fetch_timeout_sec=_env_int("QUOTE_FETCH_TIMEOUT_SEC", 75),
         download_job_timeout_sec=_env_int("DOWNLOAD_JOB_TIMEOUT_SEC", 1800),
         rebuild_queue_timeout_sec=_env_int("REBUILD_QUEUE_TIMEOUT_SEC", 1200),
-        ai_gemini_keys=tuple(
-            k for k in re.split(r"[,\s]+",
-                                os.environ.get("AI_GEMINI_KEY", "").strip())
-            if k),
+        ai_api_key=(
+            os.environ.get("AI_API_KEY")
+            or os.environ.get("GROQ_API_KEY")
+            or ""
+        ).strip(),
+        ai_model=(
+            os.environ.get("AI_MODEL")
+            or os.environ.get("GROQ_MODEL")
+            or "llama-3.3-70b-versatile"
+        ).strip(),
+        ai_classifier_model=(
+            os.environ.get("AI_CLASSIFIER_MODEL")
+            or os.environ.get("GROQ_CLASSIFIER_MODEL")
+            or "llama-3.1-8b-instant"
+        ).strip(),
         ai_db_path=(db_path.parent / "ai.db"),
         ai_personas_dir=Path(os.environ.get(
             "AI_PERSONAS_DIR", str(PROJECT_ROOT / "personas"))),

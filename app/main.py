@@ -115,26 +115,30 @@ async def run() -> None:
     redactor.add_secret(tg.access_token)
     rebuilder = Rebuilder(db, tg, cfg)
 
-    # AI persona chat (optional): only assembled when a key is configured.
+    # AI persona chat (optional): only assembled when an AI API key is configured.
     ai_engine = None
     if cfg.ai_enabled:
         from .ai.engine import AiEngine
-        from .ai.gemini import GeminiClient
+        from .ai.client import AiApiClient
         from .ai.personas import load_lexicon, load_lore, load_personas
         from .ai.store import AiStore
 
-        for key in cfg.ai_gemini_keys:
-            redactor.add_secret(key)
+        redactor.add_secret(cfg.ai_api_key)
         ai_store = AiStore(cfg.ai_db_path)
         await ai_store.connect()
         personas = load_personas(cfg.ai_personas_dir)
         lexicon = load_lexicon(cfg.ai_personas_dir)
         lore = load_lore(cfg.ai_personas_dir)
-        gemini = GeminiClient(cfg.ai_gemini_keys, ai_store)
-        ai_engine = AiEngine(ai_store, gemini, personas, lexicon, lore)
+        llm = AiApiClient(
+            cfg.ai_api_key,
+            ai_store,
+            model=cfg.ai_model,
+            classifier_model=cfg.ai_classifier_model,
+        )
+        ai_engine = AiEngine(ai_store, llm, personas, lexicon, lore)
         log.info("AI persona chat ready: %d personas, %d lexicon entities, "
-                 "lore %d chars, %d gemini key(s)", len(personas),
-                 len(lexicon.entities), len(lore), len(cfg.ai_gemini_keys))
+                 "lore %d chars, model %s", len(personas),
+                 len(lexicon.entities), len(lore), cfg.ai_model)
 
     bot_app = BotApp(db, cfg, telegraph=tg, ai_engine=ai_engine)
     application = bot_app.build()
@@ -325,7 +329,7 @@ async def run() -> None:
         await tg.close()
         if ai_engine is not None:
             await ai_engine.stop()
-            await ai_engine.gemini.close()
+            await ai_engine.llm.close()
             await ai_engine.store.close()
         await db.close()
 

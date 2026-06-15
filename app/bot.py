@@ -597,7 +597,7 @@ class BotApp:
                     "Сначала выбери персонажа: /ai persona <ключ>")
                 return
             try:
-                reply = await self.ai.gemini.generate(
+                reply = await self.ai.llm.generate(
                     self.ai.system_for(persona),
                     f"Сообщение от тестера: {text}\n"
                     "Ответь ОДНИМ сообщением в своём характере.")
@@ -627,13 +627,13 @@ class BotApp:
         store = self.ai.store
         persona = await self.ai.active_persona()
         chats = await store.enabled_chats()
-        left = await self.ai.gemini.generation_budget_left()
+        usage = await self.ai.llm.usage_status()
         kb = await store.kb_count()
         lines = [
             "🤖 <b>ИИ-персонаж</b>",
             f"Персонаж: <b>{esc(persona.name) if persona else '—'}</b>",
             f"Чаты: {', '.join(map(str, chats)) or '—'}",
-            f"Бюджет генерации на сегодня: {left}",
+            f"AI API: {esc(usage)}",
             f"База знаний: {kb} глав",
             f"Маски: {', '.join(sorted(self.ai.personas))}",
             "",

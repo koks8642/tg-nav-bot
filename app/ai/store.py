@@ -3,7 +3,7 @@
 Tables:
   settings     — key/value (enabled chats, active persona, tunables)
   buffer       — rolling window of recent group messages (chat memory)
-  quota        — per-model request counters per Google reset day
+  quota        — per-model request counters for local usage visibility
   ignores      — shadow-banned users (anti-abuse)
   thread_summary — rolling summaries of long reply threads
   summaries    — chapter knowledge base (+ FTS index when built)
@@ -69,9 +69,8 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def google_reset_day(now: datetime | None = None) -> str:
-    """Gemini free-tier daily quotas reset at midnight US Pacific. Group the
-    counters by that day so the evening reserve survives the UTC rollover."""
+def provider_usage_day(now: datetime | None = None) -> str:
+    """Local daily usage bucket for the admin status screen."""
     now = now or datetime.now(timezone.utc)
     try:  # exact rule when tzdata is available (Linux/Docker: always)
         from zoneinfo import ZoneInfo
@@ -255,24 +254,30 @@ class AiStore:
             (chat_id, root_id, upto_id, summary[:2000]))
         await self.conn.commit()
 
-    # ── quota ─────────────────────────────────────────────────────────────
-    async def quota_used(self, model: str) -> int:
+    # ── provider usage ────────────────────────────────────────────────────
+    async def usage_today(self, model: str) -> int:
         cur = await self.conn.execute(
             "SELECT used FROM quota WHERE day=? AND model=?",
-            (google_reset_day(), model))
+            (provider_usage_day(), model))
         row = await cur.fetchone()
         return row["used"] if row else 0
 
-    async def quota_bump(self, model: str, n: int = 1) -> None:
+    async def usage_bump(self, model: str, n: int = 1) -> None:
         await self.conn.execute(
             "INSERT INTO quota(day,model,used) VALUES(?,?,?) "
             "ON CONFLICT(day,model) DO UPDATE SET used=used+excluded.used",
-            (google_reset_day(), model, n))
+            (provider_usage_day(), model, n))
         await self.conn.execute(
             "DELETE FROM quota WHERE day < ?",
             ((datetime.now(timezone.utc) - timedelta(days=7))
              .strftime("%Y-%m-%d"),))
         await self.conn.commit()
+
+    async def quota_used(self, model: str) -> int:
+        return await self.usage_today(model)
+
+    async def quota_bump(self, model: str, n: int = 1) -> None:
+        await self.usage_bump(model, n)
 
     # ── anti-abuse ────────────────────────────────────────────────────────
     async def is_ignored(self, user_id: int) -> bool:

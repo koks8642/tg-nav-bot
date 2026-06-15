@@ -17,8 +17,7 @@ Telegram/Telegraph/Teletype), Docker, мощности с запасом под 
 - Регион: **Frankfurt / Amsterdam / любой не-РФ**.
 - При регистрации нужна карта (только для верификации, на Always Free не спишут).
 
-**Запасной вариант:** Google Cloud **e2-micro Always Free** (регион us-west1/
-us-central1/us-east1, 1 ГБ RAM) — тоже бесплатно навсегда, шаги почти те же.
+**Запасной вариант:** любой небольшой VPS с Docker и постоянным диском под SQLite.
 
 ---
 

@@ -19,7 +19,7 @@ import time
 from collections import defaultdict
 
 from .decision import ASK, DIRECT, RESPOND, decide
-from .gemini import GeminiClient, QuotaExhausted, RefusedError
+from .client import AiApiClient, EmptyResponse, RateLimited
 from .personas import Lexicon, Persona
 from .queue import FairQueue, Job
 from .store import AiStore
@@ -54,11 +54,11 @@ CLASSIFIER_SYSTEM = """\
 
 
 class AiEngine:
-    def __init__(self, store: AiStore, gemini: GeminiClient,
+    def __init__(self, store: AiStore, llm: AiApiClient,
                  personas: dict[str, Persona], lexicon: Lexicon,
                  lore: str = ""):
         self.store = store
-        self.gemini = gemini
+        self.llm = llm
         self.personas = personas
         self.lexicon = lexicon
         self.lore = lore
@@ -200,7 +200,7 @@ class AiEngine:
         ctx = "\n".join(f"{r['username'] or 'нкто'}: {r['text'][:200]}"
                         for r in recent[:-1])
         user = (f"Контекст:\n{ctx}\n\nНОВОЕ сообщение: {text[:600]}")
-        return await self.gemini.classify(
+        return await self.llm.classify(
             CLASSIFIER_SYSTEM.format(name=persona.name), user)
 
     # ── worker: paced, fair, crash-proof ──────────────────────────────────
@@ -237,13 +237,13 @@ class AiEngine:
             return
         prompt = await self._build_prompt(persona, job)
         try:
-            reply = await self.gemini.generate(self.system_for(persona), prompt)
-        except RefusedError:
+            reply = await self.llm.generate(self.system_for(persona), prompt)
+        except EmptyResponse:
             reply = (random.choice(persona.fallback_lines)
                      if persona.fallback_lines and job.priority == DIRECT
                      else None)
-        except QuotaExhausted:
-            log.info("all keys rate-limited; dropping one reply")
+        except RateLimited:
+            log.info("AI API rate-limited; dropping one reply")
             return
         except Exception as e:  # noqa: BLE001
             log.warning("generation failed: %s", e)
