@@ -141,10 +141,14 @@ class AiApiClient:
         *,
         temperature: float = 1.0,
         max_tokens: int = 400,
+        models: tuple[str, ...] | list[str] | None = None,
     ) -> tuple[str, str]:
         last_limit: RateLimited | None = None
+        cascade = tuple(m.strip() for m in (models or self.model_cascade)
+                        if m and m.strip())
+        cascade = cascade or self.model_cascade
         for attempt in range(3):
-            for model in self.model_cascade:
+            for model in cascade:
                 payload = {
                     "model": model,
                     "messages": [

@@ -255,7 +255,8 @@ class AiEngine:
         try:
             reply, model_used = await self._generate_reply(
                 system, prompt, max_tokens=220)
-        except EmptyResponse:
+        except EmptyResponse as e:
+            log.info("AI local fallback after empty/invalid response: %s", e)
             reply = (random.choice(persona.fallback_lines)
                      if persona.fallback_lines and job.priority == DIRECT
                      else None)
@@ -290,8 +291,35 @@ class AiEngine:
 
     async def _generate_reply(self, system: str, prompt: str,
                               max_tokens: int) -> tuple[str, str]:
+        cascade = tuple(getattr(self.llm, "model_cascade", ()) or ())
+        if cascade:
+            last_limit: RateLimited | None = None
+            invalid_models: list[str] = []
+            for candidate in cascade:
+                try:
+                    return await self._generate_valid_reply(
+                        system, prompt, max_tokens, models=(candidate,))
+                except RateLimited as e:
+                    last_limit = e
+                    continue
+                except EmptyResponse as e:
+                    invalid_models.append(candidate)
+                    log.info("AI model %s returned invalid reply: %s",
+                             candidate, e)
+                    continue
+            if invalid_models:
+                raise EmptyResponse(
+                    "all models returned invalid replies: "
+                    + ", ".join(invalid_models))
+            raise last_limit or RateLimited("rate limit")
+        return await self._generate_valid_reply(system, prompt, max_tokens)
+
+    async def _generate_valid_reply(self, system: str, prompt: str,
+                                    max_tokens: int,
+                                    models: tuple[str, ...] | None = None
+                                    ) -> tuple[str, str]:
         reply, model = await _generate_with_model(
-            self.llm, system, prompt, max_tokens=max_tokens)
+            self.llm, system, prompt, max_tokens=max_tokens, models=models)
         reply = _strip_thinking(reply)
         if reply and not _has_bad_latin(reply):
             return reply, model
@@ -307,7 +335,7 @@ class AiEngine:
                "`<think>` и служебные объяснения. "
                f"Плохой вариант: {reply[:400]}")
         reply, model = await _generate_with_model(
-            self.llm, system, fix, max_tokens=max_tokens)
+            self.llm, system, fix, max_tokens=max_tokens, models=models)
         reply = _strip_thinking(reply)
         if not reply or _has_bad_latin(reply):
             raise EmptyResponse("empty or invalid response after cleanup")
@@ -431,7 +459,12 @@ def _strip_thinking(reply: str) -> str:
 
 
 async def _generate_with_model(llm, system: str, prompt: str,
-                               max_tokens: int) -> tuple[str, str]:
+                               max_tokens: int,
+                               models: tuple[str, ...] | None = None
+                               ) -> tuple[str, str]:
     if hasattr(llm, "generate_with_model"):
+        if models is not None:
+            return await llm.generate_with_model(
+                system, prompt, max_tokens=max_tokens, models=models)
         return await llm.generate_with_model(system, prompt, max_tokens=max_tokens)
     return await llm.generate(system, prompt, max_tokens=max_tokens), "test"

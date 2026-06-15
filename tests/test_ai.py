@@ -190,6 +190,32 @@ class FakeAiClient:
         return result
 
 
+class FakeCascadeClient:
+    def __init__(self, responses):
+        self.model_cascade = tuple(responses)
+        self.responses = {
+            model: list(values) if isinstance(values, list) else [values]
+            for model, values in responses.items()
+        }
+        self.calls = []
+
+    async def usage_status(self):
+        return "0 запросов сегодня"
+
+    async def classify(self, system, user):
+        return None
+
+    async def generate_with_model(self, system, user, **kw):
+        models = tuple(kw.get("models") or self.model_cascade)
+        model = models[0]
+        self.calls.append(model)
+        values = self.responses[model]
+        result = values.pop(0) if len(values) > 1 else values[0]
+        if isinstance(result, Exception):
+            raise result
+        return result, model
+
+
 async def make_engine(tmp_path, llm, persona=None):
     store = AiStore(tmp_path / "ai.db")
     await store.connect()
@@ -429,6 +455,22 @@ def test_engine_regenerates_unclosed_thinking(tmp_path):
         assert reply == "Смотри на меня, когда задаёшь такие вопросы."
         assert model == "test"
         assert gem.generate_calls == 2
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_engine_tries_next_model_before_local_fallback(tmp_path):
+    async def go():
+        llm = FakeCascadeClient({
+            "bad-model": ["<think>думаю без конца", "<think>снова думаю"],
+            "good-model": "Я здесь. Спрашивай осторожнее.",
+        })
+        eng = await make_engine(tmp_path, llm)
+        reply, model = await eng._generate_reply("system", "prompt",
+                                                 max_tokens=120)
+        assert reply == "Я здесь. Спрашивай осторожнее."
+        assert model == "good-model"
+        assert llm.calls == ["bad-model", "bad-model", "good-model"]
         await eng.store.close()
     asyncio.run(go())
 
