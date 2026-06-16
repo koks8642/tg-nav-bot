@@ -20,7 +20,7 @@ import time
 from collections import defaultdict
 
 from .decision import ASK, DIRECT, RESPOND, decide
-from .client import AiApiClient, EmptyResponse, RateLimited
+from .client import CASCADE_ORDER, AiApiClient, EmptyResponse, RateLimited
 from .personas import Lexicon, Persona
 from .queue import FairQueue, Job
 from .store import AiStore
@@ -242,6 +242,32 @@ class AiEngine:
     async def _active_model(self) -> str:
         return (await self.store.get("active_model")) or self.llm.model
 
+    async def _generate_cascade(self, system: str, prompt: str,
+                                max_tokens: int) -> str:
+        """Try the active model first, then the priority cascade (best models
+        first, smaller ones last). Fail over only on rate-limit / empty — each
+        model is tried at most once, so the happy path is a single call."""
+        active = await self._active_model()
+        order = [active] + [m for m in CASCADE_ORDER if m != active]
+        last_limit: RateLimited | None = None
+        for model in order:
+            try:
+                reply = _strip_thinking(await self.llm.generate(
+                    system, prompt, model=model, max_tokens=max_tokens))
+            except RateLimited as e:
+                last_limit = e
+                continue
+            except EmptyResponse:
+                continue
+            except Exception as e:  # noqa: BLE001
+                log.warning("model %s failed: %s", model, e)
+                continue
+            if reply:
+                return reply
+        if last_limit is not None:
+            raise last_limit  # everything we tried was rate-limited
+        raise EmptyResponse("all models returned empty")
+
     async def _run_job(self, job: Job) -> None:
         if self.send_callback is None:
             return
@@ -251,10 +277,8 @@ class AiEngine:
         prompt = await self._build_prompt(persona, job)
         system = self.system_for(
             persona, include_lore=job.mode in ("plot", "lore"))
-        model = await self._active_model()
         try:
-            reply = await self.llm.generate(
-                system, prompt, model=model, max_tokens=320)
+            reply = await self._generate_cascade(system, prompt, max_tokens=320)
         except RateLimited as e:
             delay = min(
                 max(float(e.retry_after or 0),
@@ -262,10 +286,10 @@ class AiEngine:
                 await self.setting("max_rate_limit_cooldown_sec"))
             self._rate_limited_until = max(self._rate_limited_until,
                                            time.time() + delay)
-            log.info("model %s rate-limited; pausing %.0fs", model, delay)
+            log.info("all models rate-limited; pausing %.0fs", delay)
             return  # stay silent under rate limit — no fallback spam
         except EmptyResponse as e:
-            log.info("empty reply from %s: %s", model, e)
+            log.info("empty reply from all models: %s", e)
             reply = (random.choice(persona.fallback_lines)
                      if persona.fallback_lines and job.priority == DIRECT
                      else None)
@@ -346,12 +370,13 @@ class AiEngine:
 
         parts.append(f"Сейчас тебе пишет {speaker}: «{job.text[:800]}»")
         parts.append(
-            f"Ответь {speaker} по сути его сообщения — живо, дерзко и в своём "
-            f"характере, можно мат. Обращайся к нему по имени и не путай с "
-            f"другими. КАЖДЫЙ твой ответ уникален: не копируй свои прошлые "
-            f"реплики, приёмы, присказки и смайлики, не зацикливайся. "
-            f"Пиши СТРОГО ПО-РУССКИ: никаких английских слов и латиницы, если "
-            f"это не каноническое имя/аббревиатура из контекста.")
+            f"Ответь по сути его сообщения — живо, дерзко и в своём характере, "
+            f"можно мат. НЕ начинай ответ с его имени: ты и так отвечаешь "
+            f"именно ему (это reply), обращение в начале не нужно. Имя "
+            f"«{speaker}» вставляй ВНУТРИ реплики только если к месту — для "
+            f"подколки, наезда или акцента. Не путай его с другими. КАЖДЫЙ "
+            f"ответ уникален: не копируй свои прошлые реплики, приёмы, "
+            f"присказки и смайлики, не зацикливайся.")
         return "\n\n".join(parts)
 
     async def _sleep(self, seconds: float) -> None:

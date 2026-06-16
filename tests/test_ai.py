@@ -438,6 +438,27 @@ def test_engine_run_job_empty_uses_fallback_for_direct(tmp_path):
     asyncio.run(go())
 
 
+def test_engine_cascade_fails_over_on_rate_limit(tmp_path):
+    async def go():
+        from app.ai.client import RateLimited
+        # active model rate-limited, next model in the cascade answers
+        gem = FakeAiClient(generate_result=[RateLimited("x"), "Я здесь."])
+        eng = await make_engine(tmp_path, gem)
+        sent = []
+
+        async def send(c, r, t):
+            sent.append(t)
+            return 1
+        eng.send_callback = send
+        await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
+                               username="u", text="Ютия привет",
+                               priority=DIRECT, mode="casual", enqueued_at=0.0))
+        assert sent == ["Я здесь."]
+        assert gem.generate_calls == 2
+        await eng.store.close()
+    asyncio.run(go())
+
+
 def test_engine_uses_active_model_setting(tmp_path):
     async def go():
         gem = FakeAiClient(generate_result="ответ")

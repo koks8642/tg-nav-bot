@@ -20,14 +20,23 @@ CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
 
-# Chat-suitable models on Groq, shown by /ai model. Non-reasoning ones first
-# (best for short in-character chat); reasoning ones work too — we strip their
-# <think> blocks — but they spend more tokens.
+# Chat-suitable models on Groq, shown by /ai model. The two strongest first.
 AVAILABLE_MODELS = (
     "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "qwen/qwen3-32b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+)
+
+# Auto-failover order when the active model is rate-limited: the two best
+# models first, smaller/faster ones only as a last resort so the avatar keeps
+# talking even when the good models hit their daily cap.
+CASCADE_ORDER = (
+    "llama-3.3-70b-versatile",
     "openai/gpt-oss-120b",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
     "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
 )
