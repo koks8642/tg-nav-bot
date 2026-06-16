@@ -1,12 +1,12 @@
-"""Async AI API client for persona replies.
+"""Async Groq chat-completions client for persona replies.
 
-The bot currently calls Groq's chat-completions endpoint. Model choice
-stays in environment variables so avatar/persona quality can be tuned without
-code changes.
+One active model at a time (switchable at runtime, so we can A/B which model
+plays the characters best). No auto-cascade across models — that only burns the
+free token budget and muddies the comparison. Rate limits surface as
+RateLimited so the engine can pause; empty replies as EmptyResponse.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -15,24 +15,25 @@ import aiohttp
 
 log = logging.getLogger("ai.client")
 
-CHAT_COMPLETIONS_API = "".join((
-    "https://api.groq.com/",
-    "open",
-    "ai/v1/chat/completions",
-))
+CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
+
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
-POWERFUL_MODELS = (
+
+# Chat-suitable models on Groq, shown by /ai model. Non-reasoning ones first
+# (best for short in-character chat); reasoning ones work too — we strip their
+# <think> blocks — but they spend more tokens.
+AVAILABLE_MODELS = (
     "llama-3.3-70b-versatile",
-    "qwen/qwen3-32b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
     "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
 )
 
 
 class RateLimited(Exception):
-    """The API rejected the request because of rate limits."""
-
     def __init__(self, message: str = "rate limit",
                  retry_after: float | None = None):
         super().__init__(message)
@@ -40,38 +41,21 @@ class RateLimited(Exception):
 
 
 class EmptyResponse(Exception):
-    """The model returned an empty response."""
+    """The model returned no usable text."""
 
 
 class AiApiClient:
-    def __init__(
-        self,
-        api_key: str,
-        store,
-        *,
-        model: str = DEFAULT_MODEL,
-        model_cascade: tuple[str, ...] | list[str] | None = None,
-        classifier_model: str = DEFAULT_CLASSIFIER_MODEL,
-        timeout_sec: int = 45,
-    ):
+    def __init__(self, api_key: str, store, *,
+                 model: str = DEFAULT_MODEL,
+                 classifier_model: str = DEFAULT_CLASSIFIER_MODEL,
+                 timeout_sec: int = 45):
         self.api_key = api_key.strip()
         self.store = store
-        self.model = model.strip() or DEFAULT_MODEL
-        self.model_cascade = tuple(
-            m.strip() for m in (model_cascade or (self.model,))
-            if m and m.strip())
-        if not self.model_cascade:
-            self.model_cascade = (self.model,)
-        self.classifier_model = classifier_model.strip() or self.model
+        self.model = (model or DEFAULT_MODEL).strip()
+        self.classifier_model = (classifier_model
+                                 or DEFAULT_CLASSIFIER_MODEL).strip()
         self._timeout = aiohttp.ClientTimeout(total=timeout_sec)
         self._session: aiohttp.ClientSession | None = None
-
-    def set_models(self, model: str,
-                   cascade: tuple[str, ...] | list[str] | None = None) -> None:
-        self.model = model.strip() or DEFAULT_MODEL
-        models = tuple(m.strip() for m in (cascade or (self.model,))
-                       if m and m.strip())
-        self.model_cascade = models or (self.model,)
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -83,103 +67,58 @@ class AiApiClient:
             await self._session.close()
 
     async def usage_status(self) -> str:
-        """Human-readable status for /ai.
+        used = await self.store.usage_today(self.model)
+        return (f"модель {self.model}: {used} запросов сегодня "
+                f"(точный остаток — в Groq Console → Limits)")
 
-        Exact remaining limits are account/model specific, so we show local
-        successful requests for today and rely on API backoff for live limits.
-        """
-        usage = []
-        for model in self.model_cascade:
-            usage.append(f"{model}: {await self.store.usage_today(model)}")
-        return "; ".join(usage) + "; точный остаток смотри в Groq Limits"
-
+    # ── low level ─────────────────────────────────────────────────────────
     async def _chat(self, payload: dict) -> str:
         sess = await self.session()
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        async with sess.post(CHAT_COMPLETIONS_API, headers=headers,
-                             json=payload) as resp:
+        headers = {"Authorization": f"Bearer {self.api_key}",
+                   "Content-Type": "application/json"}
+        async with sess.post(CHAT_API, headers=headers, json=payload) as resp:
             data = await resp.json(content_type=None)
             status = resp.status
-            resp_headers = dict(resp.headers)
+            headers_out = dict(resp.headers)
         if status == 429:
-            raise RateLimited("rate limit",
-                              retry_after=_retry_after(resp_headers, data))
-        if status in (401, 403):
-            msg = (data or {}).get("error", {}).get("message", "auth failed")
-            raise RuntimeError(f"AI API auth failed: {msg[:200]}")
+            raise RateLimited(
+                "rate limit", retry_after=_retry_after(headers_out, data))
         if status >= 400:
             msg = (data or {}).get("error", {}).get("message", "")
-            raise RuntimeError(f"AI API HTTP {status}: {msg[:200]}")
+            raise RuntimeError(f"Groq HTTP {status}: {msg[:200]}")
         try:
-            text = data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, AttributeError):
+            text = (data["choices"][0]["message"]["content"] or "").strip()
+        except (KeyError, IndexError, AttributeError, TypeError):
             text = ""
         if not text:
-            reason = (data.get("choices") or [{}])[0].get("finish_reason", "EMPTY")
+            reason = (data.get("choices") or [{}])[0].get(
+                "finish_reason", "empty")
             raise EmptyResponse(f"empty response ({reason})")
         return text
 
-    async def generate(
-        self,
-        system: str,
-        user: str,
-        *,
-        temperature: float = 1.0,
-        max_tokens: int = 400,
-    ) -> str:
-        text, _model = await self.generate_with_model(
-            system, user, temperature=temperature, max_tokens=max_tokens)
+    # ── public ────────────────────────────────────────────────────────────
+    async def generate(self, system: str, user: str, *,
+                       model: str | None = None,
+                       temperature: float = 1.0,
+                       max_tokens: int = 320) -> str:
+        m = (model or self.model).strip() or DEFAULT_MODEL
+        payload = {
+            "model": m,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
+            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
+        }
+        _add_reasoning_options(payload, m)
+        text = await self._chat(payload)
+        await self.store.usage_bump(m)
         return text
-
-    async def generate_with_model(
-        self,
-        system: str,
-        user: str,
-        *,
-        temperature: float = 1.0,
-        max_tokens: int = 400,
-        models: tuple[str, ...] | list[str] | None = None,
-    ) -> tuple[str, str]:
-        last_limit: RateLimited | None = None
-        cascade = tuple(m.strip() for m in (models or self.model_cascade)
-                        if m and m.strip())
-        cascade = cascade or self.model_cascade
-        for attempt in range(3):
-            for model in cascade:
-                payload = {
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": temperature,
-                    "max_completion_tokens": max_tokens,
-                }
-                _add_reasoning_options(payload, model)
-                try:
-                    result = await self._chat(payload)
-                except RateLimited as e:
-                    last_limit = e
-                    log.info("AI model %s rate-limited; trying fallback", model)
-                    continue
-                await self.store.usage_bump(model)
-                return result, model
-            if last_limit and attempt < 2 and (last_limit.retry_after or 0) <= 6:
-                await asyncio.sleep(3.0 * (attempt + 1))
-                continue
-            break
-        raise last_limit or RateLimited("rate limit")
 
     async def classify(self, system: str, user: str) -> dict | None:
         payload = {
             "model": self.classifier_model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": user}],
             "temperature": 0.0,
             "max_completion_tokens": 200,
             "response_format": {"type": "json_object"},
@@ -187,7 +126,7 @@ class AiApiClient:
         _add_reasoning_options(payload, self.classifier_model)
         try:
             raw = await self._chat(payload)
-        except Exception as e:  # noqa: BLE001 — classifier must not break chat
+        except Exception as e:  # noqa: BLE001 — classifier must never break flow
             log.debug("classifier failed: %s", e)
             return None
         await self.store.usage_bump(self.classifier_model)
@@ -195,8 +134,7 @@ class AiApiClient:
 
 
 def parse_json_block(raw: str) -> dict | None:
-    """Parse a JSON object out of a model reply (tolerates code fences)."""
-    raw = raw.strip()
+    raw = (raw or "").strip()
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         return None
@@ -208,26 +146,22 @@ def parse_json_block(raw: str) -> dict | None:
 
 
 def _add_reasoning_options(payload: dict, model: str) -> None:
-    model_key = model.lower()
-    if "gpt-oss" in model_key:
+    """Hide chain-of-thought for reasoning models so it never leaks into chat."""
+    key = model.lower()
+    if "gpt-oss" in key:
         payload["reasoning_effort"] = "low"
         payload["reasoning_format"] = "hidden"
-        return
-    if "qwen" not in model_key and "deepseek" not in model_key:
-        return
-    payload["reasoning_format"] = "hidden"
+    elif "qwen" in key or "deepseek" in key:
+        payload["reasoning_format"] = "hidden"
 
 
 def _retry_after(headers: dict, data: dict) -> float | None:
-    values = [
-        headers.get("retry-after"),
-        headers.get("Retry-After"),
-        headers.get("x-ratelimit-reset-tokens"),
-        headers.get("x-ratelimit-reset-requests"),
-        ((data or {}).get("error") or {}).get("message"),
-    ]
-    delays = [_parse_delay(v) for v in values if v]
-    delays = [d for d in delays if d is not None]
+    candidates = [headers.get("retry-after"), headers.get("Retry-After"),
+                  headers.get("x-ratelimit-reset-requests"),
+                  headers.get("x-ratelimit-reset-tokens"),
+                  ((data or {}).get("error") or {}).get("message")]
+    delays = [d for d in (_parse_delay(v) for v in candidates if v)
+              if d is not None]
     return max(delays) if delays else None
 
 
@@ -237,17 +171,10 @@ def _parse_delay(raw) -> float | None:
         return max(0.0, float(text))
     except ValueError:
         pass
-    total = 0.0
-    found = False
+    total, found = 0.0, False
     for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|s|m|h)", text):
         found = True
         n = float(value)
-        if unit == "ms":
-            total += n / 1000.0
-        elif unit == "s":
-            total += n
-        elif unit == "m":
-            total += n * 60.0
-        elif unit == "h":
-            total += n * 3600.0
+        total += n / 1000 if unit == "ms" else n * {
+            "s": 1, "m": 60, "h": 3600}[unit]
     return total if found else None

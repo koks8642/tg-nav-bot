@@ -40,11 +40,6 @@ DEFAULTS = {
     "max_rate_limit_cooldown_sec": 90.0,  # never freeze the avatar for hours
 }
 DUP_WINDOW_SEC = 60.0
-LATIN_RETRY_RE = re.compile(r"\b[A-Za-z]{3,}\b")
-LATIN_ALLOWED = {
-    "ai", "api", "bot", "dlc", "epub", "fb2", "html", "json", "pdf", "rpg",
-    "rqm", "sqlite", "txt", "url",
-}
 THINK_BLOCK_RE = re.compile(
     r"<\s*think(?:\s+[^>]*)?>.*?<\s*/\s*think\s*>", re.I | re.S)
 THINK_OPEN_RE = re.compile(r"<\s*think(?:\s+[^>]*)?>", re.I)
@@ -244,6 +239,9 @@ class AiEngine:
         if elapsed < wait_for:
             await self._sleep(wait_for - elapsed)
 
+    async def _active_model(self) -> str:
+        return (await self.store.get("active_model")) or self.llm.model
+
     async def _run_job(self, job: Job) -> None:
         if self.send_callback is None:
             return
@@ -251,36 +249,34 @@ class AiEngine:
         if persona is None:
             return
         prompt = await self._build_prompt(persona, job)
-        system = self.system_for(persona, include_lore=job.mode in ("plot", "lore"))
+        system = self.system_for(
+            persona, include_lore=job.mode in ("plot", "lore"))
+        model = await self._active_model()
         try:
-            reply, model_used = await self._generate_reply(
-                system, prompt, max_tokens=220)
+            reply = await self.llm.generate(
+                system, prompt, model=model, max_tokens=320)
+        except RateLimited as e:
+            delay = min(
+                max(float(e.retry_after or 0),
+                    await self.setting("rate_limit_cooldown_sec")),
+                await self.setting("max_rate_limit_cooldown_sec"))
+            self._rate_limited_until = max(self._rate_limited_until,
+                                           time.time() + delay)
+            log.info("model %s rate-limited; pausing %.0fs", model, delay)
+            return  # stay silent under rate limit — no fallback spam
         except EmptyResponse as e:
-            log.info("AI local fallback after empty/invalid response: %s", e)
+            log.info("empty reply from %s: %s", model, e)
             reply = (random.choice(persona.fallback_lines)
                      if persona.fallback_lines and job.priority == DIRECT
                      else None)
-            model_used = "fallback"
-        except RateLimited as e:
-            fallback = await self.setting("rate_limit_cooldown_sec")
-            cap = await self.setting("max_rate_limit_cooldown_sec")
-            delay = min(max(float(e.retry_after or 0), fallback), cap)
-            self._rate_limited_until = max(self._rate_limited_until,
-                                           time.time() + delay)
-            log.info("AI API rate-limited; pausing replies for %.1fs", delay)
-            reply = (random.choice(persona.fallback_lines)
-                     if persona.fallback_lines
-                     and job.priority == DIRECT
-                     and job.mode in ("insult", "casual")
-                     else None)
-            model_used = "fallback"
-        except Exception as e:  # noqa: BLE001
-            log.warning("generation failed: %s", e)
+        except Exception as e:  # noqa: BLE001 — never crash the worker
+            log.warning("generation failed (%s): %s", model, e)
             return
         if not reply:
             return
         reply = _clean(reply)
-        reply = f"{reply}\n\nМодель: {model_used}"
+        if not reply:
+            return
         sent_id = await self.send_callback(job.chat_id, job.reply_to, reply)
         self._last_answer_ts = time.time()
         if job.user_id is not None:
@@ -288,58 +284,6 @@ class AiEngine:
         if sent_id:
             await self.record_bot_message(job.chat_id, sent_id, reply,
                                           job.reply_to, persona.key)
-
-    async def _generate_reply(self, system: str, prompt: str,
-                              max_tokens: int) -> tuple[str, str]:
-        cascade = tuple(getattr(self.llm, "model_cascade", ()) or ())
-        if cascade:
-            last_limit: RateLimited | None = None
-            invalid_models: list[str] = []
-            for candidate in cascade:
-                try:
-                    return await self._generate_valid_reply(
-                        system, prompt, max_tokens, models=(candidate,))
-                except RateLimited as e:
-                    last_limit = e
-                    continue
-                except EmptyResponse as e:
-                    invalid_models.append(candidate)
-                    log.info("AI model %s returned invalid reply: %s",
-                             candidate, e)
-                    continue
-            if invalid_models:
-                raise EmptyResponse(
-                    "all models returned invalid replies: "
-                    + ", ".join(invalid_models))
-            raise last_limit or RateLimited("rate limit")
-        return await self._generate_valid_reply(system, prompt, max_tokens)
-
-    async def _generate_valid_reply(self, system: str, prompt: str,
-                                    max_tokens: int,
-                                    models: tuple[str, ...] | None = None
-                                    ) -> tuple[str, str]:
-        reply, model = await _generate_with_model(
-            self.llm, system, prompt, max_tokens=max_tokens, models=models)
-        reply = _strip_thinking(reply)
-        if reply and not _has_bad_latin(reply):
-            return reply, model
-        fix_reason = (
-            "Твой предыдущий вариант содержал служебные рассуждения/`<think>` "
-            "или оказался пустым после очистки."
-            if not reply else
-            "Твой предыдущий вариант содержал английские слова, что ломает образ."
-        )
-        fix = (prompt + "\n\n" + fix_reason + " Перепиши ответ: только финальная "
-               "реплика персонажа, 1-2 коротких предложения, строго по-русски. "
-               "Не используй английские слова, латиницу, roleplay-команды, "
-               "`<think>` и служебные объяснения. "
-               f"Плохой вариант: {reply[:400]}")
-        reply, model = await _generate_with_model(
-            self.llm, system, fix, max_tokens=max_tokens, models=models)
-        reply = _strip_thinking(reply)
-        if not reply or _has_bad_latin(reply):
-            raise EmptyResponse("empty or invalid response after cleanup")
-        return reply, model
 
     async def record_bot_message(self, chat_id, msg_id, text, reply_to,
                                  persona_key) -> None:
@@ -436,35 +380,11 @@ def _clean(reply: str) -> str:
     return reply
 
 
-def _has_bad_latin(reply: str) -> bool:
-    for word in LATIN_RETRY_RE.findall(reply):
-        if word.lower() not in LATIN_ALLOWED:
-            return True
-    return False
-
-
-def _has_thinking(reply: str) -> bool:
-    return bool(THINK_OPEN_RE.search(reply) or THINK_CLOSE_RE.search(reply))
-
-
 def _strip_thinking(reply: str) -> str:
+    """Strip a reasoning model's <think> block if it ever leaks into chat."""
     reply = THINK_BLOCK_RE.sub("", reply or "")
     open_match = THINK_OPEN_RE.search(reply)
     if open_match:
         reply = reply[:open_match.start()]
     reply = THINK_CLOSE_RE.sub("", reply)
-    reply = re.sub(r"(?im)^\s*(?:итоговый|финальный)?\s*ответ\s*:\s*", "",
-                   reply)
     return reply.strip()
-
-
-async def _generate_with_model(llm, system: str, prompt: str,
-                               max_tokens: int,
-                               models: tuple[str, ...] | None = None
-                               ) -> tuple[str, str]:
-    if hasattr(llm, "generate_with_model"):
-        if models is not None:
-            return await llm.generate_with_model(
-                system, prompt, max_tokens=max_tokens, models=models)
-        return await llm.generate_with_model(system, prompt, max_tokens=max_tokens)
-    return await llm.generate(system, prompt, max_tokens=max_tokens), "test"

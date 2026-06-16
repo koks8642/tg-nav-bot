@@ -524,8 +524,9 @@ class BotApp:
         args = context.args or []
         store = self.ai.store
         cmd = args[0].lower() if args else ""
-        # config / moderation commands stay admin-only; the rest are open
-        if cmd in ("set", "ban", "unban", "model") and \
+        # config / moderation commands stay admin-only; persona + model
+        # switching and status are open to everyone in the group
+        if cmd in ("set", "ban", "unban") and \
                 not await self.is_admin(update.effective_user.id):
             await update.message.reply_text(
                 "Эта команда только для админов чата.")
@@ -569,25 +570,22 @@ class BotApp:
             await store.set(key, val)
             await update.message.reply_text(f"{key} = {val}")
         elif cmd == "model":
-            from .ai.client import POWERFUL_MODELS
+            from .ai.client import AVAILABLE_MODELS
             if len(args) < 2:
-                current = ", ".join(self.ai.llm.model_cascade)
-                lines = ["Текущая модель/каскад: " + current,
-                         "", "Доступные мощные модели:"]
-                lines.extend(f"• {m}" for m in POWERFUL_MODELS)
+                current = await store.get("active_model") or self.ai.llm.model
+                lines = [f"Текущая модель: {current}", "",
+                         "Переключить: /ai model <название>. Доступные:"]
+                lines.extend(f"• {m}" for m in AVAILABLE_MODELS)
                 await update.message.reply_text("\n".join(lines))
                 return
-            picked = self._resolve_ai_model(" ".join(args[1:]), POWERFUL_MODELS)
+            picked = self._resolve_ai_model(" ".join(args[1:]), AVAILABLE_MODELS)
             if picked is None:
                 await update.message.reply_text(
-                    "Не знаю такую модель. Напиши /ai model без аргументов.")
+                    "Не знаю такую модель. Список: /ai model")
                 return
-            cascade = (picked,) + tuple(m for m in POWERFUL_MODELS if m != picked)
-            self.ai.llm.set_models(picked, cascade)
-            await store.set("ai_model", picked)
-            await store.set("ai_model_cascade", ",".join(cascade))
-            await update.message.reply_text(
-                "Модель переключена:\n" + "\n".join(cascade))
+            await store.set("active_model", picked)
+            self.ai.llm.model = picked
+            await update.message.reply_text(f"Модель переключена на: {picked}")
         elif cmd == "ban" and len(args) >= 2:
             try:
                 uid = int(args[1])
@@ -617,14 +615,16 @@ class BotApp:
                     "Сначала выбери персонажа: /ai persona <ключ>")
                 return
             try:
-                reply, model_used = await self.ai._generate_reply(
+                model = await store.get("active_model") or self.ai.llm.model
+                reply = await self.ai.llm.generate(
                     self.ai.system_for(persona),
                     f"Сообщение от тестера: {text}\n"
                     "Ответь ОДНИМ сообщением в своём характере.",
-                    max_tokens=220)
+                    model=model, max_tokens=320)
+                from .ai.engine import _strip_thinking
+                reply = _strip_thinking(reply)
                 await update.message.reply_text(
-                    _ai_to_html(f"{reply}\n\nМодель: {model_used}"),
-                    parse_mode=ParseMode.HTML)
+                    _ai_to_html(reply), parse_mode=ParseMode.HTML)
             except Exception as e:  # noqa: BLE001
                 await update.message.reply_text(f"Не вышло: {self._redact(e)}")
         else:
@@ -658,11 +658,13 @@ class BotApp:
         store = self.ai.store
         persona = await self.ai.active_persona()
         chats = await store.enabled_chats()
+        model = await store.get("active_model") or self.ai.llm.model
         usage = await self.ai.llm.usage_status()
         kb = await store.kb_count()
         lines = [
             "🤖 <b>ИИ-персонаж</b>",
             f"Персонаж: <b>{esc(persona.name) if persona else '—'}</b>",
+            f"Модель: <b>{esc(model)}</b> (сменить: /ai model)",
             f"Чаты: {', '.join(map(str, chats)) or '—'}",
             f"AI API: {esc(usage)}",
             f"База знаний: {kb} глав",
