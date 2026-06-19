@@ -26,6 +26,17 @@ log = logging.getLogger("ai.kb")
 
 TELEGRAPH_GET = "https://api.telegra.ph/getPage/{path}?return_content=true"
 
+# Cheap models the build cycles through. Groq rate limits are PER MODEL, so
+# spreading the build across several small models multiplies the daily token
+# budget — and deliberately avoids the chat's premium models (70b / gpt-120b),
+# so summarising chapters never eats the chat's quota.
+KB_MODELS = (
+    "llama-3.1-8b-instant",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "openai/gpt-oss-20b",
+)
+MAX_BACKOFF_SEC = 1800.0  # don't sleep for hours on a daily-limit retry-after
+
 # Canonical spellings so the same entity reads the same across all chapters
 # (the source MTL spells names inconsistently, which fragments KB search).
 CANON = (
@@ -57,7 +68,8 @@ class KbBuilder:
         self.store = store
         self.llm = llm
         self.index_path = Path(index_path)
-        self.model = model
+        # preferred model first, then the rest of the cheap cascade
+        self.models = (model,) + tuple(m for m in KB_MODELS if m != model)
         self.pace_sec = pace_sec
         self.max_chars = max_chars
         self._task: asyncio.Task | None = None
@@ -118,8 +130,10 @@ class KbBuilder:
                     await self._do_chapter(c)
                     await self._sleep(self.pace_sec)
                 except RateLimited as e:
-                    delay = max(float(e.retry_after or 0), 30.0)
-                    log.info("kb: rate-limited, backing off %.0fs", delay)
+                    delay = min(max(float(e.retry_after or 0), 30.0),
+                                MAX_BACKOFF_SEC)
+                    log.info("kb: all build models rate-limited, backing off "
+                             "%.0fs", delay)
                     await self._sleep(delay)
                 except Exception as e:  # noqa: BLE001 — never crash the builder
                     log.warning("kb: chapter %d failed: %s", c["n"], e)
@@ -132,14 +146,23 @@ class KbBuilder:
             log.info("kb: chapter %d empty/short, skipping", c["n"])
             return
         user = f"ГЛАВА {c['n']}:\n{text[:self.max_chars]}"
-        summary = await self.llm.generate(
-            SUMMARY_SYSTEM, user, model=self.model,
-            temperature=0.3, max_tokens=400)
-        summary = summary.strip()
+        summary = ""
+        last_limit: RateLimited | None = None
+        for model in self.models:  # use whichever build model still has budget
+            try:
+                summary = (await self.llm.generate(
+                    SUMMARY_SYSTEM, user, model=model,
+                    temperature=0.3, max_tokens=400)).strip()
+                break
+            except RateLimited as e:
+                last_limit = e
+                continue
         if not summary:
+            if last_limit is not None:
+                raise last_limit
             return
         await self.store.kb_put(c["n"], title or f"Глава {c['n']}", summary)
-        log.info("kb: chapter %d done (%d chars in)", c["n"], len(text))
+        log.info("kb: chapter %d done (%d chars)", c["n"], len(text))
 
     async def _fetch(self, path: str) -> tuple[str, str]:
         sess = await self._session_get()
