@@ -1,0 +1,166 @@
+"""Background chapter knowledge-base builder.
+
+Reads a chapter index (number → Telegraph path), fetches each chapter's text
+from the public Telegraph page, compresses it into a short factual digest with
+a cheap free Groq model, and stores it in ai.db (summaries) so personas can
+answer plot questions. Runs as a self-paced background task: idempotent
+(skips chapters already done), resumable across restarts and daily token
+limits, and never crashes the bot.
+
+Deliberately uses a SEPARATE small model (llama-3.1-8b-instant by default):
+Groq rate limits are per-model, so the build never competes with the chat's
+premium model budget.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from pathlib import Path
+
+import aiohttp
+
+from .client import RateLimited
+
+log = logging.getLogger("ai.kb")
+
+TELEGRAPH_GET = "https://api.telegra.ph/getPage/{path}?return_content=true"
+
+# Canonical spellings so the same entity reads the same across all chapters
+# (the source MTL spells names inconsistently, which fragments KB search).
+CANON = (
+    "Алон, Ютия, Эван, Сольранг, Деус, Пения, Рине, Радан, Блэки, Сили, "
+    "Каланон, Хидан, Юна, Хейнкель, Базилиора, Лиян, Рория, Филиан, Закурак, "
+    "Рейнхард, Карсем, Товетт, Комалон, Сиркал, Сиан, Фелин, Голубая Луна, "
+    "Великая Луна, Пять Грехов, Кровавый Род, Сто Призраков, Розарио, "
+    "Племя Золотой Гривы, Синяя Башня, Красная Башня, Внешние боги, Ампелан, "
+    "Астерия, Палатио, Калибан, Ашталон, Колония, Люксибл, Ронавелли, "
+    "Грейнифра, Божественная Земля, Эстрован")
+
+SUMMARY_SYSTEM = (
+    "Ты сжимаешь главу веб-новеллы «Стал покровителем злодеев» в справку для "
+    "базы знаний. Формат: 3-6 предложений фактов — какие события произошли, "
+    "кто участвовал, где (локации), чем закончилось. Затем строка «Персонажи: "
+    "…» и строка «Места: …». Только факты, без оценок и воды. Пиши по-русски.\n"
+    "ПРАВИЛА:\n"
+    "- Пиши ТОЛЬКО факты, прямо изложенные в тексте. Не домысливай.\n"
+    "- НЕ выдумывай имена/названия, которых нет в тексте: безымянного "
+    "персонажа называй ролью («рыцарь», «купец»).\n"
+    "- Для этих сущностей используй РОВНО такие написания (в переводе они "
+    "могут писаться иначе — приводи к этим):\n" + CANON)
+
+
+class KbBuilder:
+    def __init__(self, store, llm, *, index_path: str | Path,
+                 model: str = "llama-3.1-8b-instant", pace_sec: float = 4.0,
+                 max_chars: int = 14000):
+        self.store = store
+        self.llm = llm
+        self.index_path = Path(index_path)
+        self.model = model
+        self.pace_sec = pace_sec
+        self.max_chars = max_chars
+        self._task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+        self._session: aiohttp.ClientSession | None = None
+
+    # ── lifecycle ─────────────────────────────────────────────────────────
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._stop.clear()
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    def _load_index(self) -> list[dict]:
+        try:
+            data = json.loads(self.index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("kb: no chapter index at %s (%s)", self.index_path, e)
+            return []
+        return [c for c in data if isinstance(c.get("n"), int) and c.get("p")]
+
+    async def _session_get(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30))
+        return self._session
+
+    # ── main loop ─────────────────────────────────────────────────────────
+    async def _loop(self) -> None:
+        chapters = self._load_index()
+        if not chapters:
+            log.info("kb builder idle: empty chapter index")
+            return
+        log.info("kb builder started: %d chapters in index", len(chapters))
+        while not self._stop.is_set():
+            done = await self.store.kb_chapters()
+            todo = [c for c in chapters if c["n"] not in done]
+            if not todo:
+                log.info("kb: all %d chapters summarized; idle (re-check 1h)",
+                         len(chapters))
+                await self._sleep(3600)  # pick up new chapters added later
+                continue
+            log.info("kb: %d/%d chapters left", len(todo), len(chapters))
+            for c in todo:
+                if self._stop.is_set():
+                    return
+                try:
+                    await self._do_chapter(c)
+                    await self._sleep(self.pace_sec)
+                except RateLimited as e:
+                    delay = max(float(e.retry_after or 0), 30.0)
+                    log.info("kb: rate-limited, backing off %.0fs", delay)
+                    await self._sleep(delay)
+                except Exception as e:  # noqa: BLE001 — never crash the builder
+                    log.warning("kb: chapter %d failed: %s", c["n"], e)
+                    await self._sleep(self.pace_sec)
+        log.info("kb builder stopped")
+
+    async def _do_chapter(self, c: dict) -> None:
+        text, title = await self._fetch(c["p"])
+        if not text or len(text) < 200:
+            log.info("kb: chapter %d empty/short, skipping", c["n"])
+            return
+        user = f"ГЛАВА {c['n']}:\n{text[:self.max_chars]}"
+        summary = await self.llm.generate(
+            SUMMARY_SYSTEM, user, model=self.model,
+            temperature=0.3, max_tokens=400)
+        summary = summary.strip()
+        if not summary:
+            return
+        await self.store.kb_put(c["n"], title or f"Глава {c['n']}", summary)
+        log.info("kb: chapter %d done (%d chars in)", c["n"], len(text))
+
+    async def _fetch(self, path: str) -> tuple[str, str]:
+        sess = await self._session_get()
+        async with sess.get(TELEGRAPH_GET.format(path=path)) as resp:
+            data = await resp.json(content_type=None)
+        result = (data or {}).get("result", {})
+        return _flatten(result.get("content", [])), result.get("title", "")
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
+
+def _flatten(nodes) -> str:
+    """Plain text out of Telegraph content nodes."""
+    out: list[str] = []
+    for n in nodes:
+        if isinstance(n, str):
+            out.append(n)
+        elif isinstance(n, dict):
+            out.append(_flatten(n.get("children", [])))
+    return "".join(out)

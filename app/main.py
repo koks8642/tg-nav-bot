@@ -117,9 +117,11 @@ async def run() -> None:
 
     # AI persona chat (optional): only assembled when an AI API key is configured.
     ai_engine = None
+    kb_builder = None
     if cfg.ai_enabled:
         from .ai.engine import AiEngine
         from .ai.client import AiApiClient
+        from .ai.kb_builder import KbBuilder
         from .ai.personas import load_lexicon, load_lore, load_personas
         from .ai.store import AiStore
 
@@ -135,9 +137,12 @@ async def run() -> None:
         llm = AiApiClient(cfg.ai_api_key, ai_store, model=model,
                           classifier_model=cfg.ai_classifier_model)
         ai_engine = AiEngine(ai_store, llm, personas, lexicon, lore)
+        kb_builder = KbBuilder(ai_store, llm, index_path=cfg.ai_chapters_index,
+                               model=cfg.ai_kb_model)
         log.info("AI persona chat ready: %d personas, %d lexicon entities, "
-                 "lore %d chars, model %s", len(personas),
-                 len(lexicon.entities), len(lore), model)
+                 "lore %d chars, model %s, KB %d chapters", len(personas),
+                 len(lexicon.entities), len(lore), model,
+                 await ai_store.kb_count())
 
     bot_app = BotApp(db, cfg, telegraph=tg, ai_engine=ai_engine)
     application = bot_app.build()
@@ -277,6 +282,8 @@ async def run() -> None:
                                        application.bot.id)
         ai_engine.send_callback = bot_app._ai_send_callback
         ai_engine.start()  # paced reply worker
+    if kb_builder is not None:
+        kb_builder.start()  # background chapter-summary build
     await application.updater.start_polling(
         allowed_updates=["channel_post", "edited_channel_post",
                          "message", "callback_query"],
@@ -326,6 +333,8 @@ async def run() -> None:
         await application.shutdown()
         await runner.cleanup()
         await tg.close()
+        if kb_builder is not None:
+            await kb_builder.stop()
         if ai_engine is not None:
             await ai_engine.stop()
             await ai_engine.llm.close()

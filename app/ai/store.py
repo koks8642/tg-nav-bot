@@ -327,6 +327,12 @@ class AiStore:
         cur = await self.conn.execute("SELECT COUNT(*) AS n FROM summaries")
         return (await cur.fetchone())["n"]
 
+    async def kb_chapters(self) -> set[int]:
+        """Chapter numbers already in the knowledge base (for the builder to
+        skip)."""
+        cur = await self.conn.execute("SELECT chapter FROM summaries")
+        return {r["chapter"] for r in await cur.fetchall()}
+
     async def kb_search(self, query: str, limit: int = 5) -> list[dict]:
         terms = [t for t in query.split() if len(t) >= 3][:8]
         if not terms:
