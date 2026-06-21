@@ -353,12 +353,28 @@ class AiEngine:
 
         # 4) knowledge base for plot questions
         if job.mode in ("plot", "lore"):
-            found = await self.store.kb_search(job.text, limit=4)
-            if found:
-                kb = "\n".join(f"Глава {r['chapter']}: {r['text'][:260]}"
-                               for r in found)
-                parts.append("Выжимки из глав (факты; если пересказываешь "
-                             "события — укажи «📖 гл. N»):\n" + kb)
+            facts: list[tuple[int, str]] = []
+            seen: set[int] = set()
+            # exact chapter by NUMBER («что было в 300 главе» / «в главе 300»)
+            num = _chapter_number(job.text)
+            if num is not None:
+                got = await self.store.kb_get(num)
+                if got:
+                    facts.append((got["chapter"], got["text"]))
+                    seen.add(got["chapter"])
+            # plus content matches
+            for r in await self.store.kb_search(job.text, limit=4):
+                if r["chapter"] not in seen:
+                    facts.append((r["chapter"], r["text"]))
+                    seen.add(r["chapter"])
+            if facts:
+                kb = "\n".join(f"Глава {ch}: {txt[:320]}"
+                               for ch, txt in facts[:4])
+                parts.append(
+                    "ВЫЖИМКИ ИЗ ГЛАВ (это реальные факты сюжета — ответь по "
+                    "ним: перескажи их СВОИМИ словами и в своём характере. НЕ "
+                    "отнекивайся, НЕ говори «не знаю» и «мне неинтересно» — "
+                    "факты у тебя на руках, дай ответ по сути):\n" + kb)
 
         # 5) anti-loop: list your own recent replies as patterns to AVOID
         my_recent = [r["text"] for r in recent if r["is_bot"]][-4:]
@@ -418,6 +434,18 @@ def _strip_foreign_scripts(reply: str) -> str:
         return reply
     cleaned = _CJK_RE.sub("", reply)
     return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+_CHAPTER_NUM_RE = re.compile(r"глав\w*\s*№?\s*(\d{1,3})|(\d{1,3})\s*глав", re.I)
+
+
+def _chapter_number(text: str) -> int | None:
+    """Pull a chapter number out of «что было в 300 главе» / «в главе 300»."""
+    m = _CHAPTER_NUM_RE.search(text)
+    if not m:
+        return None
+    n = int(m.group(1) or m.group(2))
+    return n if 1 <= n <= 999 else None
 
 
 def _strip_thinking(reply: str) -> str:

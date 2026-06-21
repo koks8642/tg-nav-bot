@@ -519,6 +519,14 @@ def test_parse_json_block():
     assert json.loads("{}") == {}
 
 
+def test_chapter_number_detection():
+    from app.ai.engine import _chapter_number
+    assert _chapter_number("что было в 300 главе") == 300
+    assert _chapter_number("ютия что было в главе 50?") == 50
+    assert _chapter_number("расскажи про главу №7") == 7
+    assert _chapter_number("просто болтаем ни о чём") is None
+
+
 def test_strip_foreign_scripts():
     from app.ai.engine import _strip_foreign_scripts
     assert _strip_foreign_scripts("откуда 这种 сплетни 🤔") == "откуда сплетни 🤔"

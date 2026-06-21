@@ -333,6 +333,14 @@ class AiStore:
         cur = await self.conn.execute("SELECT chapter FROM summaries")
         return {r["chapter"] for r in await cur.fetchall()}
 
+    async def kb_get(self, chapter: int) -> dict | None:
+        """Fetch one chapter's digest by NUMBER (for «что было в главе N»)."""
+        cur = await self.conn.execute(
+            "SELECT chapter, title, text FROM summaries WHERE chapter=?",
+            (chapter,))
+        r = await cur.fetchone()
+        return dict(r) if r else None
+
     async def kb_search(self, query: str, limit: int = 5) -> list[dict]:
         terms = [t for t in query.split() if len(t) >= 3][:8]
         if not terms:
