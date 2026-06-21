@@ -63,12 +63,14 @@ SUMMARY_SYSTEM = (
 
 class KbBuilder:
     def __init__(self, store, llm, *, index_path: str | Path,
+                 live_index_path: str | Path | None = None,
                  corpus_dir: str | Path | None = None,
                  model: str = "llama-3.1-8b-instant", pace_sec: float = 4.0,
                  max_chars: int = 14000):
         self.store = store
         self.llm = llm
         self.index_path = Path(index_path)
+        self.live_index_path = Path(live_index_path) if live_index_path else None
         self.corpus_dir = Path(corpus_dir) if corpus_dir else None
         # preferred model first, then the rest of the cheap cascade
         self.models = (model,) + tuple(m for m in KB_MODELS if m != model)
@@ -96,13 +98,25 @@ class KbBuilder:
             await self._session.close()
 
     def _load_index(self) -> list[dict]:
-        try:
-            data = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            log.warning("kb: no chapter index at %s (%s)", self.index_path, e)
-            return []
-        return [c for c in data if isinstance(c.get("n"), int)
-                and (c.get("file") or c.get("path") or c.get("p"))]
+        # bundled snapshot (corpus 1-318 + Telegraph 319-327) FIRST, so the
+        # full local text wins; then the optional live index (re-exported from
+        # the prod registry by a cron) appends any NEWER chapters.
+        out: list[dict] = []
+        seen: set[int] = set()
+        for path in (self.index_path, self.live_index_path):
+            if not path:
+                continue
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for c in data:
+                n = c.get("n")
+                if (isinstance(n, int) and n not in seen
+                        and (c.get("file") or c.get("path") or c.get("p"))):
+                    out.append(c)
+                    seen.add(n)
+        return out
 
     async def _session_get(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -112,17 +126,17 @@ class KbBuilder:
 
     # ── main loop ─────────────────────────────────────────────────────────
     async def _loop(self) -> None:
-        chapters = self._load_index()
-        if not chapters:
-            log.info("kb builder idle: empty chapter index")
-            return
-        log.info("kb builder started: %d chapters in index", len(chapters))
+        log.info("kb builder started")
         while not self._stop.is_set():
+            # reload the index each cycle so newly-published chapters (added to
+            # the live index by the cron) get picked up automatically
+            chapters = self._load_index()
             done = await self.store.kb_chapters()
             todo = [c for c in chapters if c["n"] not in done]
             if not todo:
-                log.info("kb: all %d chapters summarized; idle (re-check 1h)",
-                         len(chapters))
+                if chapters:
+                    log.info("kb: all %d chapters summarized; idle (re-check 1h)",
+                             len(chapters))
                 await self._sleep(3600)  # pick up new chapters added later
                 continue
             log.info("kb: %d/%d chapters left", len(todo), len(chapters))
