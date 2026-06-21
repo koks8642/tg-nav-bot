@@ -33,8 +33,8 @@ DEFAULTS = {
     "cooldown_jitter_sec": 3.0,  # ± jitter on the pace (natural, not instant)
     "user_cooldown_sec": 4.0,   # min seconds between answers to the same user
     "butt_in_pct": 2.5,         # % chance to butt into an off-topic message
-    "context_messages": 30,     # general chat context shown to the persona
-    "thread_depth": 12,         # per-user conversation depth (own dialog/mood)
+    "context_messages": 22,     # recent chat shown to the persona (lean: more
+    #                             context made the model drown & misread refs)
     "dup_limit": 5,             # identical msgs/min from one user before ignore
     "rate_limit_cooldown_sec": 25.0,  # fallback pause after a provider 429
     "max_rate_limit_cooldown_sec": 90.0,  # never freeze the avatar for hours
@@ -316,84 +316,77 @@ class AiEngine:
                                 is_bot=True, persona=persona_key)
 
     async def _build_prompt(self, persona: Persona, job: Job) -> str:
+        """Assemble the per-message user prompt. Deliberately lean and
+        unambiguous: ONE conversation block (not three overlapping ones), the
+        current message framed so the model parses WHO is who, facts only on
+        plot topics. Less clutter → the model comprehends instead of drowning,
+        and fewer tokens burn."""
         speaker = job.username or "собеседник"
-        parts: list[str] = []
-        # everything is scoped to the current persona session: on a persona
-        # switch we move this marker, so the new persona never sees (or mimics)
-        # the previous one's messages.
+        # scoped to the current persona session (reset on a persona switch)
         since = await self.store.get("context_reset_ts")
+        parts: list[str] = []
 
-        # 1) general chat context — situational awareness (последние ~50)
+        # 1) the ONLY conversation block — clear speaker labels; your own past
+        #    replies are marked «ТЫ», so no separate per-user / anti-loop dumps
         recent = await self.store.recent(
             job.chat_id, limit=int(await self.setting("context_messages")),
             since_ts=since)
         convo = [r for r in recent if r["msg_id"] != job.reply_to]
         if convo:
-            parts.append("Что происходит в чате (разные люди, у каждого своё "
-                         "имя; ТЫ — твои прошлые реплики):\n" + _fmt(convo))
+            parts.append("Разговор в чате (в начале каждой строки — КТО это "
+                         "сказал; «ТЫ» — твои собственные прошлые реплики):\n"
+                         + _fmt(convo))
 
-        # 2) the persona's PRIVATE dialog & mood with THIS user (последние ~20)
-        if job.user_id is not None:
-            mine = await self.store.user_thread(
-                job.chat_id, job.user_id,
-                limit=int(await self.setting("thread_depth")), since_ts=since)
-            mine = [r for r in mine if r["msg_id"] != job.reply_to]
-            if len(mine) >= 2:
-                parts.append(f"Твоя личная переписка именно с {speaker} "
-                             f"(помни своё отношение к нему):\n" + _fmt(mine))
-
-        # 3) what the current speaker is replying to
+        # 2) what the current speaker is replying to (helps comprehension)
         if job.replied_to:
             tgt = await self.store.get_msg(job.chat_id, job.replied_to)
             if tgt:
-                src = ("твоё сообщение" if tgt["is_bot"]
-                       else f"сообщение от {tgt['username'] or 'кого-то'}")
-                parts.append(f"{speaker} отвечает на {src}: "
-                             f"«{tgt['text'][:200]}»")
+                who = ("на ТВОЮ реплику" if tgt["is_bot"]
+                       else f"на сообщение {tgt['username'] or 'кого-то'}")
+                parts.append(f"{speaker} отвечает {who}: «{tgt['text'][:200]}»")
 
-        # 4) knowledge base for plot questions
+        # 3) plot/lore facts (Sprint 3 adds character-scoping + spoilers)
         if job.mode in ("plot", "lore"):
-            facts: list[tuple[int, str]] = []
-            seen: set[int] = set()
-            # exact chapter by NUMBER («что было в 300 главе» / «в главе 300»)
-            num = _chapter_number(job.text)
-            if num is not None:
-                got = await self.store.kb_get(num)
-                if got:
-                    facts.append((got["chapter"], got["text"]))
-                    seen.add(got["chapter"])
-            # plus content matches
-            for r in await self.store.kb_search(job.text, limit=4):
-                if r["chapter"] not in seen:
-                    facts.append((r["chapter"], r["text"]))
-                    seen.add(r["chapter"])
+            facts = await self._kb_facts(job)
             if facts:
-                kb = "\n".join(f"Глава {ch}: {txt[:320]}"
-                               for ch, txt in facts[:4])
-                parts.append(
-                    "ВЫЖИМКИ ИЗ ГЛАВ (это реальные факты сюжета — ответь по "
-                    "ним: перескажи их СВОИМИ словами и в своём характере. НЕ "
-                    "отнекивайся, НЕ говори «не знаю» и «мне неинтересно» — "
-                    "факты у тебя на руках, дай ответ по сути):\n" + kb)
+                parts.append(facts)
 
-        # 5) anti-loop: list your own recent replies as patterns to AVOID
-        my_recent = [r["text"] for r in recent if r["is_bot"]][-4:]
-        if my_recent:
-            parts.append(
-                "ТВОИ ПОСЛЕДНИЕ ОТВЕТЫ (категорически НЕ повторяй их приёмы, "
-                "фразы, шутки, смайлики и структуру — ответь СОВЕРШЕННО иначе):\n"
-                + "\n".join(f"— {t[:110]}" for t in my_recent))
-
-        parts.append(f"Сейчас тебе пишет {speaker}: «{job.text[:800]}»")
+        # 4) the current message, framed so referents are parsed correctly
         parts.append(
-            f"Ответь по сути его сообщения — живо, дерзко и в своём характере, "
-            f"можно мат. НЕ начинай ответ с его имени: ты и так отвечаешь "
-            f"именно ему (это reply), обращение в начале не нужно. Имя "
-            f"«{speaker}» вставляй ВНУТРИ реплики только если к месту — для "
-            f"подколки, наезда или акцента. Не путай его с другими. КАЖДЫЙ "
-            f"ответ уникален: не копируй свои прошлые реплики, приёмы, "
-            f"присказки и смайлики, не зацикливайся.")
+            f"СЕЙЧАС тебе пишет {speaker}. Его сообщение:\n«{job.text[:800]}»")
+
+        # 5) one tight instruction (in-character + comprehension + anti-repeat)
+        parts.append(
+            f"Ответь {speaker} по сути ИМЕННО этого сообщения, в своём "
+            f"характере — живо, можно дерзко и мат. СНАЧАЛА верно пойми смысл "
+            f"и КТО есть кто: слова «наш / моя / твой» и любые третьи лица "
+            f"(художник, кто-то ещё), упомянутые в его реплике, — это НЕ сам "
+            f"{speaker}; не путай собеседника с теми, о ком он говорит. Не "
+            f"начинай ответ с его имени (ты и так отвечаешь ему); имя вставляй "
+            f"внутри, лишь если к месту. Не повторяй свои прошлые реплики "
+            f"(«ТЫ» выше) — каждый раз формулируй заново.")
         return "\n\n".join(parts)
+
+    async def _kb_facts(self, job: Job) -> str:
+        """Relevant chapter digests for a plot/lore question: the exact chapter
+        if a number is named, plus content matches."""
+        facts: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        num = _chapter_number(job.text)
+        if num is not None:
+            got = await self.store.kb_get(num)
+            if got:
+                facts.append((got["chapter"], got["text"]))
+                seen.add(got["chapter"])
+        for r in await self.store.kb_search(job.text, limit=4):
+            if r["chapter"] not in seen:
+                facts.append((r["chapter"], r["text"]))
+                seen.add(r["chapter"])
+        if not facts:
+            return ""
+        kb = "\n".join(f"Глава {ch}: {txt[:320]}" for ch, txt in facts[:4])
+        return ("ФАКТЫ ИЗ ГЛАВ (реальные события сюжета — перескажи их своими "
+                "словами в характере, по сути вопроса, не отнекивайся):\n" + kb)
 
     async def _sleep(self, seconds: float) -> None:
         try:
