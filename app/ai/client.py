@@ -33,10 +33,13 @@ AVAILABLE_MODELS = (
 # Auto-failover order when the active model is rate-limited: the two best
 # models first, smaller/faster ones only as a last resort so the avatar keeps
 # talking even when the good models hit their daily cap.
+# RP quality first: Llama models roleplay far more naturally than the
+# safety-tuned gpt-oss family (which goes stiff/assistant-like), so on a
+# rate-limit failover we drop to llama-4-scout BEFORE gpt-oss.
 CASCADE_ORDER = (
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
+    "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
 )

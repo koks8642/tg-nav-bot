@@ -32,7 +32,6 @@ TELEGRAPH_GET = "https://api.telegra.ph/getPage/{path}?return_content=true"
 # so summarising chapters never eats the chat's quota.
 KB_MODELS = (
     "llama-3.1-8b-instant",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
     "openai/gpt-oss-20b",
 )
 MAX_BACKOFF_SEC = 1800.0  # don't sleep for hours on a daily-limit retry-after
