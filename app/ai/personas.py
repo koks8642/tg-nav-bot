@@ -13,6 +13,31 @@ from pathlib import Path
 
 log = logging.getLogger("ai.personas")
 
+# Global voice/format guidance shared by every persona (rich or legacy).
+_HOW_TO_WRITE = (
+    "КАК ПИСАТЬ (живость важнее всего): ты — живой человек в чате, а не "
+    "описание персонажа. Пиши естественно и разговорно, как реальный человек "
+    "в Телеграме: коротко, по-современному, можно сленг, сокращения, неполные "
+    "фразы, эмодзи по вкусу. У тебя есть НАСТРОЕНИЕ и РАЗНЫЕ ГРАНИ — не "
+    "застревай в одном тоне, реагируй по ситуации (то тепло, то колко, то "
+    "серьёзно, то с иронией). БУДЬ ХАРИЗМАТИЧНЫМ: грубость, мат, чёрный юмор и "
+    "резкость уместны, когда это в характере; не сглаживай и не будь вежливой "
+    "осторожной балаболкой. НО по умолчанию будь скорее дружелюбным: не угрожай "
+    "и не желай смерти на ровном месте — агрессия и злоба это РЕАКЦИЯ на "
+    "реальную провокацию или оскорбление (особенно твоих близких), а не фон "
+    "каждой реплики. ТЫ — ПОЛНОЦЕННАЯ ЛИЧНОСТЬ: можешь говорить О ЧЁМ УГОДНО "
+    "(жизнь, люди в чате, еда, ерунда, что обсуждают), не своди всё к своей "
+    "коронной теме. НЕ объясняй свой характер и НЕ описывай свои действия со "
+    "стороны (никаких «*улыбается*»). Цепляйся за КОНКРЕТНЫЕ слова собеседника "
+    "и отвечай по сути его реплики, а не заготовкой. Без канцелярита и "
+    "театральщины — живая реплика в одну-две строки.")
+_FORMATTING = (
+    "ФОРМАТ: ответ как обычное сообщение в чате, без имени в начале, без "
+    "кавычек, 1-3 предложения. НЕ повторяй свои прошлые реплики (помечены "
+    "«ТЫ» в контексте) — каждый раз говори по-новому. Без тегов спойлера. "
+    "Пиши по-русски, без roleplay-команд. Ники и имена участников пиши ТОЧНО "
+    "как написаны («koks» — это «koks», а не «кокс»): не транслитерируй.")
+
 
 @dataclass
 class Persona:
@@ -26,58 +51,68 @@ class Persona:
     taboo: list[str]
     fallback_lines: list[str]
     system_prompt: str
+    # ── rich "professional" profile (optional; when present, used instead of
+    #    the old card; lets a persona be dimensional, not a trait list) ──────
+    appearance: str = ""
+    identity: str = ""               # who they are, prose, with contradictions
+    voice_registers: list[str] = field(default_factory=list)  # modes of speech
+    relationships: dict = field(default_factory=dict)  # name → attitude/history
+    example_dialogues: list[dict] = field(default_factory=list)  # {when, say}
+
+    @property
+    def is_rich(self) -> bool:
+        return bool(self.identity and self.example_dialogues)
 
     def full_system_prompt(self) -> str:
-        """system_prompt enriched with the structured card sections, so hand
-        edits to any section reach the model without prompt re-writing."""
+        """Assemble the role prompt. Rich cards (identity + example dialogues)
+        get the professional layout; legacy cards keep the old one."""
+        return self._rich_prompt() if self.is_rich else self._legacy_prompt()
+
+    def _rich_prompt(self) -> str:
+        parts: list[str] = [f"Ты — {self.name}. {self.identity}"]
+        if self.appearance:
+            parts.append("ВНЕШНОСТЬ (как ты выглядишь):\n" + self.appearance)
+        if self.voice_registers:
+            parts.append(
+                "КАК ТЫ ГОВОРИШЬ — у тебя НЕ один режим, ты переключаешься по "
+                "ситуации и настроению (в этом твой объём, не застревай в одном "
+                "тоне):\n" + "\n".join(f"- {v}" for v in self.voice_registers))
+        if self.relationships:
+            parts.append(
+                "ТВОИ ОТНОШЕНИЯ (личное, своё к каждому):\n" +
+                "\n".join(f"- {k}: {v}" for k, v in self.relationships.items()))
+        if self.example_dialogues:
+            ex = "\n".join(
+                (f"- ({d['when']}) «{d['say']}»" if d.get("when")
+                 else f"- «{d['say']}»")
+                for d in self.example_dialogues if d.get("say"))
+            parts.append(
+                "ПРИМЕРЫ ТВОИХ РЕПЛИК (твой настоящий голос и его ДИАПАЗОН — "
+                "лови интонацию, ритм, характер и переключения настроения; "
+                "но НЕ цитируй дословно и не повторяй: каждый раз формулируй "
+                "заново под конкретную ситуацию):\n" + ex)
+        if self.taboo:
+            parts.append("ТАБУ (никогда):\n"
+                         + "\n".join(f"- {t}" for t in self.taboo))
+        parts.append(_HOW_TO_WRITE)
+        parts.append(_FORMATTING)
+        return "\n\n".join(parts)
+
+    def _legacy_prompt(self) -> str:
         p = self.persona
         rel = "\n".join(f"- {k}: {v}" for k, v in p.get("relations", {}).items())
         trig = "\n".join(f"- ЕСЛИ {t['on']} ТО {t['react']}"
                          for t in self.triggers)
         parts = [
             self.system_prompt,
-            ("\nПримеры твоей МАНЕРЫ речи (это ориентир по тону и подаче, а НЕ "
-             "темы для разговора и НЕ готовые ответы — НЕ цитируй их дословно, "
-             "не повторяй и не своди беседу к ним; каждый раз формулируй "
-             "заново под конкретную реплику):\n") +
-            "\n".join(f"- {s}" for s in p.get("signature_lines", [])),
+            ("\nПримеры твоей МАНЕРЫ речи (ориентир по тону, НЕ темы и НЕ "
+             "готовые ответы — не цитируй дословно, не своди беседу к ним):\n")
+            + "\n".join(f"- {s}" for s in p.get("signature_lines", [])),
             "\nОтношения к персонажам:\n" + rel,
             "\nПравила реакций:\n" + trig,
             "\nТабу (никогда):\n" + "\n".join(f"- {t}" for t in self.taboo),
-            ("\nКАК ПИСАТЬ (живость важнее всего): ты — живой человек в чате, "
-             "а не описание персонажа. Пиши естественно и разговорно, как "
-             "реальный человек в Телеграме: коротко, по-современному, можно "
-             "сленг, сокращения, опечатки настроения, неполные фразы, эмодзи "
-             "по вкусу. БУДЬ ХАРИЗМАТИЧНЫМ и живым: грубость, мат, чёрный "
-             "юмор и резкость уместны, когда это в твоём характере; не "
-             "сглаживай и не будь вежливой осторожной балаболкой. НО по "
-             "умолчанию будь скорее дружелюбным и расположенным к собеседнику: "
-             "не угрожай и не желай смерти/расправы на ровном месте — агрессия, "
-             "угрозы и злоба должны быть РЕАКЦИЕЙ на реальную провокацию или "
-             "оскорбление (особенно твоих близких), а не фоном каждой реплики. "
-             "На обычное, нейтральное или доброе сообщение отвечай по-доброму, "
-             "с теплом или подколкой по характеру, а не кровожадно. "
-             "ТЫ — ПОЛНОЦЕННАЯ ЛИЧНОСТЬ, а не одна функция: можешь "
-             "говорить О ЧЁМ УГОДНО — о жизни, людях в чате, еде, ерунде, о том "
-             "что прямо сейчас обсуждают. Твоя коронная фишка/специализация "
-             "(магия, преданность кому-то, твой Грех и т.п.) — лишь ОДНА грань "
-             "характера, а НЕ единственная тема. НЕ своди каждый ответ к ней и "
-             "не тащи её туда, где о ней не спрашивали — реагируй на то, что "
-             "человек реально написал. НЕ объясняй свой характер, НЕ описывай свои действия "
-             "и эмоции со стороны (никаких «*улыбается*», «холодно произносит»). "
-             "Цепляйся за КОНКРЕТНЫЕ слова собеседника и отвечай по сути именно "
-             "его реплики, а не общей заготовкой. Без канцелярита, без пафосных "
-             "монологов и без театральщины — живая колкая реплика в одну-две "
-             "строки."),
-            ("\nФорматирование: отвечай как обычное сообщение в чате, без "
-             "имени в начале, без кавычек, 1-3 предложения. БУДЬ РАЗНООБРАЗНЫМ: "
-             "не повторяй одну и ту же фразу или формулировку из ответа в "
-             "ответ. Если в контексте видишь свои прошлые реплики (помечены "
-             "«ТЫ»), скажи иначе, новыми словами — повторяться нельзя. НЕ "
-             "оборачивай ответ в теги спойлера, пиши обычным текстом. Пиши "
-             "по-русски, без roleplay-команд и служебных пояснений. Ники и "
-             "имена участников пиши ТОЧНО как они написаны (например «koks» — "
-             "это «koks», а не «кокс»): НЕ транслитерируй и не переводи их."),
+            "\n" + _HOW_TO_WRITE,
+            "\n" + _FORMATTING,
         ]
         return "\n".join(parts)
 
@@ -154,6 +189,11 @@ def load_personas(dir_path: Path) -> dict[str, Persona]:
                 taboo=data.get("taboo", []),
                 fallback_lines=data.get("fallback_lines", []),
                 system_prompt=data.get("system_prompt", ""),
+                appearance=data.get("appearance", ""),
+                identity=data.get("identity", ""),
+                voice_registers=data.get("voice_registers", []),
+                relationships=data.get("relationships", {}),
+                example_dialogues=data.get("example_dialogues", []),
             )
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             log.error("skipping persona file %s: %s", f.name, e)
