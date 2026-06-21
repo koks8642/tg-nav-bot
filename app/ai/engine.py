@@ -397,12 +397,27 @@ def _fmt(rows: list[dict]) -> str:
 def _clean(reply: str) -> str:
     """Trim the reply and drop a leading 'Имя:' the model sometimes adds."""
     reply = _strip_thinking(reply)
+    reply = _strip_foreign_scripts(reply)
     head, sep, tail = reply.partition(":")
     if sep and len(head) <= 20 and head.istitle() and "\n" not in head:
         reply = tail.strip() or reply
     if len(reply) > 900:
         reply = reply[:900].rsplit(" ", 1)[0] + "…"
     return reply
+
+
+# CJK / Hangul / Kana — Llama occasionally code-switches into these mid-reply.
+# Strip them (and any space left dangling) without touching Cyrillic, Latin,
+# digits, punctuation or emoji.
+_CJK_RE = re.compile(
+    r"[぀-ヿ㐀-䶿一-鿿가-힯豈-﫿]+")
+
+
+def _strip_foreign_scripts(reply: str) -> str:
+    if not _CJK_RE.search(reply):
+        return reply
+    cleaned = _CJK_RE.sub("", reply)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
 
 
 def _strip_thinking(reply: str) -> str:

@@ -519,6 +519,13 @@ def test_parse_json_block():
     assert json.loads("{}") == {}
 
 
+def test_strip_foreign_scripts():
+    from app.ai.engine import _strip_foreign_scripts
+    assert _strip_foreign_scripts("откуда 这种 сплетни 🤔") == "откуда сплетни 🤔"
+    assert _strip_foreign_scripts("Алон лошара koks") == "Алон лошара koks"
+    assert _strip_foreign_scripts("한국어 тест 日本語 ок") == "тест ок"
+
+
 def test_strip_thinking():
     assert _strip_thinking("<think>думаю</think>Ответ") == "Ответ"
     assert _strip_thinking("<think>думаю без конца") == ""
