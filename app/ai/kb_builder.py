@@ -65,6 +65,7 @@ class KbBuilder:
     def __init__(self, store, llm, *, index_path: str | Path,
                  live_index_path: str | Path | None = None,
                  corpus_dir: str | Path | None = None,
+                 chapters_source=None,
                  model: str = "llama-3.1-8b-instant", pace_sec: float = 4.0,
                  max_chars: int = 14000):
         self.store = store
@@ -72,6 +73,10 @@ class KbBuilder:
         self.index_path = Path(index_path)
         self.live_index_path = Path(live_index_path) if live_index_path else None
         self.corpus_dir = Path(corpus_dir) if corpus_dir else None
+        # optional async callable -> [{n, path}] from the bot's OWN chapter
+        # registry: new chapters added by the channel hashtag trigger are
+        # summarised automatically (no cron) when AI runs on that bot.
+        self.chapters_source = chapters_source
         # preferred model first, then the rest of the cheap cascade
         self.models = (model,) + tuple(m for m in KB_MODELS if m != model)
         self.pace_sec = pace_sec
@@ -118,6 +123,22 @@ class KbBuilder:
                     seen.add(n)
         return out
 
+    async def _collect_chapters(self) -> list[dict]:
+        """Bundled snapshot + live index + the bot's own chapter registry,
+        deduped by number (earlier source wins, so corpus text beats Telegraph)."""
+        out = self._load_index()
+        seen = {c["n"] for c in out}
+        if self.chapters_source is not None:
+            try:
+                for c in await self.chapters_source():
+                    n = c.get("n")
+                    if isinstance(n, int) and n not in seen and c.get("path"):
+                        out.append(c)
+                        seen.add(n)
+            except Exception as e:  # noqa: BLE001 — registry read must not break
+                log.debug("kb: chapters_source failed: %s", e)
+        return out
+
     async def _session_get(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
@@ -128,9 +149,9 @@ class KbBuilder:
     async def _loop(self) -> None:
         log.info("kb builder started")
         while not self._stop.is_set():
-            # reload the index each cycle so newly-published chapters (added to
-            # the live index by the cron) get picked up automatically
-            chapters = self._load_index()
+            # recollect each cycle so newly-published chapters (registry hashtag
+            # trigger, or a refreshed live index) get picked up automatically
+            chapters = await self._collect_chapters()
             done = await self.store.kb_chapters()
             todo = [c for c in chapters if c["n"] not in done]
             if not todo:

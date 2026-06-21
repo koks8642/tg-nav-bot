@@ -140,6 +140,7 @@ async def run() -> None:
         kb_builder = KbBuilder(ai_store, llm, index_path=cfg.ai_chapters_index,
                                live_index_path=cfg.ai_chapters_index_live or None,
                                corpus_dir=cfg.ai_corpus_dir or None,
+                               chapters_source=db.chapters_for_kb,
                                model=cfg.ai_kb_model)
         log.info("AI persona chat ready: %d personas, %d lexicon entities, "
                  "lore %d chars, model %s, KB %d chapters", len(personas),

@@ -638,6 +638,24 @@ class Database:
         return await self.fetchone("SELECT * FROM posts WHERE message_id=?", (message_id,))
 
     # ── chapters ─────────────────────────────────────────────────────────────
+    async def chapters_for_kb(
+            self, project_key: str = "proj_stal-pokrovitelem-zlodeev"
+    ) -> list[dict]:
+        """Chapters of a project as {n, path} (Telegraph path) for the AI KB
+        builder. New chapters added by the channel hashtag trigger appear here,
+        so the builder summarises them automatically."""
+        rows = await self.fetchall(
+            "SELECT ch.number AS n, ch.telegraph_url AS url FROM chapters ch "
+            "JOIN projects p ON p.id=ch.project_id "
+            "WHERE p.key=? AND ch.telegraph_url<>'' ORDER BY ch.number",
+            (project_key,))
+        out = []
+        for r in rows:
+            path = r["url"].rstrip("/").split("telegra.ph/")[-1]
+            if path:
+                out.append({"n": r["n"], "path": path})
+        return out
+
     async def upsert_chapter(self, project_id: int, number: int, arc: str | None,
                              title: str | None, telegraph_url: str,
                              post_id: int | None, src_kind: str,
