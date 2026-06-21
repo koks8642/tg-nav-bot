@@ -349,6 +349,10 @@ class BotApp:
             await self.db.log("INFO", "watcher",
                               f"msg {msg.message_id} {result.action} "
                               f"chapters={result.chapters} items={result.items}")
+            # initiative: let the active persona react to the fresh post in the
+            # group (dormant unless AI is enabled with a persona + chat)
+            if self.ai is not None and not is_edit and text.strip():
+                await self.ai.react_to_post(text)
 
     # ── commands ─────────────────────────────────────────────────────────────
     def _greeting_html(self, is_adm: bool) -> str:
@@ -481,6 +485,7 @@ class BotApp:
         """Engine → Telegram. Format and send one persona reply, returning the
         sent message id (so the engine can remember it). Never raises."""
         bot = self.application.bot
+        reply_to = reply_to or None  # 0 = standalone (e.g. a post reaction)
         try:
             sent = await bot.send_message(
                 chat_id, _ai_to_html(raw_text),

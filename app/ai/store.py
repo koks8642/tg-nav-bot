@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS summaries (
   title    TEXT,
   text     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS affinity (
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  value   INTEGER NOT NULL DEFAULT 0,
+  updated TEXT,
+  PRIMARY KEY (chat_id, user_id)
+);
 """
 
 # kept per chat: enough to reconstruct reply threads and feed the context
@@ -194,6 +201,31 @@ class AiStore:
         rows = [dict(r) for r in await cur.fetchall()]
         rows.reverse()
         return rows
+
+    # ── per-user affinity (how the persona feels about each person) ───────
+    async def affinity_get(self, chat_id: int, user_id: int) -> int:
+        cur = await self.conn.execute(
+            "SELECT value FROM affinity WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id))
+        row = await cur.fetchone()
+        return int(row["value"]) if row else 0
+
+    async def affinity_bump(self, chat_id: int, user_id: int,
+                            delta: int, lo: int = -100, hi: int = 100) -> int:
+        """Nudge the persona's affinity toward a user, clamped to [lo, hi].
+        Returns the new value."""
+        cur = await self.conn.execute(
+            "SELECT value FROM affinity WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id))
+        row = await cur.fetchone()
+        new = max(lo, min(hi, (int(row["value"]) if row else 0) + int(delta)))
+        await self.conn.execute(
+            "INSERT INTO affinity(chat_id,user_id,value,updated) "
+            "VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+            "value=excluded.value, updated=excluded.updated",
+            (chat_id, user_id, new, _now()))
+        await self.conn.commit()
+        return new
 
     async def get_msg(self, chat_id: int, msg_id: int) -> dict | None:
         cur = await self.conn.execute(

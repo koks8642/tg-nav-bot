@@ -19,7 +19,7 @@ import re
 import time
 from collections import defaultdict
 
-from .decision import ASK, DIRECT, RESPOND, decide
+from .decision import AMBIENT, ASK, DIRECT, RESPOND, decide
 from .client import CASCADE_ORDER, AiApiClient, EmptyResponse, RateLimited
 from .personas import Lexicon, Persona
 from .queue import FairQueue, Job
@@ -35,11 +35,23 @@ DEFAULTS = {
     "butt_in_pct": 2.5,         # % chance to butt into an off-topic message
     "context_messages": 22,     # recent chat shown to the persona (lean: more
     #                             context made the model drown & misread refs)
+    "spoiler_after_chapter": 0,  # >0: facts past this chapter are late spoilers
+    #                              the persona hints at but won't reveal (0=off)
     "dup_limit": 5,             # identical msgs/min from one user before ignore
     "rate_limit_cooldown_sec": 25.0,  # fallback pause after a provider 429
     "max_rate_limit_cooldown_sec": 90.0,  # never freeze the avatar for hours
 }
 DUP_WINDOW_SEC = 60.0
+
+# Cheap sentiment markers to nudge per-user affinity on DIRECT messages (the
+# classifier judges tone for ambient ones). Substring match, lowercased.
+_AFF_NEG = ("хуй", "хуе", "лох", "туп", "дур", "кончен", "идиот", "урод",
+            "сука", "тварь", "ненавиж", "мраз", "гнид", "дебил", "уёб", "уеб",
+            "пидор", "заткн", "отстой", "бесиш", "нахуй", "залуп", "чмо",
+            "выкуси", "сдохн", "ублюд", "говн")
+_AFF_POS = ("спасибо", "люблю", "красив", "умниц", "уважа", "обожа", "классн",
+            "прекрасн", "восхищ", "молодец", "мил", "нрав", "лучш", "добр",
+            "ценю", "благодар", "восхитительн", "прелест")
 THINK_BLOCK_RE = re.compile(
     r"<\s*think(?:\s+[^>]*)?>.*?<\s*/\s*think\s*>", re.I | re.S)
 THINK_OPEN_RE = re.compile(r"<\s*think(?:\s+[^>]*)?>", re.I)
@@ -50,12 +62,15 @@ CLASSIFIER_SYSTEM = """\
 покровителем злодеев» в групповом чате. Реши, стоит ли персонажу ответить на
 НОВОЕ сообщение, исходя из его характера и контекста.
 Ответь СТРОГО JSON: {{"respond": true/false, "mode":
-"insult"|"plot"|"lore"|"casual", "heat": 0-3}}
+"insult"|"plot"|"lore"|"casual", "heat": 0-3, "affinity": -3..3}}
 - respond=true, если сообщение задевает {name} или близких ему персонажей,
   оскорбляет/хвалит персонажей или новеллу, спрашивает о сюжете/мире, или это
   реплика, куда {name} органично вставит своё слово.
 - mode: insult — наезд; plot — вопрос о событиях («что было в главе…»); lore —
   вопрос о мире/персонажах; casual — обычная реплика.
+- affinity: как сообщение влияет на отношение {name} к АВТОРУ сообщения:
+  оскорбление {name}/Алона/близких или хамство → отрицательно (−1..−3);
+  уважение, доброта, похвала, поддержка → положительно (+1..+3); нейтрально → 0.
 - respond=false на скучные бытовые сообщения без зацепок.
 """
 
@@ -129,6 +144,30 @@ class AiEngine:
         except Exception:  # noqa: BLE001 — must never break the bot loop
             log.exception("ai on_group_message failed")
 
+    async def react_to_post(self, text: str) -> None:
+        """Initiative: the active persona comments on a fresh channel post in
+        the enabled group(s). No-op without a persona / enabled chat, so it lies
+        dormant on the test stand and lights up on the channel-watching bot."""
+        try:
+            persona = await self.active_persona()
+            if persona is None or not (text or "").strip():
+                return
+            for chat_id in await self.store.enabled_chats():
+                self._queue.push(Job(
+                    chat_id=chat_id, reply_to=0, user_id=None, username=None,
+                    text=text[:600], priority=AMBIENT, mode="react_post",
+                    enqueued_at=time.time()))
+        except Exception:  # noqa: BLE001 — initiative must never break the bot
+            log.exception("ai react_to_post failed")
+
+    def _post_reaction_prompt(self, job: Job) -> str:
+        return (
+            "В канале только что вышел новый пост:\n«" + job.text + "»\n\n"
+            "Отреагируй на него ОДНОЙ короткой живой репликой в своём "
+            "характере, будто увидела его в чате. Если это про твой мир (новая "
+            "глава, арт) — тем уместнее. Без шаблонных приветствий и без "
+            "пересказа поста — просто твоя живая реакция.")
+
     async def _handle(self, chat_id, msg_id, user_id, username, text,
                       reply_to, reply_to_is_bot) -> None:
         # always remember the message (memory survives even when we don't reply)
@@ -167,11 +206,20 @@ class AiEngine:
                 return  # already have a reply queued for this person
 
         mode = self._quick_mode(text, other_score)
+        aff_delta = self._affinity_delta(text)  # cheap heuristic for direct
         if d.action == ASK:
             verdict = await self._classify(persona, chat_id, text)
             if not verdict or not verdict.get("respond"):
                 return
             mode = str(verdict.get("mode") or mode)
+            # classifier read the tone too — trust it over the heuristic
+            if "affinity" in verdict:
+                aff_delta = int(verdict.get("affinity") or 0)
+
+        # the persona's feeling about this person drifts with how they talk to it
+        if user_id is not None and aff_delta:
+            await self.store.affinity_bump(
+                chat_id, user_id, max(-3, min(3, aff_delta)))
 
         self._queue.push(Job(
             chat_id=chat_id, reply_to=msg_id, user_id=user_id,
@@ -201,6 +249,28 @@ class AiEngine:
         if any(h in low for h in self._PLOT_HINTS):
             return "plot"
         return "insult" if other_score >= 3 else "casual"
+
+    @staticmethod
+    def _affinity_delta(text: str) -> int:
+        """Small ±2 nudge to per-user affinity from message tone (warm words up,
+        insults down). Coarse on purpose — the relationship drifts over many
+        messages, no per-message precision needed."""
+        low = text.lower()
+        pos = sum(1 for w in _AFF_POS if w in low)
+        neg = sum(1 for w in _AFF_NEG if w in low)
+        return max(-2, min(2, pos - neg))
+
+    @staticmethod
+    def _affinity_label(value: int) -> str:
+        if value >= 35:
+            return "тёплое, ты к нему расположена"
+        if value >= 12:
+            return "скорее доброжелательное"
+        if value <= -35:
+            return "враждебное, ты едва терпишь его"
+        if value <= -12:
+            return "холодное и настороженное"
+        return "нейтральное"
 
     async def _classify(self, persona: Persona, chat_id: int,
                         text: str) -> dict | None:
@@ -274,9 +344,13 @@ class AiEngine:
         persona = await self.active_persona()  # may have changed since enqueue
         if persona is None:
             return
-        prompt = await self._build_prompt(persona, job)
-        system = self.system_for(
-            persona, include_lore=job.mode in ("plot", "lore"))
+        if job.mode == "react_post":
+            prompt = self._post_reaction_prompt(job)
+            system = self.system_for(persona, include_lore=True)
+        else:
+            prompt = await self._build_prompt(persona, job)
+            system = self.system_for(
+                persona, include_lore=job.mode in ("plot", "lore"))
         try:
             reply = await self._generate_cascade(system, prompt, max_tokens=320)
         except RateLimited as e:
@@ -294,7 +368,7 @@ class AiEngine:
                      if persona.fallback_lines and job.priority == DIRECT
                      else None)
         except Exception as e:  # noqa: BLE001 — never crash the worker
-            log.warning("generation failed (%s): %s", model, e)
+            log.warning("generation failed: %s", e)
             return
         if not reply:
             return
@@ -351,6 +425,16 @@ class AiEngine:
             if facts:
                 parts.append(facts)
 
+        # 3.5) your standing feeling about THIS person (drives mood). Only
+        #      mentioned when not neutral, to keep the prompt lean.
+        if job.user_id is not None:
+            val = await self.store.affinity_get(job.chat_id, job.user_id)
+            if val:
+                parts.append(
+                    f"Твоё нынешнее отношение к {speaker}: "
+                    f"{self._affinity_label(val)}. Пусть оно сквозит в тоне, но "
+                    f"не объявляй его вслух.")
+
         # 4) the current message, framed so referents are parsed correctly
         parts.append(
             f"СЕЙЧАС тебе пишет {speaker}. Его сообщение:\n«{job.text[:800]}»")
@@ -368,8 +452,9 @@ class AiEngine:
         return "\n\n".join(parts)
 
     async def _kb_facts(self, job: Job) -> str:
-        """Relevant chapter digests for a plot/lore question: the exact chapter
-        if a number is named, plus content matches."""
+        """What the persona knows about the asked plot — scoped as HER own
+        knowledge (witnessed or heard from her people), and held back as a
+        late spoiler when it's past the configured spoiler line."""
         facts: list[tuple[int, str]] = []
         seen: set[int] = set()
         num = _chapter_number(job.text)
@@ -385,8 +470,17 @@ class AiEngine:
         if not facts:
             return ""
         kb = "\n".join(f"Глава {ch}: {txt[:320]}" for ch, txt in facts[:4])
-        return ("ФАКТЫ ИЗ ГЛАВ (реальные события сюжета — перескажи их своими "
-                "словами в характере, по сути вопроса, не отнекивайся):\n" + kb)
+        # spoiler line: facts past it are serious late spoilers → don't reveal
+        line = int(await self.setting("spoiler_after_chapter"))
+        if line > 0 and facts[0][0] > line:
+            return ("Вопрос касается ПОЗДНИХ событий, которые ещё рано "
+                    "раскрывать. НЕ пересказывай их прямо — ответь уклончиво "
+                    "или с намёком, поддразни, что всему своё время. Для "
+                    "ТВОЕГО понимания (НЕ для пересказа): " + kb)
+        return ("Вот что ТЫ об этом знаешь — ты была там сама или узнала от "
+                "своих (донесения, слухи в твоих кругах). Излагай это как СВОЁ "
+                "знание, по сути вопроса, в характере; не отнекивайся, но и не "
+                "выдавай того, чего знать никак не могла:\n" + kb)
 
     async def _sleep(self, seconds: float) -> None:
         try:

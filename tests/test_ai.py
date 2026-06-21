@@ -519,6 +519,44 @@ def test_parse_json_block():
     assert json.loads("{}") == {}
 
 
+def test_engine_react_to_post_enqueues(tmp_path):
+    async def go():
+        eng = await make_engine(tmp_path, FakeAiClient())
+        await eng.react_to_post("Вышла глава 328! Покровитель злодеев.")
+        assert len(eng._queue) == 1
+        job = eng._queue.pop(0.0)
+        assert job.mode == "react_post" and job.reply_to == 0
+        # no enabled chat / no persona → no-op
+        await eng.store.set("active_persona", "")
+        await eng.react_to_post("ещё пост")
+        assert len(eng._queue) == 0
+        await eng.store.close()
+    asyncio.run(go())
+
+
+def test_affinity_store_bump_and_clamp(tmp_path):
+    async def go():
+        s = AiStore(tmp_path / "ai.db")
+        await s.connect()
+        assert await s.affinity_get(-1, 7) == 0
+        assert await s.affinity_bump(-1, 7, 5) == 5
+        assert await s.affinity_bump(-1, 7, -8) == -3
+        assert await s.affinity_bump(-1, 7, 999) == 100   # clamped high
+        assert await s.affinity_bump(-1, 7, -999) == -100  # clamped low
+        await s.close()
+    asyncio.run(go())
+
+
+def test_affinity_delta_and_label():
+    from app.ai.engine import AiEngine
+    assert AiEngine._affinity_delta("спасибо, ты умница") >= 1
+    assert AiEngine._affinity_delta("ты тупая дура") <= -1
+    assert AiEngine._affinity_delta("какая сегодня погода") == 0
+    assert "тёплое" in AiEngine._affinity_label(40)
+    assert "враждебное" in AiEngine._affinity_label(-40)
+    assert AiEngine._affinity_label(0) == "нейтральное"
+
+
 def test_chapter_number_detection():
     from app.ai.engine import _chapter_number
     assert _chapter_number("что было в 300 главе") == 300
