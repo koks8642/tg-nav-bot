@@ -20,29 +20,18 @@ CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
 
-# Chat-suitable models on Groq, shown by /ai model. The two strongest first.
+# Chat models offered by /ai model — LLAMA ONLY. The safety-tuned gpt-oss
+# family breaks character (writes code, plays assistant) and qwen goes stiff,
+# so they are deliberately excluded from roleplay. llama-3.3-70b is the best.
 AVAILABLE_MODELS = (
     "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "qwen/qwen3-32b",
-    "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
 )
 
-# Auto-failover order when the active model is rate-limited: the two best
-# models first, smaller/faster ones only as a last resort so the avatar keeps
-# talking even when the good models hit their daily cap.
-# RP quality first: Llama models roleplay far more naturally than the
-# safety-tuned gpt-oss family (which goes stiff/assistant-like), so on a
-# rate-limit failover we drop to llama-4-scout BEFORE gpt-oss.
-CASCADE_ORDER = (
-    "llama-3.3-70b-versatile",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-)
+# Failover when the active model is rate-limited — Llama-only too: better a
+# short silence than a character-breaking gpt-oss reply.
+CASCADE_ORDER = AVAILABLE_MODELS
 
 
 class RateLimited(Exception):
