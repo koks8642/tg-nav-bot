@@ -19,8 +19,10 @@ services:
       DB_PATH: /data/rqm.db          # separate volume, separate DB from prod
       PORT: "8080"                    # internal only — not published to host
       SEED_DEFAULT_REGISTRY: "0"      # no RQM registry; this is an AI-chat stand
+      AI_CORPUS_DIR: /corpus          # full chapter text for the KB builder
     volumes:
       - rqm-test-data:/data
+      - ./corpus:/corpus:ro          # bind-mounted novel corpus (Глава_*.md)
     security_opt:
       - no-new-privileges:true
     cap_drop:

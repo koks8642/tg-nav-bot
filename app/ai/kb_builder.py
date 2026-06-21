@@ -63,11 +63,13 @@ SUMMARY_SYSTEM = (
 
 class KbBuilder:
     def __init__(self, store, llm, *, index_path: str | Path,
+                 corpus_dir: str | Path | None = None,
                  model: str = "llama-3.1-8b-instant", pace_sec: float = 4.0,
                  max_chars: int = 14000):
         self.store = store
         self.llm = llm
         self.index_path = Path(index_path)
+        self.corpus_dir = Path(corpus_dir) if corpus_dir else None
         # preferred model first, then the rest of the cheap cascade
         self.models = (model,) + tuple(m for m in KB_MODELS if m != model)
         self.pace_sec = pace_sec
@@ -99,7 +101,8 @@ class KbBuilder:
         except (OSError, json.JSONDecodeError) as e:
             log.warning("kb: no chapter index at %s (%s)", self.index_path, e)
             return []
-        return [c for c in data if isinstance(c.get("n"), int) and c.get("p")]
+        return [c for c in data if isinstance(c.get("n"), int)
+                and (c.get("file") or c.get("path") or c.get("p"))]
 
     async def _session_get(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -141,7 +144,7 @@ class KbBuilder:
         log.info("kb builder stopped")
 
     async def _do_chapter(self, c: dict) -> None:
-        text, title = await self._fetch(c["p"])
+        text, title = await self._fetch(c)
         if not text or len(text) < 200:
             log.info("kb: chapter %d empty/short, skipping", c["n"])
             return
@@ -164,7 +167,18 @@ class KbBuilder:
         await self.store.kb_put(c["n"], title or f"Глава {c['n']}", summary)
         log.info("kb: chapter %d done (%d chars)", c["n"], len(text))
 
-    async def _fetch(self, path: str) -> tuple[str, str]:
+    async def _fetch(self, c: dict) -> tuple[str, str]:
+        # local corpus file (full text) preferred; else the Telegraph page
+        fname = c.get("file")
+        if fname and self.corpus_dir:
+            try:
+                raw = (self.corpus_dir / fname).read_text(encoding="utf-8")
+            except OSError:
+                return "", ""
+            return _md_text(raw)
+        path = c.get("path") or c.get("p")
+        if not path:
+            return "", ""
         sess = await self._session_get()
         async with sess.get(TELEGRAPH_GET.format(path=path)) as resp:
             data = await resp.json(content_type=None)
@@ -176,6 +190,24 @@ class KbBuilder:
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
         except asyncio.TimeoutError:
             pass
+
+
+def _md_text(raw: str) -> tuple[str, str]:
+    """Extract (prose+dialogue, title) from a corpus chapter .md, dropping the
+    markdown headers and the italic author line."""
+    title = ""
+    body: list[str] = []
+    for ln in raw.split("\n"):
+        s = ln.strip()
+        if s.startswith("## "):
+            title = s.lstrip("# ").strip()
+        elif s.startswith("#"):
+            continue
+        elif s.startswith("*") and s.endswith("*") and len(s) < 60:
+            continue
+        else:
+            body.append(ln)
+    return "\n".join(body).strip(), (title or "Глава")
 
 
 def _flatten(nodes) -> str:

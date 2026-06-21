@@ -84,6 +84,7 @@ class Config:
     ai_classifier_model: str
     ai_kb_model: str
     ai_chapters_index: Path
+    ai_corpus_dir: str
     ai_db_path: Path
     ai_personas_dir: Path
 
@@ -174,6 +175,7 @@ def load_config(*, require_bot: bool = True) -> Config:
         ).strip(),
         ai_chapters_index=Path(os.environ.get(
             "AI_CHAPTERS_INDEX", str(PROJECT_ROOT / "data/chapters_index.json"))),
+        ai_corpus_dir=os.environ.get("AI_CORPUS_DIR", "").strip(),
         ai_db_path=(db_path.parent / "ai.db"),
         ai_personas_dir=Path(os.environ.get(
             "AI_PERSONAS_DIR", str(PROJECT_ROOT / "personas"))),

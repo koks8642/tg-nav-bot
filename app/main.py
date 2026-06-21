@@ -138,6 +138,7 @@ async def run() -> None:
                           classifier_model=cfg.ai_classifier_model)
         ai_engine = AiEngine(ai_store, llm, personas, lexicon, lore)
         kb_builder = KbBuilder(ai_store, llm, index_path=cfg.ai_chapters_index,
+                               corpus_dir=cfg.ai_corpus_dir or None,
                                model=cfg.ai_kb_model)
         log.info("AI persona chat ready: %d personas, %d lexicon entities, "
                  "lore %d chars, model %s, KB %d chapters", len(personas),
