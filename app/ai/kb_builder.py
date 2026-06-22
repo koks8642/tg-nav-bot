@@ -30,9 +30,13 @@ TELEGRAPH_GET = "https://api.telegra.ph/getPage/{path}?return_content=true"
 # spreading the build across several small models multiplies the daily token
 # budget — and deliberately avoids the chat's premium models (70b / gpt-120b),
 # so summarising chapters never eats the chat's quota.
+# gpt-oss-120b first: it's the most accurate summariser and the chat no longer
+# uses it (chat is Llama-only), so its whole daily budget is free for the KB.
+# Smaller models are fallbacks when it's rate-limited.
 KB_MODELS = (
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
 )
 MAX_BACKOFF_SEC = 1800.0  # don't sleep for hours on a daily-limit retry-after
 
