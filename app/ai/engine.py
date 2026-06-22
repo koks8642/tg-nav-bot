@@ -419,9 +419,9 @@ class AiEngine:
                        else f"на сообщение {tgt['username'] or 'кого-то'}")
                 parts.append(f"{speaker} отвечает {who}: «{tgt['text'][:200]}»")
 
-        # 3) plot/lore facts (Sprint 3 adds character-scoping + spoilers)
+        # 3) plot/lore facts (character-scoped, first-person, spoiler-aware)
         if job.mode in ("plot", "lore"):
-            facts = await self._kb_facts(job)
+            facts = await self._kb_facts(job, persona)
             if facts:
                 parts.append(facts)
 
@@ -451,7 +451,7 @@ class AiEngine:
             f"(«ТЫ» выше) — каждый раз формулируй заново.")
         return "\n\n".join(parts)
 
-    async def _kb_facts(self, job: Job) -> str:
+    async def _kb_facts(self, job: Job, persona: Persona) -> str:
         """What the persona knows about the asked plot — scoped as HER own
         knowledge (witnessed or heard from her people), and held back as a
         late spoiler when it's past the configured spoiler line."""
@@ -470,17 +470,24 @@ class AiEngine:
         if not facts:
             return ""
         kb = "\n".join(f"Глава {ch}: {txt[:320]}" for ch, txt in facts[:4])
+        # CRITICAL: the digests are third-person narration; tell the persona
+        # that any mention of THEIR OWN name in them is them, to answer in the
+        # first person (otherwise it parrots «Ютия сделала…» about itself).
+        whoami = (f"ВАЖНО: ты — {persona.name}. Везде, где в фактах ниже "
+                  f"упомянута {persona.name} — это ТЫ САМА; рассказывай от "
+                  f"первого лица («я», «меня»), а не о себе в третьем лице.\n")
         # spoiler line: facts past it are serious late spoilers → don't reveal
         line = int(await self.setting("spoiler_after_chapter"))
         if line > 0 and facts[0][0] > line:
-            return ("Вопрос касается ПОЗДНИХ событий, которые ещё рано "
+            return (whoami + "Вопрос касается ПОЗДНИХ событий, которые ещё рано "
                     "раскрывать. НЕ пересказывай их прямо — ответь уклончиво "
                     "или с намёком, поддразни, что всему своё время. Для "
                     "ТВОЕГО понимания (НЕ для пересказа): " + kb)
-        return ("Вот что ТЫ об этом знаешь — ты была там сама или узнала от "
-                "своих (донесения, слухи в твоих кругах). Излагай это как СВОЁ "
-                "знание, по сути вопроса, в характере; не отнекивайся, но и не "
-                "выдавай того, чего знать никак не могла:\n" + kb)
+        return (whoami + "Вот что ТЫ об этом знаешь — ты была там сама или "
+                "узнала от своих (донесения, слухи в твоих кругах). Излагай "
+                "это как СВОЁ знание, от первого лица, по сути вопроса, в "
+                "характере; не отнекивайся, но и не выдавай того, чего знать "
+                "никак не могла:\n" + kb)
 
     async def _sleep(self, seconds: float) -> None:
         try:
