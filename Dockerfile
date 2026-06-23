@@ -1,8 +1,12 @@
 FROM python:3.11-slim
 
+ARG APP_RELEASE=dev
+LABEL org.opencontainers.image.version="${APP_RELEASE}"
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    APP_RELEASE="${APP_RELEASE}"
 
 WORKDIR /app
 

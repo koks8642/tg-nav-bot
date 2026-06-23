@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from typing import Any
 
 from .decision import AMBIENT, DIRECT
 
@@ -27,6 +28,11 @@ class Job:
     mode: str              # insult | plot | lore | casual
     enqueued_at: float
     replied_to: int | None = None  # msg id the USER replied to (if any)
+    plan: dict[str, Any] | None = None  # v2 ReplyPlan, JSON-safe for tracing
+    needs_classifier: bool = False
+    persona_key: str = ""
+    profile_version: str = ""
+    thread_id: int = 0
 
 
 class FairQueue:
@@ -47,6 +53,16 @@ class FairQueue:
         lane.append(job)
         while len(lane) > self.lane_max:
             lane.popleft()  # drop the oldest in this lane under flood
+
+    def clear(self) -> int:
+        removed = len(self)
+        self._direct.clear()
+        self._ambient.clear()
+        self._streak = 0
+        return removed
+
+    def is_stale(self, job: Job, now: float) -> bool:
+        return job.enqueued_at > 0 and now - job.enqueued_at > self.stale_sec
 
     def has_pending_from(self, chat_id: int, user_id: int | None) -> bool:
         if user_id is None:

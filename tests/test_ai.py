@@ -14,7 +14,7 @@ from app.ai.decision import (
     SKIP,
     decide,
 )
-from app.ai.engine import AiEngine, _strip_thinking
+from app.ai.engine import AiEngine, _clean, _strip_thinking
 from app.ai.client import parse_json_block
 from app.ai.personas import Lexicon, Persona, load_lexicon, load_lore, load_personas
 from app.ai.queue import FairQueue, Job
@@ -160,7 +160,7 @@ def make_persona(**over) -> Persona:
         key="yutia", name="Ютия", aliases=["Ютия", "Ютии", "Ютию"],
         one_liner="тест", spoiler_safe_until=0,
         persona={"relations": {}, "signature_lines": []},
-        triggers=[], taboo=[], fallback_lines=["Считай свои вдохи."],
+        triggers=[], taboo=[],
         system_prompt="Ты — Ютия.")
     base.update(over)
     return Persona(**base)
@@ -246,7 +246,13 @@ def test_engine_entity_asks_classifier_yes(tmp_path):
         gem = FakeAiClient(classify_result={"respond": True, "mode": "insult"})
         eng = await make_engine(tmp_path, gem)
         await eng.on_group_message(**kw(text="Алон конченый"))
-        assert gem.classify_calls == 1 and len(eng._queue) == 1
+        assert gem.classify_calls == 0 and len(eng._queue) == 1
+        async def send(*args):
+            return 10
+        eng.send_callback = send
+        job = eng._queue.pop(0.0)
+        await eng._run_job(job)
+        assert gem.classify_calls == 1
         await eng.store.close()
     asyncio.run(go())
 
@@ -256,7 +262,13 @@ def test_engine_entity_classifier_no_skips(tmp_path):
         gem = FakeAiClient(classify_result={"respond": False})
         eng = await make_engine(tmp_path, gem)
         await eng.on_group_message(**kw(text="читаю эту главу сейчас"))
-        assert gem.classify_calls == 1 and len(eng._queue) == 0
+        assert gem.classify_calls == 0 and len(eng._queue) == 1
+        async def send(*args):
+            return 10
+        eng.send_callback = send
+        job = eng._queue.pop(0.0)
+        await eng._run_job(job)
+        assert gem.classify_calls == 1 and gem.generate_calls == 0
         await eng.store.close()
     asyncio.run(go())
 
@@ -419,7 +431,7 @@ def test_engine_run_job_strips_thinking_no_model_tag(tmp_path):
     asyncio.run(go())
 
 
-def test_engine_run_job_empty_uses_fallback_for_direct(tmp_path):
+def test_engine_run_job_empty_stays_silent_after_cascade(tmp_path):
     async def go():
         from app.ai.client import EmptyResponse
         gem = FakeAiClient(generate_result=EmptyResponse("x"))
@@ -433,7 +445,7 @@ def test_engine_run_job_empty_uses_fallback_for_direct(tmp_path):
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="t", priority=DIRECT,
                                mode="casual", enqueued_at=0.0))
-        assert sent == ["Считай свои вдохи."]
+        assert sent == []
         await eng.store.close()
     asyncio.run(go())
 
@@ -578,3 +590,11 @@ def test_strip_thinking():
     assert _strip_thinking("обычный ответ без think") == "обычный ответ без think"
     # latin words are NOT stripped/rejected anymore — they're allowed
     assert _strip_thinking("RPG тут уместно") == "RPG тут уместно"
+
+
+def test_clean_strips_quotes_wrapping_whole_reply():
+    assert _clean("«Теряешь голову? Это я-то?»") == "Теряешь голову? Это я-то?"
+    assert _clean("“Тихо. Я ещё не сержусь.”") == "Тихо. Я ещё не сержусь."
+    assert _clean('"Обычный ответ."') == "Обычный ответ."
+    assert _clean("«Незакрытая реплика") == "Незакрытая реплика"
+    assert _clean("Она сказала: «нет» — и ушла.") == "Она сказала: «нет» — и ушла."

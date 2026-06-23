@@ -14,13 +14,14 @@ premium model budget.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from pathlib import Path
 
 import aiohttp
 
-from .client import RateLimited
+from .client import RateLimited, parse_json_block
 
 log = logging.getLogger("ai.kb")
 
@@ -39,6 +40,8 @@ KB_MODELS = (
     "llama-3.1-8b-instant",
 )
 MAX_BACKOFF_SEC = 1800.0  # don't sleep for hours on a daily-limit retry-after
+SUMMARY_PROMPT_VERSION = "summary-v2.1"
+SCENE_PROMPT_VERSION = "scene-v2.1"
 
 # Canonical spellings so the same entity reads the same across all chapters
 # (the source MTL spells names inconsistently, which fragments KB search).
@@ -66,6 +69,28 @@ SUMMARY_SYSTEM = (
     "- Для этих сущностей используй РОВНО такие написания (в переводе они "
     "могут писаться иначе — приводи к этим):\n" + CANON)
 
+SCENE_SYSTEM = """\
+Ты превращаешь полный текст главы «Стал покровителем злодеев» в структурированные
+сцены для профессионального ИИ-аватара. Верни СТРОГО JSON:
+{"scenes":[{"id":"короткий-id","participants":["имена"],"events":"законченный
+фактический пересказ сцены","decisions":"решения и поступки","motives":"мотивы,
+только если они прямо следуют из текста","quotes":["до 3 коротких важных
+реплик"],"witnessed_by":["кто присутствовал лично"],"reportable_to":["кто мог
+реалистично узнать это через свои связи"],"public_facts":"что стало публично",
+"forbidden_secrets":["какие сведения нельзя приписывать персонажам, которые их
+не знают"],"confidence":0.0-1.0}]}
+
+Правила:
+- Только факты главы, без домыслов.
+- Делай 1-5 содержательных сцен, не дроби каждый диалог.
+- Различай личное присутствие, возможное донесение и публичное знание.
+- reportable_to заполняй только при прямом основании в тексте: действующая
+  агентурная сеть, подчинённые свидетели или явно переданное донесение. Не
+  считай, что влиятельный персонаж автоматически знает всё.
+- Секрет Алона о перерождении/попаданчестве нельзя приписывать другим.
+- Используй канонические написания имён.
+"""
+
 
 class KbBuilder:
     def __init__(self, store, llm, *, index_path: str | Path,
@@ -73,7 +98,8 @@ class KbBuilder:
                  corpus_dir: str | Path | None = None,
                  chapters_source=None,
                  model: str = "llama-3.1-8b-instant", pace_sec: float = 4.0,
-                 max_chars: int = 14000):
+                 max_chars: int = 14000,
+                 scene_focus_entities: list[str] | None = None):
         self.store = store
         self.llm = llm
         self.index_path = Path(index_path)
@@ -87,6 +113,8 @@ class KbBuilder:
         self.models = (model,) + tuple(m for m in KB_MODELS if m != model)
         self.pace_sec = pace_sec
         self.max_chars = max_chars
+        self.scene_focus_entities = [
+            str(v) for v in (scene_focus_entities or []) if str(v).strip()]
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._session: aiohttp.ClientSession | None = None
@@ -159,11 +187,18 @@ class KbBuilder:
             # trigger, or a refreshed live index) get picked up automatically
             chapters = await self._collect_chapters()
             done = await self.store.kb_chapters()
+            # Existing work becomes searchable through the structured layer
+            # immediately; no need to wait for all 327 summaries.
+            await self._backfill_summary_scenes()
             todo = [c for c in chapters if c["n"] not in done]
             if not todo:
                 if chapters:
-                    log.info("kb: all %d chapters summarized; idle (re-check 1h)",
-                             len(chapters))
+                    await self._backfill_summary_scenes()
+                    if await self._enrich_next_scene(chapters):
+                        await self._sleep(self.pace_sec)
+                        continue
+                    log.info("kb: all %d chapters summarized and scenes "
+                             "indexed; idle (re-check 1h)", len(chapters))
                 await self._sleep(3600)  # pick up new chapters added later
                 continue
             log.info("kb: %d/%d chapters left", len(todo), len(chapters))
@@ -191,12 +226,14 @@ class KbBuilder:
             return
         user = f"ГЛАВА {c['n']}:\n{text[:self.max_chars]}"
         summary = ""
+        model_used = ""
         last_limit: RateLimited | None = None
         for model in self.models:  # use whichever build model still has budget
             try:
                 summary = (await self.llm.generate(
                     SUMMARY_SYSTEM, user, model=model,
                     temperature=0.3, max_tokens=700)).strip()
+                model_used = model
                 break
             except RateLimited as e:
                 last_limit = e
@@ -205,8 +242,116 @@ class KbBuilder:
             if last_limit is not None:
                 raise last_limit
             return
-        await self.store.kb_put(c["n"], title or f"Глава {c['n']}", summary)
+        source_hash = _hash_text(text)
+        await self.store.kb_put(
+            c["n"], title or f"Глава {c['n']}", summary,
+            source_hash=source_hash, model=model_used,
+            prompt_version=SUMMARY_PROMPT_VERSION,
+            quality={"chars": len(summary),
+                     "sentences": summary.count(".")})
+        await self._put_summary_scene(
+            c["n"], summary, source_hash=source_hash,
+            model=model_used)
         log.info("kb: chapter %d done (%d chars)", c["n"], len(text))
+
+    async def _backfill_summary_scenes(self) -> None:
+        """Index every existing digest as a baseline scene without LLM calls."""
+        existing = await self.store.scene_chapters()
+        names = [v.strip() for v in CANON.split(",")]
+        for row in await self.store.kb_all():
+            chapter = int(row["chapter"])
+            if chapter in existing:
+                await self.store.kb_mark_legacy_meta(chapter)
+                continue
+            await self.store.kb_mark_legacy_meta(chapter)
+            await self._put_summary_scene(
+                chapter, str(row["text"]), names=names)
+
+    async def _put_summary_scene(self, chapter: int, text: str,
+                                 names: list[str] | None = None,
+                                 source_hash: str = "",
+                                 model: str = "") -> None:
+        names = names or [v.strip() for v in CANON.split(",")]
+        folded = text.casefold()
+        participants = [
+            name for name in names if name.casefold() in folded]
+        await self.store.scene_put(
+            chapter, "summary", participants=participants, events=text,
+            witnessed_by=[], reportable_to=[],
+            confidence=0.75, source="summary",
+            forbidden_secrets=[
+                "Алон переродился из нашего мира и заранее знает сюжет"],
+            source_hash=source_hash, model=model,
+            prompt_version=SUMMARY_PROMPT_VERSION)
+
+    async def _enrich_next_scene(self, chapters: list[dict]) -> bool:
+        """Enrich one focus chapter after the current digest build is done."""
+        if not self.scene_focus_entities:
+            return False
+        enriched = await self.store.scene_chapters(source="full_text")
+        summaries = {int(r["chapter"]): str(r["text"])
+                     for r in await self.store.kb_all()}
+        focus = [v.lower() for v in self.scene_focus_entities]
+        for chapter in chapters:
+            number = int(chapter["n"])
+            if number in enriched:
+                continue
+            digest = summaries.get(number, "").lower()
+            if not any(entity in digest for entity in focus):
+                continue
+            text, _ = await self._fetch(chapter)
+            if not text:
+                continue
+            payload = (
+                "ФОКУСНЫЕ ПЕРСОНАЖИ/ТЕМЫ: "
+                + ", ".join(self.scene_focus_entities)
+                + f"\n\nГЛАВА {number}:\n{text[:self.max_chars]}")
+            raw = ""
+            model_used = ""
+            last_limit: RateLimited | None = None
+            order = ("openai/gpt-oss-120b",) + tuple(
+                model for model in self.models
+                if model != "openai/gpt-oss-120b")
+            for model in order:
+                try:
+                    raw = await self.llm.generate(
+                        SCENE_SYSTEM, payload, model=model,
+                        temperature=0.2, max_tokens=1400)
+                    model_used = model
+                    break
+                except RateLimited as exc:
+                    last_limit = exc
+            if not raw:
+                if last_limit:
+                    raise last_limit
+                return False
+            data = parse_json_block(raw) or {}
+            scenes = data.get("scenes")
+            if not isinstance(scenes, list):
+                log.warning("kb: scene JSON malformed for chapter %d", number)
+                return False
+            for idx, scene in enumerate(scenes[:6]):
+                if not isinstance(scene, dict):
+                    continue
+                await self.store.scene_put(
+                    number, str(scene.get("id") or f"scene-{idx + 1}"),
+                    participants=_strings(scene.get("participants")),
+                    events=str(scene.get("events") or ""),
+                    decisions=str(scene.get("decisions") or ""),
+                    motives=str(scene.get("motives") or ""),
+                    quotes=_strings(scene.get("quotes"))[:3],
+                    witnessed_by=_strings(scene.get("witnessed_by")),
+                    reportable_to=_strings(scene.get("reportable_to")),
+                    public_facts=str(scene.get("public_facts") or ""),
+                    forbidden_secrets=_strings(
+                        scene.get("forbidden_secrets")),
+                    confidence=float(scene.get("confidence") or 0.8),
+                    source="full_text", source_hash=_hash_text(text),
+                    model=model_used, prompt_version=SCENE_PROMPT_VERSION)
+            log.info("kb: chapter %d enriched into %d structured scenes",
+                     number, len(scenes[:6]))
+            return True
+        return False
 
     async def _fetch(self, c: dict) -> tuple[str, str]:
         # local corpus file (full text) preferred; else the Telegraph page
@@ -260,3 +405,14 @@ def _flatten(nodes) -> str:
         elif isinstance(n, dict):
             out.append(_flatten(n.get("children", [])))
     return "".join(out)
+
+
+def _strings(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def _hash_text(text: str) -> str:
+    normalized = "\n".join(line.rstrip() for line in text.strip().splitlines())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()

@@ -14,7 +14,10 @@ that owner is consumed as the answer.
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
+import os
 import re
 import time
 
@@ -522,8 +525,8 @@ class BotApp:
 
     async def cmd_ai(self, update: Update,
                      context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Everyone (in the group) can read status, switch the persona, and
-        test it; only admins can change settings or ban users."""
+        """Test-chat members can switch/test/trace/leave feedback; only admins
+        can alter pipeline settings, enable chats or moderate users."""
         if self.ai is None:
             return
         args = context.args or []
@@ -531,10 +534,18 @@ class BotApp:
         cmd = args[0].lower() if args else ""
         # config / moderation commands stay admin-only; persona + model
         # switching and status are open to everyone in the group
-        if cmd in ("set", "ban", "unban") and \
+        if cmd in ("set", "ban", "unban", "pipeline") and \
                 not await self.is_admin(update.effective_user.id):
             await update.message.reply_text(
                 "Эта команда только для админов чата.")
+            return
+        public_test_commands = {
+            "persona", "model", "test", "trace", "feedback", "stats"}
+        if cmd in public_test_commands and update.effective_chat.id not in \
+                await store.enabled_chats():
+            await update.message.reply_text(
+                "Эта тестовая команда работает только в подключённой "
+                "ИИ-беседе.")
             return
         if not args:
             await update.message.reply_text(await self._ai_status_text(),
@@ -543,8 +554,7 @@ class BotApp:
         if cmd == "persona" and len(args) >= 2:
             key = args[1].lower()
             if key in ("off", "none", "-"):
-                await store.set("active_persona", "")
-                await store.mark_context_reset()
+                await self.ai.switch_persona("")
                 await update.message.reply_text("Персонаж снят.")
                 return
             p = self.ai.personas.get(key) or self._resolve_persona(args[1])
@@ -554,12 +564,11 @@ class BotApp:
                 await update.message.reply_text(
                     f"Не знаю «{esc(args[1])}». Есть: {known}")
                 return
-            await store.set("active_persona", p.key)
-            # wipe conversational context so the new persona starts clean and
-            # never inherits or imitates the previous persona's dialogue
-            await store.mark_context_reset()
+            dropped = await self.ai.switch_persona(p.key)
             await update.message.reply_text(
-                f"Теперь в чате говорит: {p.name} — {p.one_liner}")
+                f"Теперь в чате говорит: {p.name} — {p.one_liner}"
+                + (f"\nСнято старых заданий из очереди: {dropped}."
+                   if dropped else ""))
         elif cmd == "set" and len(args) >= 3:
             from .ai.engine import DEFAULTS
             key, val = args[1].lower(), args[2]
@@ -591,6 +600,57 @@ class BotApp:
             await store.set("active_model", picked)
             self.ai.llm.model = picked
             await update.message.reply_text(f"Модель переключена на: {picked}")
+        elif cmd == "pipeline":
+            if len(args) < 2 or args[1].lower() not in {"v1", "v2"}:
+                current = await self.ai.pipeline_version()
+                await update.message.reply_text(
+                    f"Текущий конвейер: {current}. Использование: "
+                    "/ai pipeline v1|v2")
+                return
+            version = args[1].lower()
+            await store.set("pipeline_version", version)
+            await store.mark_context_reset()
+            await update.message.reply_text(
+                f"Конвейер переключён на {version}. Контекст сброшен.")
+        elif cmd == "trace":
+            replied = update.message.reply_to_message
+            if replied is None:
+                await update.message.reply_text(
+                    "Ответь командой /ai trace на сообщение персонажа.")
+                return
+            trace = await store.trace_for_message(
+                update.effective_chat.id, replied.message_id)
+            if trace is None:
+                await update.message.reply_text(
+                    "Трассировка для этого сообщения не найдена.")
+                return
+            body = self._ai_trace_text(trace)
+            doc = io.BytesIO(body.encode("utf-8"))
+            doc.name = f"ai-trace-{trace['id']}.txt"
+            await update.message.reply_document(
+                document=doc, filename=doc.name,
+                caption=f"Трассировка #{trace['id']} ({trace['persona']})")
+        elif cmd == "feedback":
+            replied = update.message.reply_to_message
+            if replied is None or len(args) < 2:
+                await update.message.reply_text(
+                    "Ответь на сообщение персонажа: "
+                    "/ai feedback <категория> [комментарий]")
+                return
+            trace = await store.trace_for_message(
+                update.effective_chat.id, replied.message_id)
+            if trace is None:
+                await update.message.reply_text("Трассировка не найдена.")
+                return
+            category = args[1].lower()[:80]
+            note = " ".join(args[2:])
+            await store.feedback_add(
+                trace["id"], update.effective_user.id, category, note)
+            await update.message.reply_text(
+                f"Отзыв сохранён для трассировки #{trace['id']}.")
+        elif cmd == "stats":
+            await update.message.reply_text(
+                await self._ai_status_text(), parse_mode=ParseMode.HTML)
         elif cmd == "ban" and len(args) >= 2:
             try:
                 uid = int(args[1])
@@ -619,24 +679,21 @@ class BotApp:
                 await update.message.reply_text(
                     "Сначала выбери персонажа: /ai persona <ключ>")
                 return
-            try:
-                model = await store.get("active_model") or self.ai.llm.model
-                reply = await self.ai.llm.generate(
-                    self.ai.system_for(persona),
-                    f"Сообщение от тестера: {text}\n"
-                    "Ответь ОДНИМ сообщением в своём характере.",
-                    model=model, max_tokens=320)
-                from .ai.engine import _strip_thinking
-                reply = _strip_thinking(reply)
-                await update.message.reply_text(
-                    _ai_to_html(reply), parse_mode=ParseMode.HTML)
-            except Exception as e:  # noqa: BLE001
-                await update.message.reply_text(f"Не вышло: {self._redact(e)}")
+            user = update.effective_user
+            await self.ai.on_group_message(
+                chat_id=update.effective_chat.id,
+                msg_id=update.message.message_id,
+                user_id=user.id if user else None,
+                username=(user.first_name or user.username) if user else None,
+                text=text, reply_to=None, reply_to_is_bot=True)
         else:
             await update.message.reply_text(
                 "Команды: /ai · /ai persona <ключ|off> · /ai set <параметр> "
-                "<число> · /ai model [модель] · /ai ban <id> [часов] · /ai unban <id> · "
-                "/ai test <текст>\nВ группе: /ai_on, /ai_off")
+                "<число> · /ai model [модель] · /ai pipeline v1|v2 · "
+                "/ai trace (reply) · /ai feedback <категория> [текст] (reply) · "
+                "/ai stats · /ai ban <id> [часов] · /ai unban <id> · "
+                "/ai test <текст>\n"
+                "В группе: /ai_on, /ai_off")
 
     def _resolve_persona(self, query: str):
         """Match a user-typed persona by key, Russian name, or alias
@@ -661,18 +718,33 @@ class BotApp:
     async def _ai_status_text(self) -> str:
         from .ai.engine import DEFAULTS
         store = self.ai.store
+        await store.ensure_daily_reset()
         persona = await self.ai.active_persona()
         chats = await store.enabled_chats()
         model = await store.get("active_model") or self.ai.llm.model
         usage = await self.ai.llm.usage_status()
         kb = await store.kb_count()
+        scenes = await store.scene_stats()
+        provenance = await store.kb_meta_coverage()
+        diagnostics = await store.diagnostics_stats()
+        pipeline = await self.ai.pipeline_version()
         lines = [
             "🤖 <b>ИИ-персонаж</b>",
+            f"Релиз: <b>{esc(os.environ.get('APP_RELEASE', 'dev'))}</b>",
             f"Персонаж: <b>{esc(persona.name) if persona else '—'}</b>",
             f"Модель: <b>{esc(model)}</b> (сменить: /ai model)",
+            f"Конвейер: <b>{pipeline}</b>",
             f"Чаты: {', '.join(map(str, chats)) or '—'}",
-            f"AI API: {esc(usage)}",
-            f"База знаний: {kb} глав",
+            "AI API:\n" + esc(usage),
+            f"База знаний: {kb} глав; сцен {scenes['total']}, "
+            f"из полного текста {scenes['full_text']}",
+            f"Происхождение KB: хэш {provenance['hashed']}/"
+            f"{provenance['total']}, модель {provenance['modeled']}/"
+            f"{provenance['total']}",
+            f"Диагностика: трасс {diagnostics['traces']}, "
+            f"отзывов {diagnostics['feedback']}, память сегодня "
+            f"{diagnostics['memories']}, отношений "
+            f"{diagnostics['relationships']}",
             f"Маски: {', '.join(sorted(self.ai.personas))}",
             "",
             "Параметры (/ai set …):",
@@ -680,6 +752,49 @@ class BotApp:
         for k in sorted(DEFAULTS):
             lines.append(f"  {k} = {await store.get_float(k, float(DEFAULTS[k])):g}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _ai_trace_text(trace: dict) -> str:
+        def pretty(key: str) -> str:
+            raw = trace.get(key) or "{}"
+            try:
+                return json.dumps(
+                    json.loads(raw), ensure_ascii=False, indent=2)
+            except (json.JSONDecodeError, TypeError):
+                return str(raw)
+
+        return "\n".join([
+            f"AI TRACE #{trace['id']}",
+            f"created: {trace['created']}",
+            f"persona: {trace['persona']}",
+            f"model: {trace['model']}",
+            f"trigger_msg_id: {trace['trigger_msg_id']}",
+            f"sent_msg_id: {trace.get('sent_msg_id')}",
+            "",
+            "REPLY PLAN",
+            pretty("plan_json"),
+            "",
+            "KNOWLEDGE",
+            pretty("knowledge_json"),
+            "",
+            "MEMORY / SELECTED PROFILE",
+            pretty("memory_json"),
+            "",
+            "PARAMETERS",
+            pretty("params_json"),
+            "",
+            "QUALITY CHECKS",
+            pretty("checks_json"),
+            "",
+            "SYSTEM PROMPT",
+            trace["system_prompt"],
+            "",
+            "USER PROMPT",
+            trace["user_prompt"],
+            "",
+            "RESPONSE",
+            trace["response"],
+        ])
 
     # ── search (everyone) ─────────────────────────────────────────────────────
     @staticmethod

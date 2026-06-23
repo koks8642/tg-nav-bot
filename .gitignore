@@ -32,3 +32,4 @@ Thumbs.db
 
 # pytest --basetemp artifact (CI)
 .test-tmp/
+.pytest-*/

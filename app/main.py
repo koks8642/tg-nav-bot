@@ -120,7 +120,7 @@ async def run() -> None:
     kb_builder = None
     if cfg.ai_enabled:
         from .ai.engine import AiEngine
-        from .ai.client import AVAILABLE_MODELS, AiApiClient
+        from .ai.client import AVAILABLE_MODELS, DEFAULT_MODEL, AiApiClient
         from .ai.kb_builder import KbBuilder
         from .ai.personas import load_lexicon, load_lore, load_personas
         from .ai.store import AiStore
@@ -132,7 +132,8 @@ async def run() -> None:
         # drop a stale pick that's no longer a supported roleplay model
         model = (await ai_store.get("active_model")) or cfg.ai_model
         if model not in AVAILABLE_MODELS:
-            model = cfg.ai_model
+            model = (cfg.ai_model if cfg.ai_model in AVAILABLE_MODELS
+                     else DEFAULT_MODEL)
         await ai_store.set("active_model", model)
         personas = load_personas(cfg.ai_personas_dir)
         lexicon = load_lexicon(cfg.ai_personas_dir)
@@ -140,11 +141,18 @@ async def run() -> None:
         llm = AiApiClient(cfg.ai_api_key, ai_store, model=model,
                           classifier_model=cfg.ai_classifier_model)
         ai_engine = AiEngine(ai_store, llm, personas, lexicon, lore)
+        focus_entities: list[str] = []
+        for persona in personas.values():
+            focus_entities.extend(
+                str(v) for v in persona.routing.get(
+                    "scene_focus_entities", []))
         kb_builder = KbBuilder(ai_store, llm, index_path=cfg.ai_chapters_index,
                                live_index_path=cfg.ai_chapters_index_live or None,
                                corpus_dir=cfg.ai_corpus_dir or None,
                                chapters_source=db.chapters_for_kb,
-                               model=cfg.ai_kb_model)
+                               model=cfg.ai_kb_model,
+                               scene_focus_entities=list(dict.fromkeys(
+                                   focus_entities)))
         log.info("AI persona chat ready: %d personas, %d lexicon entities, "
                  "lore %d chars, model %s, KB %d chapters", len(personas),
                  len(lexicon.entities), len(lore), model,

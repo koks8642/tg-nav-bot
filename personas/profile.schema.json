@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rqm.local/persona-profile.schema.json",
+  "title": "RQM AI persona profile",
+  "type": "object",
+  "required": ["key", "name", "aliases", "one_liner", "taboo"],
+  "properties": {
+    "profile_schema_version": {"type": "integer", "minimum": 1},
+    "key": {"type": "string", "pattern": "^[a-z0-9_-]+$"},
+    "name": {"type": "string", "minLength": 1},
+    "aliases": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "one_liner": {"type": "string"},
+    "identity": {"type": "string"},
+    "worldview": {"type": "array", "items": {"type": "string"}},
+    "goals": {"type": "array", "items": {"type": "string"}},
+    "contradictions": {"type": "array", "items": {"type": "string"}},
+    "knowledge_boundaries": {
+      "type": "object",
+      "properties": {
+        "never_knows": {"type": "array", "items": {"type": "string"}},
+        "forbidden_claims": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "interaction_rules": {"type": "array", "items": {"type": "string"}},
+    "relationship_boundaries": {"type": "array", "items": {"type": "string"}},
+    "registers": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {"type": "string"},
+          {
+            "type": "object",
+            "required": ["description"],
+            "properties": {"description": {"type": "string"}}
+          }
+        ]
+      }
+    },
+    "routing": {
+      "type": "object",
+      "required": ["default_register", "intent_registers"],
+      "properties": {
+        "default_register": {"type": "string"},
+        "intent_registers": {"type": "object"},
+        "protected_entities": {"type": "object"},
+        "jealousy_entities": {"type": "object"},
+        "entity_aliases": {"type": "object"},
+        "entity_registers": {"type": "object"},
+        "sensitive_topics": {"type": "array"},
+        "scene_focus_entities": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      }
+    },
+    "relationships": {"type": "object"},
+    "example_dialogues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["say"],
+        "properties": {
+          "when": {"type": "string"},
+          "say": {"type": "string", "minLength": 1},
+          "register": {"type": "string"},
+          "topics": {"type": "array", "items": {"type": "string"}},
+          "targets": {"type": "array", "items": {"type": "string"}},
+          "heat": {"type": "integer", "minimum": 0, "maximum": 3}
+        }
+      }
+    },
+    "taboo": {"type": "array", "items": {"type": "string"}}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "profile_schema_version": {"minimum": 2}
+        },
+        "required": ["profile_schema_version"]
+      },
+      "then": {
+        "required": [
+          "identity",
+          "worldview",
+          "goals",
+          "contradictions",
+          "knowledge_boundaries",
+          "interaction_rules",
+          "relationship_boundaries",
+          "registers",
+          "routing",
+          "relationships",
+          "example_dialogues"
+        ]
+      }
+    }
+  ]
+}

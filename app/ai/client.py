@@ -1,17 +1,21 @@
 """Async Groq chat-completions client for persona replies.
 
-One active model at a time (switchable at runtime, so we can A/B which model
-plays the characters best). No auto-cascade across models — that only burns the
-free token budget and muddies the comparison. Rate limits surface as
-RateLimited so the engine can pause; empty replies as EmptyResponse.
+The active roleplay model is switchable at runtime. The professional v2 engine
+uses the Llama-only list as a quality/rate-limit cascade: stronger first,
+smaller last, never crossing into assistant-like model families. Rate limits
+surface as RateLimited so the engine can pace itself; empty replies as
+EmptyResponse.
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
+import time
 
 import aiohttp
+
+from .models import ModelCallResult
 
 log = logging.getLogger("ai.client")
 
@@ -26,7 +30,6 @@ DEFAULT_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
 AVAILABLE_MODELS = (
     "llama-3.3-70b-versatile",
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "llama-3.1-8b-instant",
 )
 
 # Failover when the active model is rate-limited — Llama-only too: better a
@@ -68,24 +71,47 @@ class AiApiClient:
             await self._session.close()
 
     async def usage_status(self) -> str:
-        used = await self.store.usage_today(self.model)
-        return (f"модель {self.model}: {used} запросов сегодня "
-                f"(точный остаток — в Groq Console → Limits)")
+        rows = await self.store.usage_report()
+        if not rows:
+            return "сегодня запросов ещё не было"
+        parts = []
+        for row in rows:
+            requests = int(row["requests"])
+            avg = int(row["latency_ms"]) // max(1, requests)
+            parts.append(
+                f"{row['model']}: {requests} запр., "
+                f"{int(row['prompt_tokens'])}+"
+                f"{int(row['completion_tokens'])} ток., {avg} мс ср., "
+                f"429={int(row['rate_limits'])}, ошибок={int(row['errors'])}")
+        return "\n".join(parts)
 
     # ── low level ─────────────────────────────────────────────────────────
-    async def _chat(self, payload: dict) -> str:
+    async def _chat_result(self, payload: dict) -> ModelCallResult:
         sess = await self.session()
         headers = {"Authorization": f"Bearer {self.api_key}",
                    "Content-Type": "application/json"}
-        async with sess.post(CHAT_API, headers=headers, json=payload) as resp:
-            data = await resp.json(content_type=None)
-            status = resp.status
-            headers_out = dict(resp.headers)
+        started = time.perf_counter()
+        model = str(payload.get("model") or "")
+        try:
+            async with sess.post(CHAT_API, headers=headers, json=payload) as resp:
+                data = await resp.json(content_type=None)
+                status = resp.status
+                headers_out = dict(resp.headers)
+        except Exception:
+            latency = int((time.perf_counter() - started) * 1000)
+            await self.store.usage_record(
+                model, requests=1, latency_ms=latency, errors=1)
+            raise
+        latency = int((time.perf_counter() - started) * 1000)
         if status == 429:
+            await self.store.usage_record(
+                model, requests=1, latency_ms=latency, rate_limits=1)
             raise RateLimited(
                 "rate limit", retry_after=_retry_after(headers_out, data))
         if status >= 400:
             msg = (data or {}).get("error", {}).get("message", "")
+            await self.store.usage_record(
+                model, requests=1, latency_ms=latency, errors=1)
             raise RuntimeError(f"Groq HTTP {status}: {msg[:200]}")
         try:
             text = (data["choices"][0]["message"]["content"] or "").strip()
@@ -94,14 +120,45 @@ class AiApiClient:
         if not text:
             reason = (data.get("choices") or [{}])[0].get(
                 "finish_reason", "empty")
+            await self.store.usage_record(
+                model, requests=1, latency_ms=latency, errors=1)
             raise EmptyResponse(f"empty response ({reason})")
-        return text
+        usage = data.get("usage") or {}
+        result = ModelCallResult(
+            text=text, model=model,
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            completion_tokens=int(usage.get("completion_tokens") or 0),
+            total_tokens=int(usage.get("total_tokens") or 0),
+            latency_ms=latency,
+            finish_reason=str(
+                (data.get("choices") or [{}])[0].get("finish_reason") or ""),
+            rate_limit_remaining_requests=str(
+                headers_out.get("x-ratelimit-remaining-requests") or ""),
+            rate_limit_remaining_tokens=str(
+                headers_out.get("x-ratelimit-remaining-tokens") or ""),
+        )
+        await self.store.usage_record(
+            model, requests=1, prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens, latency_ms=latency)
+        return result
+
+    async def _chat(self, payload: dict) -> str:
+        return (await self._chat_result(payload)).text
 
     # ── public ────────────────────────────────────────────────────────────
     async def generate(self, system: str, user: str, *,
                        model: str | None = None,
                        temperature: float = 1.0,
                        max_tokens: int = 320) -> str:
+        return (await self.generate_with_meta(
+            system, user, model=model, temperature=temperature,
+            max_tokens=max_tokens)).text
+
+    async def generate_with_meta(self, system: str, user: str, *,
+                                 model: str | None = None,
+                                 temperature: float = 1.0,
+                                 max_tokens: int = 320) -> ModelCallResult:
         m = (model or self.model).strip() or DEFAULT_MODEL
         payload = {
             "model": m,
@@ -111,9 +168,7 @@ class AiApiClient:
             "max_completion_tokens": max_tokens,
         }
         _add_reasoning_options(payload, m)
-        text = await self._chat(payload)
-        await self.store.usage_bump(m)
-        return text
+        return await self._chat_result(payload)
 
     async def classify(self, system: str, user: str) -> dict | None:
         payload = {
@@ -126,11 +181,10 @@ class AiApiClient:
         }
         _add_reasoning_options(payload, self.classifier_model)
         try:
-            raw = await self._chat(payload)
+            raw = (await self._chat_result(payload)).text
         except Exception as e:  # noqa: BLE001 — classifier must never break flow
             log.debug("classifier failed: %s", e)
             return None
-        await self.store.usage_bump(self.classifier_model)
         return parse_json_block(raw)
 
 

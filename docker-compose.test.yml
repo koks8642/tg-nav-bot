@@ -12,7 +12,10 @@
 #   docker compose -f docker-compose.test.yml -p rqm-test down   # keeps volume
 services:
   rqm-test:
-    build: .
+    build:
+      context: .
+      args:
+        APP_RELEASE: ${AI_RELEASE:-ai-v2.2-20260622}
     restart: unless-stopped
     env_file: .env.test
     environment:
