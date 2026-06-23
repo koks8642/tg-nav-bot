@@ -649,27 +649,17 @@ class AiEngine:
                     })
                     log.info("v2 corrective retry failed: %s", exc)
 
-        # A role-breaking answer is treated like a failed model, not replaced
-        # by canned text. Continue down the Llama cascade after the one allowed
-        # corrective attempt.
-        used_models = {model_used} if model_used else set()
-        while checks and checks.should_retry:
-            try:
-                reply, model_used, call = await self._generate_v2(
-                    bundle, max_tokens=max_tokens, temperature=temperature,
-                    skip_models=used_models, plan=plan,
-                    attempt_log=model_calls)
-                model_calls.append(call)
-                used_models.add(model_used)
-                checks = validate_reply(
-                    reply, persona=persona, plan=plan, knowledge=knowledge,
-                    selected_examples=bundle.selected_examples)
-            except (RateLimited, EmptyResponse, Exception) as exc:
-                log.info("v2 quality cascade exhausted: %s", exc)
-                break
-
+        # A role-breaking answer is treated like a failed model: we stay silent
+        # rather than send canned text. We do NOT cascade across the weaker
+        # Llama models on quality grounds — if 70b's reply failed validation,
+        # scout/8b (strictly weaker) won't pass it either, so re-generating
+        # there only burns rate-limited budget and still ends in silence. The
+        # one corrective retry above (same model, cooler temperature) is the
+        # cheap insurance that actually fixes format/role slips. The model
+        # cascade for *availability* (rate-limit/empty) still lives inside
+        # _generate_v2.
         if not reply or (checks and checks.should_retry):
-            log.info("v2 reply rejected after cascade/retry: %s",
+            log.info("v2 reply rejected after corrective retry: %s",
                      checks.severe if checks else "empty")
             return
 
@@ -731,14 +721,11 @@ class AiEngine:
 
     async def _generate_v2(self, bundle, *, max_tokens: int,
                            temperature: float,
-                           skip_models: set[str] | None = None,
                            plan: ReplyPlan | None = None,
                            attempt_log: list[dict] | None = None
                            ) -> tuple[str, str, dict]:
         active = await self._active_model()
-        skip_models = skip_models or set()
-        order = [m for m in [active] + [
-            v for v in CASCADE_ORDER if v != active] if m not in skip_models]
+        order = [active] + [v for v in CASCADE_ORDER if v != active]
         last_limit: RateLimited | None = None
         for model in order:
             compact = "8b" in model.lower() or "17b" in model.lower()

@@ -114,16 +114,6 @@ CREATE TABLE IF NOT EXISTS memory_events (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_person
   ON memory_events(chat_id, user_id, persona, importance, id);
-CREATE TABLE IF NOT EXISTS conversation_state (
-  chat_id   INTEGER NOT NULL,
-  persona   TEXT NOT NULL,
-  topic     TEXT NOT NULL DEFAULT '',
-  register  TEXT NOT NULL DEFAULT 'default',
-  heat      INTEGER NOT NULL DEFAULT 0,
-  conflict  TEXT NOT NULL DEFAULT '',
-  updated   TEXT NOT NULL,
-  PRIMARY KEY (chat_id, persona)
-);
 CREATE TABLE IF NOT EXISTS conversation_state_v2 (
   chat_id   INTEGER NOT NULL,
   user_id   INTEGER NOT NULL DEFAULT 0,
@@ -334,7 +324,6 @@ class AiStore:
                 return False
             await self.conn.execute("DELETE FROM relationship_state")
             await self.conn.execute("DELETE FROM memory_events")
-            await self.conn.execute("DELETE FROM conversation_state")
             await self.conn.execute("DELETE FROM conversation_state_v2")
             await self.conn.execute("DELETE FROM affinity")
             await self.conn.execute(

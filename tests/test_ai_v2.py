@@ -433,13 +433,17 @@ class CascadeClient:
         return "test"
 
 
-def test_v2_rejects_bad_answer_then_uses_smaller_model_without_fallback(
-        tmp_path):
+def test_v2_one_corrective_retry_then_silent_no_quality_cascade(tmp_path):
+    # A reply that fails validation gets exactly ONE corrective retry on the
+    # SAME model. We do NOT cascade to weaker Llama models on quality grounds:
+    # if 70b's answer was rejected, scout/8b won't pass either, so re-running
+    # there only burns rate-limited budget. After a failed correction we stay
+    # silent. (Caps quality-driven generation at 2 calls instead of 4.)
     async def go():
         client = CascadeClient([
             "Сейчас я оторву тебе голову.",       # 70B invalid
             "Сейчас я оторву тебе голову.",       # one correction invalid
-            "День был спокойным. Редкая роскошь."  # next Llama valid
+            "День был спокойным. Редкая роскошь."  # never reached
         ])
         store = AiStore(tmp_path / "ai.db")
         await store.connect()
@@ -461,9 +465,8 @@ def test_v2_rejects_bad_answer_then_uses_smaller_model_without_fallback(
             chat_id=-1, reply_to=1, user_id=7, username="тестер",
             text="Ютия, как настроение?", priority="direct",
             mode="casual", enqueued_at=0, plan=plan.to_dict()))
-        assert sent == ["День был спокойным. Редкая роскошь."]
-        assert len(client.calls) == 3
-        assert "17b" in client.calls[-1]["model"]
+        assert sent == []
+        assert len(client.calls) == 2  # initial + one correction, no cascade
         await store.close()
     asyncio.run(go())
 
