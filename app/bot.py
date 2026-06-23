@@ -583,35 +583,6 @@ class BotApp:
                 return
             await store.set(key, val)
             await update.message.reply_text(f"{key} = {val}")
-        elif cmd == "model":
-            from .ai.client import AVAILABLE_MODELS
-            if len(args) < 2:
-                current = await store.get("active_model") or self.ai.llm.model
-                lines = [f"Текущая модель: {current}", "",
-                         "Переключить: /ai model <название>. Доступные:"]
-                lines.extend(f"• {m}" for m in AVAILABLE_MODELS)
-                await update.message.reply_text("\n".join(lines))
-                return
-            picked = self._resolve_ai_model(" ".join(args[1:]), AVAILABLE_MODELS)
-            if picked is None:
-                await update.message.reply_text(
-                    "Не знаю такую модель. Список: /ai model")
-                return
-            await store.set("active_model", picked)
-            self.ai.llm.model = picked
-            await update.message.reply_text(f"Модель переключена на: {picked}")
-        elif cmd == "pipeline":
-            if len(args) < 2 or args[1].lower() not in {"v1", "v2"}:
-                current = await self.ai.pipeline_version()
-                await update.message.reply_text(
-                    f"Текущий конвейер: {current}. Использование: "
-                    "/ai pipeline v1|v2")
-                return
-            version = args[1].lower()
-            await store.set("pipeline_version", version)
-            await store.mark_context_reset()
-            await update.message.reply_text(
-                f"Конвейер переключён на {version}. Контекст сброшен.")
         elif cmd == "trace":
             replied = update.message.reply_to_message
             if replied is None:
@@ -689,7 +660,7 @@ class BotApp:
         else:
             await update.message.reply_text(
                 "Команды: /ai · /ai persona <ключ|off> · /ai set <параметр> "
-                "<число> · /ai model [модель] · /ai pipeline v1|v2 · "
+                "<число> · "
                 "/ai trace (reply) · /ai feedback <категория> [текст] (reply) · "
                 "/ai stats · /ai ban <id> [часов] · /ai unban <id> · "
                 "/ai test <текст>\n"
@@ -706,34 +677,23 @@ class BotApp:
                 return cand
         return None
 
-    def _resolve_ai_model(self, query: str, models: tuple[str, ...]):
-        q = query.strip().lower()
-        for model in models:
-            low = model.lower()
-            if q == low or q == low.rsplit("/", 1)[-1]:
-                return model
-        matches = [m for m in models if q in m.lower()]
-        return matches[0] if len(matches) == 1 else None
-
     async def _ai_status_text(self) -> str:
         from .ai.engine import DEFAULTS
         store = self.ai.store
         await store.ensure_daily_reset()
         persona = await self.ai.active_persona()
         chats = await store.enabled_chats()
-        model = await store.get("active_model") or self.ai.llm.model
         usage = await self.ai.llm.usage_status()
         kb = await store.kb_count()
         scenes = await store.scene_stats()
         provenance = await store.kb_meta_coverage()
         diagnostics = await store.diagnostics_stats()
-        pipeline = await self.ai.pipeline_version()
         lines = [
             "🤖 <b>ИИ-персонаж</b>",
             f"Релиз: <b>{esc(os.environ.get('APP_RELEASE', 'dev'))}</b>",
             f"Персонаж: <b>{esc(persona.name) if persona else '—'}</b>",
-            f"Модель: <b>{esc(model)}</b> (сменить: /ai model)",
-            f"Конвейер: <b>{pipeline}</b>",
+            "Модели: <b>Llama 70B → Llama 17B</b> "
+            "(17B только при недоступности 70B)",
             f"Чаты: {', '.join(map(str, chats)) or '—'}",
             "AI API:\n" + esc(usage),
             f"База знаний: {kb} глав; сцен {scenes['total']}, "

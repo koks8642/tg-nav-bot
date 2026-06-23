@@ -40,8 +40,8 @@ KB_MODELS = (
     "llama-3.1-8b-instant",
 )
 MAX_BACKOFF_SEC = 1800.0  # don't sleep for hours on a daily-limit retry-after
-SUMMARY_PROMPT_VERSION = "summary-v2.1"
-SCENE_PROMPT_VERSION = "scene-v2.1"
+SUMMARY_PROMPT_VERSION = "summary-current"
+SCENE_PROMPT_VERSION = "scene-current"
 
 # Canonical spellings so the same entity reads the same across all chapters
 # (the source MTL spells names inconsistently, which fragments KB search).
@@ -261,9 +261,9 @@ class KbBuilder:
         for row in await self.store.kb_all():
             chapter = int(row["chapter"])
             if chapter in existing:
-                await self.store.kb_mark_legacy_meta(chapter)
+                await self.store.kb_mark_unknown_meta(chapter)
                 continue
-            await self.store.kb_mark_legacy_meta(chapter)
+            await self.store.kb_mark_unknown_meta(chapter)
             await self._put_summary_scene(
                 chapter, str(row["text"]), names=names)
 

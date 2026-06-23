@@ -80,7 +80,6 @@ class Config:
     rebuild_queue_timeout_sec: int
     # AI persona chat (group roleplay) settings
     ai_api_key: str
-    ai_model: str
     ai_classifier_model: str
     ai_kb_model: str
     ai_chapters_index: Path
@@ -160,11 +159,6 @@ def load_config(*, require_bot: bool = True) -> Config:
             os.environ.get("AI_API_KEY")
             or os.environ.get("GROQ_API_KEY")
             or ""
-        ).strip(),
-        ai_model=(
-            os.environ.get("AI_MODEL")
-            or os.environ.get("GROQ_MODEL")
-            or "llama-3.3-70b-versatile"
         ).strip(),
         ai_classifier_model=(
             os.environ.get("AI_CLASSIFIER_MODEL")

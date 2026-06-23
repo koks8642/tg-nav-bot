@@ -19,11 +19,12 @@ _QUESTION_WORDS = (
     "знаешь", "отношение", "относишься",
 )
 _PLOT_WORDS = (
-    "глав", "что было", "что произошло", "что случилось", "тогда",
+    "что было", "что произошло", "что случилось", "тогда",
     "в тот момент", "событи", "эпизод", "сцен",
 )
 _META_WORDS = (
-    "ты бот", "ты ии", "нейросет", "искусственный интеллект",
+    "ты бот", "ты ии", "ии-модел", "ии модел", "нейросет",
+    "искусственный интеллект",
     "языковая модель", "ты персонаж", "вымышлен", "автор новеллы",
     "читатель", "написал программист", "находишься в telegram",
     "ролевая игра", "выйди из роли", "системный промпт", "разработчик",
@@ -31,7 +32,8 @@ _META_WORDS = (
 )
 _REAL_WORLD_WORDS = (
     "фильм", "сериал", "аниме", "музык", "песн", "рецепт", "код",
-    "python", "javascript", "телефон", "компьютер", "интернет", "мем",
+    "python", "питон", "javascript", "программ", "телефон", "компьютер",
+    "интернет", "мем",
     # "работа/работе/работу" (быт), но НЕ глагол "работает" — иначе любой
     # лор-вопрос «как X работает?» уходил в real_world
     "работе", "работу", "работы", "работой", "подработ",
@@ -48,7 +50,8 @@ _FOREIGN_WORLD_WORDS = (
     "президент", "трамп", "путин", "байден", "интернет", "телефон",
     "смартфон", "компьютер", "нейросет", "телеграм", "telegram",
     "ютуб", "youtube", "тикток", "tiktok", "сериал", "фильм", "аниме",
-    "мем", "видеоигр", "rpg", "python", "javascript", "автомобил",
+    "мем", "видеоигр", "rpg", "код", "python", "javascript",
+    "программ", "автомобил",
     "самолёт", "самолет", "космос", "сша", "росси", "евросоюз",
 )
 _CAUSAL_WORDS = (
@@ -56,21 +59,57 @@ _CAUSAL_WORDS = (
     "после этого", "дальше", "предыстор", "что привело", "почему это",
     "до этого", "связано с", "отразилось", "привело потом",
 )
+_CHAT_SCOPE_WORDS = (
+    "пользователь", "участник", "в чате", "в нашем чате", "в этом чате",
+    "человек из чата", "ник ", "никнейм", "псевдоним",
+)
+_CHAT_OPERATION_WORDS = (
+    "когда будут главы", "когда главы", "где главы", "новые главы",
+    "когда выйдет глава", "когда выйдут главы", "когда перевод",
+    "занимаешься переводом", "про перевод",
+)
+_LORE_QUERY_PATTERNS = (
+    r"\bкто (?:такой|такая|такие)\b",
+    r"\bчто (?:такое|за)\b",
+    r"\bчто представляет собой\b",
+    r"\bгде находится\b",
+    r"\b(?:расскажи|поведай|напомни)\s+(?:про|о)\b",
+    r"\bчто ты знаешь (?:про|о)\b",
+    r"\bпочему\b",
+    r"\bкакую роль\b",
+    r"\bчем извест",
+    r"\bчто связывает\b",
+    r"\bкак (?:ты )?относишься\b",
+    r"\bразве\b",
+    r"\bпопадан\w*\b",
+    r"\bзнает (?:будущий )?сюжет\b",
+    r"\bкак\b.{0,40}\b(?:работает|устроен\w*|действует)\b",
+)
 _INTENTS = {"casual", "lore", "plot", "provocation", "meta", "real_world"}
 _MEMORY_KINDS = {
     "protected_insult", "personal_insult", "apology", "personal_praise",
     "protected_praise", "jealousy", "provocation", "personal_fact",
 }
-_DEFAULT_NEG = (
+_INSULT_NEG = (
     "лох", "туп", "дур", "идиот", "урод", "сука", "твар", "мраз",
     "дебил", "уёб", "уеб", "чмо", "говн", "ненавиж", "сдох",
-    "убью", "убить", "уничтож", "похорон", "трону", "сломаю",
     "жалк", "ничтож", "лжец", "слабак", "ничего не сто", "смерт",
-    "посмеш",
-    # обиходные синонимы угрозы расправы — без них защита Алона не срабатывала
-    "прикон", "прибью", "прибей", "замоч", "грохну", "кокну", "порешу",
-    "зареж", "прирез", "перереж", "придуш", "удушу", "удавлю", "расправ",
-    "пристрел", "размаж", "урою", "закопа", "разорв", "глотк", "придушу",
+    "посмеш", "пидор", "хуесос", "шлюх", "недотрах", "ебан", "ёбан",
+)
+_PERSONAL_TAUNT_PATTERNS = (
+    r"\b(?:тебе|тебя|у тебя|ты)\b.{0,45}\bне да[её]т\b",
+    r"\bнедотрах\w*\b",
+    r"\bчто там у тебя\b.{0,30}\bлизать\b",
+)
+_THREAT_FORMS = (
+    "убью", "уничтожу", "прикончу", "прибью", "замочу", "грохну",
+    "кокну", "порешу", "зарежу", "прирежу", "перережу", "придушу",
+    "удушу", "удавлю", "пристрелю", "размажу", "урою", "закопаю",
+    "разорву", "сломаю", "похороню",
+)
+_THREAT_INFINITIVES = (
+    "убить", "уничтожить", "прикончить", "зарезать", "придушить",
+    "пристрелить", "сломать", "похоронить", "разорвать",
 )
 _DEFAULT_POS = (
     "спасибо", "люблю", "красив", "уважа", "обожа", "умница",
@@ -126,40 +165,54 @@ class ReplyPlanner:
             other_entity_score=other_score, butt_in_pct=butt_in_pct, roll=roll)
         entities = list(dict.fromkeys([
             *self.lexicon.entities_in(text), *profile_entities]))
+        conversation_entities = _conversation_entities(
+            text, known=entities, persona=persona)
+        entities = list(dict.fromkeys([*entities, *conversation_entities]))
         active_aliases = {v.lower() for v in persona.aliases}
         knowledge_entities = [
             value for value in entities
-            if value.lower() not in active_aliases and value.lower() not in {
+            if value not in conversation_entities
+            and value.lower() not in active_aliases and value.lower() not in {
                 "глава", "новелла", "rqm", "кимчи"}]
         direct = decision.action == RESPOND
 
         intent = self._intent(low, knowledge_entities)
         world_scope = self._world_scope(
-            text, intent=intent, entities=entities, persona=persona)
+            text, intent=intent, entities=entities, persona=persona,
+            conversation_entities=conversation_entities)
         if world_scope == "foreign" and intent == "casual":
             intent = "real_world"
         heat, target, memory_kind = self._emotion(
-            persona, low, entities, active_hit)
-        if heat and intent == "casual":
+            persona, low, entities, active_hit, direct)
+        if heat >= 2 or (heat and intent == "casual"):
             intent = "provocation"
+        world_scope = self._world_scope(
+            text, intent=intent, entities=entities, persona=persona,
+            conversation_entities=conversation_entities)
         register = self._register(persona, intent, heat, target, entities)
         needs_knowledge = intent in {"plot", "lore"}
+        forbidden_probe = _matches_forbidden_probe(low, persona)
+        if forbidden_probe:
+            needs_knowledge = False
         chapter = bool(re.search(
-            r"глав\w*\s*№?\s*\d{1,3}|\d{1,3}\s*глав", text, re.I))
+            r"глав\w*\s*№?\s*\d{1,3}|"
+            r"\d{1,3}(?:-?(?:й|я|ю|ей|ой))?\s*глав",
+            text, re.I))
         knowledge_scope = (
             "causal" if chapter and any(v in low for v in _CAUSAL_WORDS)
             else "exact" if chapter else "relevant")
         affinity = self._affinity(low, target, persona)
         risks: list[str] = []
+        if forbidden_probe:
+            risks.append("forbidden_knowledge_probe")
 
         if len(entities) > 1 and heat and target is None:
             risks.append("ambiguous_emotion_target")
-        if heat and entities:
+        if heat and _emotion_context_is_ambiguous(low, entities):
             risks.append("emotion_target_requires_classifier")
-        if intent == "casual" and knowledge_entities and any(
-                word in low for word in _QUESTION_WORDS):
-            intent = "lore"
-            needs_knowledge = True
+        if (direct and intent == "provocation" and heat == 0
+                and re.search(r"\b(?:он|она|они|его|её|их)\b", low)):
+            risks.append("third_party_profanity_requires_classifier")
         if state and state.heat and heat == 0 and state.topic:
             same_topic = any(e.lower() in state.topic.lower() for e in entities)
             if same_topic:
@@ -177,6 +230,7 @@ class ReplyPlanner:
             needs_knowledge=needs_knowledge,
             search_query=self._search_query(text, entities),
             entities=entities,
+            conversation_entities=conversation_entities,
             emotion_target=target,
             affinity_delta=affinity,
             risk_flags=risks,
@@ -188,15 +242,34 @@ class ReplyPlanner:
         # ASK means the cheap core only saw an ambient hook. Ambiguous direct
         # messages also benefit from the classifier; clear direct messages do
         # not spend an extra request.
-        needs_classifier = decision.action == ASK or bool(risks)
+        needs_classifier = decision.action == ASK or any(
+            risk != "forbidden_knowledge_probe" for risk in risks)
         return plan, needs_classifier
 
     def merge_classifier(self, persona: Persona, plan: ReplyPlan,
                          verdict: dict | None, *, text: str = "") -> ReplyPlan:
         if not verdict:
-            return replace(plan, respond=plan.priority == DIRECT,
-                           reason=plan.reason + ":classifier-failed",
-                           classifier_used=True)
+            ambiguous = {
+                "ambiguous_emotion_target",
+                "emotion_target_requires_classifier",
+                "third_party_profanity_requires_classifier",
+            }.intersection(plan.risk_flags)
+            if ambiguous:
+                intent = (
+                    "casual" if plan.intent == "provocation"
+                    else plan.intent)
+                return replace(
+                    plan, respond=plan.priority == DIRECT,
+                    intent=intent, heat=0, emotion_target=None,
+                    affinity_delta=0, memory_kind=None,
+                    register=self._register(
+                        persona, intent, 0, None, plan.entities),
+                    reason=plan.reason + ":classifier-failed-conservative",
+                    classifier_used=True)
+            return replace(
+                plan, respond=plan.priority == DIRECT,
+                reason=plan.reason + ":classifier-failed",
+                classifier_used=True)
         respond_raw = verdict.get("respond", plan.respond)
         respond = respond_raw if isinstance(respond_raw, bool) else plan.respond
         intent = str(verdict.get("intent") or verdict.get("mode")
@@ -301,19 +374,26 @@ class ReplyPlanner:
     def _intent(low: str, entities: list[str]) -> str:
         if any(word in low for word in _META_WORDS):
             return "meta"
-        if any(word in low for word in _PLOT_WORDS):
+        if any(word in low for word in _CHAT_OPERATION_WORDS):
+            return "casual"
+        if (any(word in low for word in _PLOT_WORDS)
+                or re.search(
+                    r"глав\w*\s*№?\s*\d{1,3}|\d{1,3}(?:-?[яй])?\s*глав",
+                    low)):
             return "plot"
-        if entities and any(word in low for word in _QUESTION_WORDS):
+        if entities and any(
+                re.search(pattern, low) for pattern in _LORE_QUERY_PATTERNS):
             return "lore"
         if any(word in low for word in _REAL_WORLD_WORDS):
             return "real_world"
-        if any(_marker_in(low, word) for word in _DEFAULT_NEG):
+        if any(_marker_in(low, word) for word in _INSULT_NEG):
             return "provocation"
         return "casual"
 
     @staticmethod
     def _emotion(persona: Persona, low: str, entities: list[str],
-                 active_hit: bool) -> tuple[int, str | None, str | None]:
+                 active_hit: bool,
+                 direct: bool) -> tuple[int, str | None, str | None]:
         routing = persona.routing
         for topic in routing.get("sensitive_topics", []):
             if any(str(k).lower() in low for k in topic.get("keywords", [])):
@@ -321,14 +401,15 @@ class ReplyPlanner:
                         str(topic.get("target") or topic.get("id") or "тема"),
                         str(topic.get("memory_kind") or "provocation"))
 
-        negative = any(_marker_in(low, word) for word in _DEFAULT_NEG)
+        negative = any(_marker_in(low, word) for word in _INSULT_NEG)
         positive = any(_marker_in(low, word) for word in _DEFAULT_POS)
         jealousy = routing.get("jealousy_entities", {})
         for entity in entities:
             if entity in jealousy and any(
                     word in low for word in ("люблю", "лучшая пара", "жен",
                                              "замуж", "выберет", "достойна",
-                                             "муж", "созданы", "нравится")):
+                                             "муж", "созданы", "нравится",
+                                             "лучше подходит", "подходит")):
                 cfg = jealousy[entity]
                 return (int(cfg.get("heat", 1)) if isinstance(cfg, dict) else 1,
                         entity, "jealousy")
@@ -338,7 +419,9 @@ class ReplyPlanner:
             if entity not in protected:
                 continue
             cfg = protected[entity]
-            if negative:
+            target_aliases = routing.get(
+                "entity_aliases", {}).get(entity, [])
+            if negative or _threatens_entity(low, entity, target_aliases):
                 if isinstance(cfg, dict):
                     return (int(cfg.get("heat", 3)), entity,
                             str(cfg.get("memory_kind") or "protected_insult"))
@@ -346,7 +429,15 @@ class ReplyPlanner:
             if positive:
                 return 0, entity, "protected_praise"
 
-        if negative and active_hit:
+        addressed = active_hit or (
+            direct and bool(re.search(
+                r"\b(?:ты|тебя|тебе|тобой|твой|твоя|твоё|твои|у тебя)\b",
+                low)))
+        personal_taunt = any(
+            re.search(pattern, low) for pattern in _PERSONAL_TAUNT_PATTERNS)
+        if addressed and (
+                negative or personal_taunt or _threatens_entity(
+                    low, persona.name, [*persona.aliases, "тебя", "тебе"])):
             return 2, persona.name, "personal_insult"
         if any(_marker_in(low, word) for word in _DEFAULT_APOLOGY):
             return 0, persona.name, "apology"
@@ -389,7 +480,9 @@ class ReplyPlanner:
         # the persona/protected values, not merely quoted about a third party.
         if any(_marker_in(low, word) for word in _DEFAULT_APOLOGY):
             return 1
-        neg = sum(1 for word in _DEFAULT_NEG if _marker_in(low, word))
+        neg = sum(1 for word in _INSULT_NEG if _marker_in(low, word))
+        if target and _threatens_entity(low, target, []):
+            neg += 2
         pos = sum(1 for word in _DEFAULT_POS if _marker_in(low, word))
         protected = set(persona.routing.get("protected_entities", {}))
         if target and target not in protected and target != persona.name:
@@ -399,7 +492,9 @@ class ReplyPlanner:
     @staticmethod
     def _search_query(text: str, entities: list[str]) -> str:
         chapter = re.search(
-            r"глав\w*\s*№?\s*(\d{1,3})|(\d{1,3})\s*глав", text, re.I)
+            r"глав\w*\s*№?\s*(\d{1,3})|"
+            r"(\d{1,3})(?:-?(?:й|я|ю|ей|ой))?\s*глав",
+            text, re.I)
         parts = entities[:4]
         if chapter:
             parts.insert(0, f"глава {chapter.group(1) or chapter.group(2)}")
@@ -410,13 +505,25 @@ class ReplyPlanner:
 
     @staticmethod
     def _world_scope(text: str, *, intent: str, entities: list[str],
-                     persona: Persona) -> str:
+                     persona: Persona,
+                     conversation_entities: list[str]) -> str:
         low = text.lower()
-        if any(word in low for word in _SHARED_WORLD_WORDS):
-            return "shared"
+        if any(word in low for word in _CHAT_OPERATION_WORDS):
+            return "conversation"
+        if conversation_entities or any(
+                word in low for word in _CHAT_SCOPE_WORDS):
+            return "conversation"
+        if intent in {"lore", "plot", "meta", "provocation"}:
+            return "native"
         if any(word in low for word in _FOREIGN_WORLD_WORDS):
             return "foreign"
-        if intent in {"lore", "plot", "meta", "provocation"}:
+        if any(word in low for word in _SHARED_WORLD_WORDS):
+            return "shared"
+        active_forms = {value.casefold() for value in persona.aliases}
+        if any(
+                entity.casefold() not in active_forms
+                and entity not in conversation_entities
+                for entity in entities):
             return "native"
         known = {v.casefold() for v in entities}
         known.update(v.casefold() for v in persona.aliases)
@@ -427,7 +534,7 @@ class ReplyPlanner:
         proper = re.findall(r"(?<!\w)[А-ЯЁ][а-яё]{2,}(?!\w)", text)
         unknown = [
             value for value in proper
-            if value.casefold() not in known
+            if not _matches_known_form(value, known)
             and value.casefold() not in ignored]
         if unknown and any(word in low for word in _QUESTION_WORDS):
             return "foreign"
@@ -447,3 +554,121 @@ def _marker_in(text: str, marker: str) -> bool:
         return bool(re.search(
             rf"(?<![а-яёa-z]){re.escape(marker)}", text, re.I))
     return marker in text
+
+
+def _threatens_entity(text: str, entity: str,
+                      aliases: list[str]) -> bool:
+    """Detect a threat directed *at* an entity, not violence performed by it."""
+    target = _entity_pattern(entity, aliases)
+    future = "|".join(re.escape(value) for value in _THREAT_FORMS)
+    infinitive = "|".join(re.escape(value) for value in _THREAT_INFINITIVES)
+    object_prefix = (
+        r"(?:моего|мою|мой|твоего|твою|твой|этого|эту|этот|вашего|вашу|"
+        r"ваш)\s+")
+    direct = (
+        rf"(?:\b(?:{future})\b\s+(?:{object_prefix})?{target})"
+        rf"|(?:{target}.{{0,20}}\b(?:{future})\b)")
+    if re.search(direct, text, re.I):
+        return True
+    intended = (
+        rf"\b(?:я|мы|хочу|хотим|собираюсь|собираемся|буду|будем|пойду|"
+        rf"пойдём|решил|решила)\b.{{0,60}}"
+        rf"(?:\b(?:{infinitive})\b\s+(?:{object_prefix})?{target}|"
+        rf"{target}.{{0,30}}\b(?:{infinitive})\b)")
+    return bool(re.search(intended, text, re.I))
+
+
+def _entity_pattern(entity: str, aliases: list[str]) -> str:
+    values = [entity, *aliases]
+    tokens: list[str] = []
+    for value in values:
+        value = str(value).strip().casefold()
+        if not value:
+            continue
+        if " " not in value and len(value) >= 4:
+            tokens.append(re.escape(value[:4]) + r"[а-яёa-z-]*")
+        else:
+            tokens.append(re.escape(value))
+    return r"(?<![а-яёa-z])(?:" + "|".join(dict.fromkeys(tokens)) + \
+        r")(?![а-яёa-z])"
+
+
+def _conversation_entities(text: str, *, known: list[str],
+                           persona: Persona) -> list[str]:
+    """Extract names/nicks that belong to this chat, not to canon or the web."""
+    candidates: list[str] = []
+    patterns = (
+        r"(?:пользовател[ья]|участник[а]?)(?:\s+в\s+(?:нашем|этом)\s+чате)?"
+        r"\s+([^?.!,]{2,50})",
+        r"(?:в\s+(?:нашем|этом)\s+чате)\s+([^?.!,]{2,50})",
+        r"(?:опиши|опишите)\s+([^?.!,]{2,50})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            candidates.append(match.group(1).strip())
+    candidates.extend(re.findall(r"@[A-Za-z0-9_]{3,32}", text))
+    candidates.extend(
+        value for value in re.findall(
+            r"(?<![\w@])[A-Za-z][A-Za-z0-9_-]{2,31}(?!\w)", text)
+        if value.casefold() not in {
+            "python", "javascript", "telegram", "youtube", "tiktok", "rpg"})
+
+    blocked = {value.casefold() for value in known}
+    blocked.update(value.casefold() for value in persona.aliases)
+    blocked.update({
+        "ютия", "выдержанный", "такого", "такой", "этого", "этой",
+        "человека", "пользователя", "участника",
+    })
+    out: list[str] = []
+    for value in candidates:
+        value = re.sub(
+            r"^(?:такого|такой|этого|этой|по имени)\s+", "", value,
+            flags=re.I).strip(" «»\"'")
+        words = value.split()
+        while words and words[-1].casefold() in {
+                "знаешь", "знаете", "вообще"}:
+            words.pop()
+        value = " ".join(words)
+        if len(value) < 2 or value.casefold() in blocked:
+            continue
+        if any(value.casefold() == known_value
+               for known_value in blocked):
+            continue
+        if value not in out:
+            out.append(value)
+    return out[:3]
+
+
+def _matches_known_form(value: str, known: set[str]) -> bool:
+    folded = value.casefold()
+    if folded in known:
+        return True
+    for name in known:
+        for token in re.findall(r"[а-яёa-z]{4,}", name, re.I):
+            if folded.startswith(token[:4].casefold()):
+                return True
+    return False
+
+
+def _matches_forbidden_probe(text: str, persona: Persona) -> bool:
+    boundaries = [
+        *persona.knowledge_boundaries.get("never_knows", []),
+        *persona.knowledge_boundaries.get("forbidden_claims", []),
+    ]
+    for boundary in boundaries:
+        words = {
+            value.casefold() for value in
+            re.findall(r"[а-яёa-z]{4,}", str(boundary), re.I)}
+        if len(words) >= 2 and sum(word in text for word in words) >= 2:
+            return True
+    return False
+
+
+def _emotion_context_is_ambiguous(text: str, entities: list[str]) -> bool:
+    if len(entities) > 1:
+        return True
+    return bool(re.search(
+        r"\b(?:сказал|сказала|говорит|говорил|говорила|назвал|назвала|"
+        r"слышал|слышала|цитирую|цитата|типа|сравни|как будто)\b",
+        text))

@@ -15,7 +15,9 @@ from app.ai.decision import (
     decide,
 )
 from app.ai.engine import AiEngine, _clean, _strip_thinking
+from app.ai.engine import _relevant_context
 from app.ai.client import parse_json_block
+from app.ai.models import ReplyPlan
 from app.ai.personas import Lexicon, Persona, load_lexicon, load_lore, load_personas
 from app.ai.queue import FairQueue, Job
 from app.ai.store import AiStore
@@ -75,7 +77,8 @@ def test_decide_offtopic_asks_when_dice_win():
 
 def _job(priority, uid=1, t=0.0, chat=-1):
     return Job(chat_id=chat, reply_to=uid, user_id=uid, username="u",
-               text="x", priority=priority, mode="casual", enqueued_at=t)
+               text="x", priority=priority, enqueued_at=t,
+               plan=_reply_plan(priority=priority).to_dict())
 
 
 def test_queue_direct_preferred_but_ambient_not_starved():
@@ -158,12 +161,19 @@ def test_real_personas_lexicon_lore_load():
 def make_persona(**over) -> Persona:
     base = dict(
         key="yutia", name="Ютия", aliases=["Ютия", "Ютии", "Ютию"],
-        one_liner="тест", spoiler_safe_until=0,
-        persona={"relations": {}, "signature_lines": []},
-        triggers=[], taboo=[],
-        system_prompt="Ты — Ютия.")
+        one_liner="тест", taboo=[], identity="Ты — Ютия.",
+        registers={"default": {"description": "Спокойная речь."}},
+        routing={"default_register": "default",
+                 "intent_registers": {}})
     base.update(over)
     return Persona(**base)
+
+
+def _reply_plan(*, priority=DIRECT, intent="casual",
+                register="default", heat=0, needs_knowledge=False):
+    return ReplyPlan(
+        respond=True, priority=priority, reason="test", intent=intent,
+        register=register, heat=heat, needs_knowledge=needs_knowledge)
 
 
 class FakeAiClient:
@@ -382,7 +392,9 @@ def test_engine_run_job_sends_and_records(tmp_path):
         eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="вася", text="Алон хуесос",
-                               priority=DIRECT, mode="insult", enqueued_at=0.0))
+                               priority=DIRECT, enqueued_at=0.0,
+                               plan=_reply_plan(
+                                   intent="provocation", heat=3).to_dict()))
         assert sent and sent[0][2] == "Ты пожалеешь, милый."
         # the bot's own reply is remembered for context
         recent = await eng.store.recent(-100500)
@@ -405,7 +417,8 @@ def test_engine_run_job_silent_on_rate_limit(tmp_path):
         eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="t", priority=DIRECT,
-                               mode="casual", enqueued_at=0.0))
+                               enqueued_at=0.0,
+                               plan=_reply_plan().to_dict()))
         assert sent == []  # rate-limited → stay silent, no fallback spam
         await eng.store.close()
     asyncio.run(go())
@@ -423,7 +436,8 @@ def test_engine_run_job_strips_thinking_no_model_tag(tmp_path):
         eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="вася", text="Ютия привет",
-                               priority=DIRECT, mode="casual", enqueued_at=0.0))
+                               priority=DIRECT, enqueued_at=0.0,
+                               plan=_reply_plan().to_dict()))
         # <think> stripped, clean text, NO "Модель:" debug tag
         assert sent and sent[0][2] == "Ты пожалеешь."
         assert gem.generate_calls == 1
@@ -444,7 +458,8 @@ def test_engine_run_job_empty_stays_silent_after_cascade(tmp_path):
         eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="t", priority=DIRECT,
-                               mode="casual", enqueued_at=0.0))
+                               enqueued_at=0.0,
+                               plan=_reply_plan().to_dict()))
         assert sent == []
         await eng.store.close()
     asyncio.run(go())
@@ -464,14 +479,15 @@ def test_engine_cascade_fails_over_on_rate_limit(tmp_path):
         eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="Ютия привет",
-                               priority=DIRECT, mode="casual", enqueued_at=0.0))
+                               priority=DIRECT, enqueued_at=0.0,
+                               plan=_reply_plan().to_dict()))
         assert sent == ["Я здесь."]
         assert gem.generate_calls == 2
         await eng.store.close()
     asyncio.run(go())
 
 
-def test_engine_uses_active_model_setting(tmp_path):
+def test_engine_always_starts_with_70b_even_if_stale_setting_exists(tmp_path):
     async def go():
         gem = FakeAiClient(generate_result="ответ")
         captured = {}
@@ -482,15 +498,17 @@ def test_engine_uses_active_model_setting(tmp_path):
             return await orig(system, user, **kw)
         gem.generate = spy
         eng = await make_engine(tmp_path, gem)
-        await eng.store.set("active_model", "qwen/qwen3-32b")
+        await eng.store.set(
+            "active_model", "meta-llama/llama-4-scout-17b-16e-instruct")
 
         async def send(c, r, t):
             return 1
         eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="Ютия привет",
-                               priority=DIRECT, mode="casual", enqueued_at=0.0))
-        assert captured["model"] == "qwen/qwen3-32b"
+                               priority=DIRECT, enqueued_at=0.0,
+                               plan=_reply_plan().to_dict()))
+        assert captured["model"] == "llama-3.3-70b-versatile"
         await eng.store.close()
     asyncio.run(go())
 
@@ -509,7 +527,10 @@ def test_engine_run_job_silent_on_plot_rate_limit(tmp_path):
         eng.send_callback = send
         await eng._run_job(Job(chat_id=-100500, reply_to=1, user_id=7,
                                username="u", text="что было в главе",
-                               priority=DIRECT, mode="plot", enqueued_at=0.0))
+                               priority=DIRECT, enqueued_at=0.0,
+                               plan=_reply_plan(
+                                   intent="plot",
+                                   needs_knowledge=True).to_dict()))
         assert sent == []
         await eng.store.close()
     asyncio.run(go())
@@ -537,7 +558,8 @@ def test_engine_react_to_post_enqueues(tmp_path):
         await eng.react_to_post("Вышла глава 328! Покровитель злодеев.")
         assert len(eng._queue) == 1
         job = eng._queue.pop(0.0)
-        assert job.mode == "react_post" and job.reply_to == 0
+        assert ReplyPlan.from_dict(job.plan).reason == "channel-post"
+        assert job.reply_to == 0
         # no enabled chat / no persona → no-op
         await eng.store.set("active_persona", "")
         await eng.react_to_post("ещё пост")
@@ -546,35 +568,37 @@ def test_engine_react_to_post_enqueues(tmp_path):
     asyncio.run(go())
 
 
-def test_affinity_store_bump_and_clamp(tmp_path):
+def test_relationship_store_bump_and_clamp(tmp_path):
     async def go():
         s = AiStore(tmp_path / "ai.db")
         await s.connect()
-        assert await s.affinity_get(-1, 7) == 0
-        assert await s.affinity_bump(-1, 7, 5) == 5
-        assert await s.affinity_bump(-1, 7, -8) == -3
-        assert await s.affinity_bump(-1, 7, 999) == 100   # clamped high
-        assert await s.affinity_bump(-1, 7, -999) == -100  # clamped low
+        assert (await s.relationship_get(-1, 7, "yutia")).affinity == 0
+        assert (await s.relationship_bump(
+            -1, 7, "yutia", affinity=5)).affinity == 5
+        assert (await s.relationship_bump(
+            -1, 7, "yutia", affinity=-8)).affinity == -3
+        assert (await s.relationship_bump(
+            -1, 7, "yutia", affinity=999)).affinity == 100
+        assert (await s.relationship_bump(
+            -1, 7, "yutia", affinity=-999)).affinity == -100
         await s.close()
     asyncio.run(go())
 
 
-def test_affinity_delta_and_label():
-    from app.ai.engine import AiEngine
-    assert AiEngine._affinity_delta("спасибо, ты умница") >= 1
-    assert AiEngine._affinity_delta("ты тупая дура") <= -1
-    assert AiEngine._affinity_delta("какая сегодня погода") == 0
-    assert "тёплое" in AiEngine._affinity_label(40)
-    assert "враждебное" in AiEngine._affinity_label(-40)
-    assert AiEngine._affinity_label(0) == "нейтральное"
-
-
-def test_chapter_number_detection():
-    from app.ai.engine import _chapter_number
-    assert _chapter_number("что было в 300 главе") == 300
-    assert _chapter_number("ютия что было в главе 50?") == 50
-    assert _chapter_number("расскажи про главу №7") == 7
-    assert _chapter_number("просто болтаем ни о чём") is None
+def test_relevant_context_finds_old_entity_message_through_recent_noise():
+    rows = [{
+        "msg_id": 1, "text": "Выдержанный Кимчи — псевдоним участника.",
+        "username": "a", "is_bot": 0,
+    }]
+    rows.extend({
+        "msg_id": value, "text": f"посторонний шум {value}",
+        "username": "b", "is_bot": 0,
+    } for value in range(2, 70))
+    picked = _relevant_context(
+        rows, current_msg_id=999,
+        entities=["Выдержанный Кимчи"], username="тестер")
+    assert any("псевдоним участника" in row["text"] for row in picked)
+    assert len(picked) <= 8
 
 
 def test_strip_foreign_scripts():
@@ -598,3 +622,5 @@ def test_clean_strips_quotes_wrapping_whole_reply():
     assert _clean('"Обычный ответ."') == "Обычный ответ."
     assert _clean("«Незакрытая реплика") == "Незакрытая реплика"
     assert _clean("Она сказала: «нет» — и ушла.") == "Она сказала: «нет» — и ушла."
+    assert _clean("Он загадка - и это прекрасно.") == \
+        "Он загадка — и это прекрасно."

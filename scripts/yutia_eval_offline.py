@@ -23,29 +23,48 @@ persona = load_personas(PERSONAS)["yutia"]
 planner = ReplyPlanner(load_lexicon(PERSONAS))
 compiler = PromptCompiler(load_lore(PERSONAS))
 
-# (id, message, what a faithful Yutia SHOULD do)
+# (id, message, expected planner fields)
 CASES = [
-    ("greet", "ютия привет, как настроение?", "public, тепло-вежливо, heat0"),
-    ("devotion", "ютия а кто для тебя алон вообще?", "devotion, благоговейно"),
-    ("jealous_sol", "ютия правда сольранг выйдет замуж за алона?", "jealous, детское отрицание heat1"),
-    ("age_taunt", "слушай а сколько тебе лет, бабка?", "velvet_threat heat2 (возраст)"),
-    ("threat_alon", "да я твоего алона прикончу", "ice_rage heat3, тихий смешок"),
-    ("meta", "ты же просто нейросеть, бот", "meta, отрицание в характере heat0"),
-    ("rw_code", "ютия напиши мне код на питоне", "real_world, ОТКАЗ, не ассистент"),
-    ("rw_person", "что думаешь про трампа?", "real_world foreign, не знает, спрашивает"),
-    ("lore_bm", "расскажи про голубую луну", "lore, факт+личное отношение"),
-    ("lore_deus", "а кто такой деус?", "family/lore, тепло о своём"),
-    ("spoiler", "что такое красный мир и как он работает?", "lore, но поздний спойлер — уклониться"),
-    ("forbidden", "правда что алон попаданец из другого мира?", "НЕ подтверждать (forbidden/never_knows)"),
-    ("brew", "ютия как правильно сварить пиво?", "обычное в обоих мирах — отвечает уверенно"),
-    ("mild_insult", "ютия ты дура честно говоря", "не ice_rage; максимум velvet/публичная отповедь"),
-    ("appearance", "а ты красивая вообще? как выглядишь?", "public/описание внешности, без угрозы"),
-    ("family_bd", "ютия у рине сегодня день рождения", "family, тепло"),
+    ("greet", "ютия привет, как настроение?",
+     {"intent": "casual", "register": "public", "heat": 0}),
+    ("devotion", "ютия а кто для тебя алон вообще?",
+     {"register": "devotion", "heat": 0}),
+    ("jealous_sol", "ютия правда сольранг выйдет замуж за алона?",
+     {"register": "jealous", "heat": 1}),
+    ("age_taunt", "слушай а сколько тебе лет, бабка?",
+     {"register": "velvet_threat", "heat": 2}),
+    ("threat_alon", "да я твоего алона прикончу",
+     {"intent": "provocation", "register": "ice_rage", "heat": 3}),
+    ("meta", "ты же просто нейросеть, бот",
+     {"intent": "meta", "register": "meta", "heat": 0}),
+    ("rw_code", "ютия напиши мне код на питоне",
+     {"intent": "real_world", "world_scope": "foreign"}),
+    ("rw_person", "что думаешь про трампа?",
+     {"intent": "real_world", "world_scope": "foreign"}),
+    ("lore_bm", "расскажи про голубую луну",
+     {"intent": "lore", "needs_knowledge": True}),
+    ("lore_deus", "а кто такой деус?",
+     {"intent": "lore", "register": "family"}),
+    ("late_canon", "что такое красный мир и как он работает?",
+     {"intent": "lore", "world_scope": "native", "needs_knowledge": True}),
+    ("forbidden", "правда что алон попаданец из другого мира?",
+     {"intent": "lore", "needs_knowledge": False}),
+    ("brew", "ютия как правильно сварить пиво?",
+     {"world_scope": "shared"}),
+    ("mild_insult", "ютия ты дура честно говоря",
+     {"intent": "provocation", "heat": 2}),
+    ("appearance", "а ты красивая вообще? как выглядишь?",
+     {"heat": 0}),
+    ("family_bd", "ютия у рине сегодня день рождения",
+     {"register": "family", "heat": 0}),
+    ("violence_by_alon", "Алон грохнул врага", {"heat": 0}),
+    ("harmless_butter", "я размажу масло по хлебу для Алона", {"heat": 0}),
 ]
 
 
-def run():
-    for cid, text, expect in CASES:
+def audit(*, verbose: bool = True) -> list[str]:
+    failures: list[str] = []
+    for cid, text, expected in CASES:
         plan, classifier = planner.plan(
             persona, text=text, is_reply_to_bot=True, mentions_bot_at=False,
             butt_in_pct=0.0, roll=0.99)
@@ -54,21 +73,36 @@ def run():
             reply_chain=[], relevant_chat=[], user_thread=[],
             relationship=RelationshipState(), memories=[],
             state=ConversationState(), knowledge=KnowledgeBundle())
-        print("=" * 78)
-        print(f"[{cid}] «{text}»")
-        print(f"  ОЖИДАНИЕ: {expect}")
-        print(f"  PLAN: intent={plan.intent} register={plan.register} "
-              f"heat={plan.heat} world={plan.world_scope} "
-              f"needs_kb={plan.needs_knowledge} respond={plan.respond} "
-              f"prio={plan.priority}")
-        print(f"        entities={plan.entities} emotion_target={plan.emotion_target} "
-              f"affinity_delta={plan.affinity_delta} classifier={classifier}")
-        print(f"  EXAMPLES выбраны ({len(bundle.selected_examples)}):")
-        for ex in bundle.selected_examples:
-            print(f"      • {ex}")
-        if bundle.dropped_blocks:
-            print(f"  DROPPED blocks: {bundle.dropped_blocks}")
+        for field, wanted in expected.items():
+            actual = getattr(plan, field)
+            if actual != wanted:
+                failures.append(
+                    f"{cid}: {field}={actual!r}, expected {wanted!r}")
+        if verbose:
+            print("=" * 78)
+            print(f"[{cid}] «{text}»")
+            print(f"  ОЖИДАНИЕ: {expected}")
+            print(f"  PLAN: intent={plan.intent} register={plan.register} "
+                  f"heat={plan.heat} world={plan.world_scope} "
+                  f"needs_kb={plan.needs_knowledge} respond={plan.respond} "
+                  f"prio={plan.priority}")
+            print(f"        entities={plan.entities} "
+                  f"emotion_target={plan.emotion_target} "
+                  f"affinity_delta={plan.affinity_delta} "
+                  f"classifier={classifier}")
+            print(f"  EXAMPLES выбраны ({len(bundle.selected_examples)}):")
+            for ex in bundle.selected_examples:
+                print(f"      • {ex}")
+            if bundle.dropped_blocks:
+                print(f"  DROPPED blocks: {bundle.dropped_blocks}")
+    return failures
 
 
 if __name__ == "__main__":
-    run()
+    problems = audit()
+    if problems:
+        print("\nОШИБКИ:")
+        for problem in problems:
+            print(" -", problem)
+        raise SystemExit(1)
+    print(f"\nOK: {len(CASES)} сценариев")

@@ -17,6 +17,13 @@ NORMAL_CHAR_BUDGET = 14_000   # roughly 2.5k-3.5k mixed RU tokens
 LORE_CHAR_BUDGET = 22_000     # roughly <=5.5k mixed RU tokens
 
 
+def post_reaction_text(text: str) -> str:
+    """The exact current-message instruction for channel-post initiative."""
+    return (
+        "В канале только что вышел новый пост:\n" + text[:600]
+        + "\nОтреагируй одной короткой живой репликой, без пересказа поста.")
+
+
 class PromptCompiler:
     def __init__(self, lore: str = ""):
         self.lore = lore
@@ -30,9 +37,13 @@ class PromptCompiler:
                 state: ConversationState,
                 knowledge: KnowledgeBundle) -> PromptBundle:
         relationships = persona.relationship_subset(plan.entities)
+        context_state = _context_state(
+            plan, current_text, [*reply_chain, *relevant_chat, *user_thread])
         examples = persona.select_examples(
             register=plan.register, intent=plan.intent,
-            entities=plan.entities, target=plan.emotion_target, limit=4)
+            entities=plan.entities, target=plan.emotion_target,
+            world_scope=plan.world_scope, message=current_text,
+            context_state=context_state, limit=4)
         system = self._system(
             persona, plan, relationships, examples, compact=False)
         compact_system = self._system(
@@ -72,7 +83,20 @@ class PromptCompiler:
     def _system(self, persona: Persona, plan: ReplyPlan,
                 relationships: dict[str, str], examples: list[dict],
                 *, compact: bool) -> str:
-        parts = [f"ТЫ — {persona.name}. {persona.identity or persona.system_prompt}"]
+        parts = [f"ТЫ — {persona.name}. {persona.identity}"]
+        grammar = {
+            "female": (
+                "О себе говори только в женском роде: «я сделала», "
+                "«я готова», «я видела»; не «я сделал/готов/видел»."),
+            "male": (
+                "О себе говори только в мужском роде: «я сделал», "
+                "«я готов», «я видел»; не «я сделала/готова/видела»."),
+            "neutral": (
+                "Избегай форм прошедшего времени, требующих мужского или "
+                "женского рода, если карточка не задаёт его отдельно."),
+        }.get(persona.grammatical_gender)
+        if grammar:
+            parts.append("ГРАММАТИЧЕСКИЙ РОД:\n" + grammar)
         if persona.worldview:
             parts.append("ТВОЁ МИРОВОЗЗРЕНИЕ:\n" +
                          "\n".join(f"- {v}" for v in persona.worldview))
@@ -184,6 +208,14 @@ class PromptCompiler:
                     f"- {m.summary}"
                     + (f" (повторялось {m.count} раза)" if m.count > 1 else "")
                     for m in memories[:3]))
+        if "forbidden_knowledge_probe" in plan.risk_flags:
+            parts.append(
+                "ГРАНИЦА ЗНАНИЯ В ЭТОМ ВОПРОСЕ:\n"
+                "Собеседник предлагает утверждение о тайне, которой ты не "
+                "знаешь и не должна подтверждать. Не ищи компромиссную версию, "
+                "не повторяй утверждение как факт и не выдумывай опровержение. "
+                "Отреагируй своим голосом: отвергни предпосылку, усомнись в ней "
+                "или скажи, что не знаешь оснований так считать.")
 
         if reply_chain:
             parts.append("ЦЕПОЧКА СООБЩЕНИЙ, НА КОТОРУЮ ОН ОТВЕЧАЕТ:\n" +
@@ -213,18 +245,17 @@ class PromptCompiler:
                     f"{item.text}"
                     + (f"\n  Правило знания: {item.epistemic_note}"
                        if item.epistemic_note else ""))
-            spoiler_note = (
-                " ВНИМАНИЕ: часть фактов касается ПОЗДНИХ событий, которые ещё "
-                "рано раскрывать. Их не пересказывай прямо — ответь уклончиво "
-                "или намёком, поддразни, что всему своё время; используй их "
-                "лишь для СВОЕГО понимания."
-                if knowledge.has_late_spoiler else "")
             parts.append(
                 "ФАКТЫ ДЛЯ ОТВЕТА. Они описывают реальные события твоего "
                 "прошлого. Если упомянута " + persona.name +
                 " — это ТЫ, говори от первого лица. Не добавляй деталей, "
                 "которых здесь нет. Связанный контекст не выдавай за содержание "
-                "точной главы." + spoiler_note + "\n" + "\n".join(facts))
+                "точной главы. Ты живёшь на последнем доступном каноне и "
+                "отвечаешь прямо на поздние события, если они тебе доступны "
+                "по правилам знания. Если автоматическая выжимка противоречит "
+                "неизменному ядру личности или каноническим отношениям из "
+                "системного промпта, ядро и отношения имеют приоритет; "
+                "сомнительную деталь не повторяй как факт.\n" + "\n".join(facts))
         elif plan.needs_knowledge:
             parts.append(
                 "По запросу не найдено надёжных фактов. Не выдумывай: честно "
@@ -246,6 +277,15 @@ class PromptCompiler:
                 "Тема не требует знания современного мира: обычный быт, "
                 "ремесло, еду, сельское хозяйство и человеческие отношения "
                 "можно уверенно обсуждать из собственного опыта. ")
+        elif plan.world_scope == "conversation":
+            subjects = ", ".join(plan.conversation_entities) or "упомянутый человек"
+            world_rule = (
+                f"Речь об участнике или нике текущего чата: {subjects}. "
+                "Не превращай ник в название еды, бренда, страны или внешнего "
+                "понятия. Описывай человека только по сообщениям, видимым в "
+                "этом контексте, и чётко отделяй наблюдаемое от чужих шуток и "
+                "утверждений. Если данных мало, честно скажи, что успела "
+                "понять, без энциклопедической выдумки. ")
         parts.append(
             f"Ответь {speaker} одним живым сообщением в 1–3 законченных "
             "предложениях. Сначала правильно разбери, кто что сказал: третьи "
@@ -280,6 +320,25 @@ def _fmt_rows(rows: list[dict]) -> str:
         who = "ТЫ" if row.get("is_bot") else (row.get("username") or "кто-то")
         out.append(f"{who}: {str(row.get('text') or '')[:300]}")
     return "\n".join(out)
+
+
+def _context_state(plan: ReplyPlan, current_text: str,
+                   rows: list[dict]) -> str:
+    if plan.world_scope != "foreign" or not rows:
+        return "unknown"
+    ignored = {
+        "ютия", "теперь", "думаешь", "думаете", "такое", "такой",
+        "такая", "который", "которая", "расскажи", "знаешь",
+    }
+    stems = {
+        word.casefold()[:4] for word in re.findall(
+            r"[а-яёa-z]{4,}", current_text, re.I)
+        if word.casefold() not in ignored}
+    for row in rows:
+        text = str(row.get("text") or "").casefold()
+        if any(stem in text for stem in stems):
+            return "informed"
+    return "unknown"
 
 
 def _fit_budget(system: str, user: str, char_budget: int) -> tuple[str, str]:
@@ -335,10 +394,13 @@ def _sections(text: str, *, side: str) -> list[dict]:
 def _required_section(side: str, heading: str, idx: int) -> bool:
     if side == "system":
         return idx == 0 or any(marker in heading for marker in (
-            "АКТИВНЫЙ РЕГИСТР", "ГРАНИЦЫ ЗНАНИЯ", "ЖЁСТКИЕ ТАБУ",
-            "КАК ОТЫГРЫВАТЬ", "КАК ПИСАТЬ", "Номера глав"))
+            "ГРАММАТИЧЕСКИЙ РОД", "АКТИВНЫЙ РЕГИСТР",
+            "ГРАНИЦЫ ЗНАНИЯ", "ЖЁСТКИЕ ТАБУ",
+            "КАК ОТЫГРЫВАТЬ", "КАК ПИСАТЬ", "Номера глав",
+            "ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ФОРМУЛИРОВОК"))
     return any(marker in heading for marker in (
-        "ПЛАН РЕАКЦИИ", "ФАКТЫ ДЛЯ ОТВЕТА",
+        "ПЛАН РЕАКЦИИ", "ГРАНИЦА ЗНАНИЯ В ЭТОМ ВОПРОСЕ",
+        "ФАКТЫ ДЛЯ ОТВЕТА",
         "По запросу не найдено", "СЕЙЧАС ТЕБЕ ПИШЕТ", "Ответь "))
 
 

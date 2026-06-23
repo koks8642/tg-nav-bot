@@ -28,15 +28,6 @@ def test_seed_default_registry_can_be_disabled(monkeypatch):
     assert cfg.seed_default_registry is False
 
 
-def test_ai_model_defaults_and_override(monkeypatch):
-    monkeypatch.setenv("BOT_TOKEN", "x")
-    monkeypatch.delenv("AI_MODEL", raising=False)
-    cfg = load_config(require_bot=False)
-    assert cfg.ai_model == "llama-3.3-70b-versatile"
-    monkeypatch.setenv("AI_MODEL", "qwen/qwen3-32b")
-    assert load_config(require_bot=False).ai_model == "qwen/qwen3-32b"
-
-
 def test_invalid_channel_id_blocks_bot_start(monkeypatch):
     monkeypatch.setenv("BOT_TOKEN", "x")
     monkeypatch.setenv("CHANNEL_CHAT_ID", "")

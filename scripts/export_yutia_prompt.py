@@ -22,7 +22,7 @@ from app.ai.models import (  # noqa: E402
 from app.ai.planner import CLASSIFIER_SYSTEM, ReplyPlanner  # noqa: E402
 from app.ai.personas import load_lore, load_personas  # noqa: E402
 from app.ai.personas import load_lexicon  # noqa: E402
-from app.ai.prompting import PromptCompiler  # noqa: E402
+from app.ai.prompting import PromptCompiler, post_reaction_text  # noqa: E402
 
 
 def build_export() -> str:
@@ -90,13 +90,7 @@ def build_export() -> str:
 не начинай с имени, не повторяй прошлые формулировки и не становись
 справочным ассистентом."""
 
-    post_reaction = """\
-В канале только что вышел новый пост:
-«ТЕКСТ ПОСТА»
-
-Отреагируй на него ОДНОЙ короткой живой репликой в своём характере, будто
-увидела его в чате. Если это про твой мир (новая глава, арт) — тем уместнее.
-Без шаблонных приветствий и без пересказа поста — просто твоя живая реакция."""
+    post_reaction = post_reaction_text("ТЕКСТ ПОСТА")
 
     sections = [
         "ЮТИЯ — ВСЁ, ЧТО ПОЛУЧАЕТ НЕЙРОСЕТЬ ДЛЯ ОТВЕТА",
@@ -107,7 +101,7 @@ def build_export() -> str:
         "потому что они меняются при каждом запросе.",
         "",
         "=" * 78,
-        "1. ПОЛНЫЙ V2 SYSTEM PROMPT ДЛЯ ОБЫЧНОЙ БЕСЕДЫ",
+        "1. ПОЛНЫЙ SYSTEM PROMPT ДЛЯ ОБЫЧНОЙ БЕСЕДЫ",
         "=" * 78,
         casual.system,
         "",
@@ -115,7 +109,7 @@ def build_export() -> str:
         casual.user,
         "",
         "=" * 78,
-        "2. ПОЛНЫЙ V2 PROMPT ДЛЯ СЮЖЕТА/ЛОРА",
+        "2. ПОЛНЫЙ PROMPT ДЛЯ СЮЖЕТА/ЛОРА",
         "=" * 78,
         "REPLY PLAN:",
         json.dumps(lore_plan.to_dict(), ensure_ascii=False, indent=2),

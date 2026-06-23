@@ -5,7 +5,6 @@ Tables:
   buffer       — rolling window of recent group messages (chat memory)
   quota        — per-model request counters for local usage visibility
   ignores      — shadow-banned users (anti-abuse)
-  thread_summary — rolling summaries of long reply threads
   summaries    — chapter knowledge base (+ FTS index when built)
 """
 from __future__ import annotations
@@ -49,24 +48,10 @@ CREATE TABLE IF NOT EXISTS ignores (
   until   TEXT,
   reason  TEXT
 );
-CREATE TABLE IF NOT EXISTS thread_summary (
-  chat_id  INTEGER NOT NULL,
-  root_id  INTEGER NOT NULL,
-  upto_id  INTEGER NOT NULL,
-  summary  TEXT NOT NULL,
-  PRIMARY KEY (chat_id, root_id)
-);
 CREATE TABLE IF NOT EXISTS summaries (
   chapter  INTEGER PRIMARY KEY,
   title    TEXT,
   text     TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS affinity (
-  chat_id INTEGER NOT NULL,
-  user_id INTEGER NOT NULL,
-  value   INTEGER NOT NULL DEFAULT 0,
-  updated TEXT,
-  PRIMARY KEY (chat_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS usage_stats (
   day               TEXT NOT NULL,
@@ -114,7 +99,7 @@ CREATE TABLE IF NOT EXISTS memory_events (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_person
   ON memory_events(chat_id, user_id, persona, importance, id);
-CREATE TABLE IF NOT EXISTS conversation_state_v2 (
+CREATE TABLE IF NOT EXISTS conversation_state (
   chat_id   INTEGER NOT NULL,
   user_id   INTEGER NOT NULL DEFAULT 0,
   persona   TEXT NOT NULL,
@@ -246,7 +231,7 @@ class AiStore:
         await self.ensure_daily_reset()
 
     async def _migrate_additive(self) -> None:
-        """Bring pre-v2 test databases forward without destructive rewrites."""
+        """Bring existing test databases to the single current schema."""
         columns = {
             "memory_events": {
                 "event_count": "INTEGER NOT NULL DEFAULT 1",
@@ -263,7 +248,24 @@ class AiStore:
                 if name not in existing:
                     await self.conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
-        # v2.0 temporarily marked every summary scene as reportable to the
+        cur = await self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='conversation_state_v2'")
+        if await cur.fetchone():
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO conversation_state("
+                "chat_id,user_id,persona,thread_id,topic,register,heat,"
+                "conflict,updated) SELECT chat_id,user_id,persona,thread_id,"
+                "topic,register,heat,conflict,updated "
+                "FROM conversation_state_v2")
+            await self.conn.execute("DROP TABLE conversation_state_v2")
+        # Old experimental tables are not part of the current architecture.
+        await self.conn.execute("DROP TABLE IF EXISTS affinity")
+        await self.conn.execute("DROP TABLE IF EXISTS thread_summary")
+        await self.conn.execute(
+            "DELETE FROM settings WHERE key IN "
+            "('pipeline_version','active_model')")
+        # An early scene import marked every summary as reportable to the
         # focus persona. A digest cannot prove epistemic access, so remove that
         # unsafe blanket grant on every existing test database.
         await self.conn.execute(
@@ -271,12 +273,18 @@ class AiStore:
             "WHERE source='summary' AND reportable_to_json!='[]'")
         await self.conn.execute(
             "INSERT OR IGNORE INTO scene_meta(chapter,scene_id,prompt_version,"
-            "built_at) SELECT chapter,scene_id,'legacy-unknown',? FROM scenes",
+            "built_at) SELECT chapter,scene_id,'unknown',? FROM scenes",
             (_now(),))
         await self.conn.execute(
-            "UPDATE scene_meta SET prompt_version='legacy-unknown',"
+            "UPDATE scene_meta SET prompt_version='unknown',"
             "built_at=CASE WHEN built_at='' THEN ? ELSE built_at END "
             "WHERE prompt_version=''", (_now(),))
+        await self.conn.execute(
+            "UPDATE scene_meta SET prompt_version='unknown' "
+            "WHERE prompt_version='legacy-unknown'")
+        await self.conn.execute(
+            "UPDATE summary_meta SET prompt_version='unknown' "
+            "WHERE prompt_version='legacy-unknown'")
         await self.conn.commit()
 
     async def close(self) -> None:
@@ -324,8 +332,7 @@ class AiStore:
                 return False
             await self.conn.execute("DELETE FROM relationship_state")
             await self.conn.execute("DELETE FROM memory_events")
-            await self.conn.execute("DELETE FROM conversation_state_v2")
-            await self.conn.execute("DELETE FROM affinity")
+            await self.conn.execute("DELETE FROM conversation_state")
             await self.conn.execute(
                 "INSERT INTO settings(key,value) VALUES('persona_memory_day',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (today,))
@@ -396,32 +403,7 @@ class AiStore:
         rows.reverse()
         return rows
 
-    # ── per-user affinity (how the persona feels about each person) ───────
-    async def affinity_get(self, chat_id: int, user_id: int) -> int:
-        cur = await self.conn.execute(
-            "SELECT value FROM affinity WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id))
-        row = await cur.fetchone()
-        return int(row["value"]) if row else 0
-
-    async def affinity_bump(self, chat_id: int, user_id: int,
-                            delta: int, lo: int = -100, hi: int = 100) -> int:
-        """Nudge the persona's affinity toward a user, clamped to [lo, hi].
-        Returns the new value."""
-        cur = await self.conn.execute(
-            "SELECT value FROM affinity WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id))
-        row = await cur.fetchone()
-        new = max(lo, min(hi, (int(row["value"]) if row else 0) + int(delta)))
-        await self.conn.execute(
-            "INSERT INTO affinity(chat_id,user_id,value,updated) "
-            "VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET "
-            "value=excluded.value, updated=excluded.updated",
-            (chat_id, user_id, new, _now()))
-        await self.conn.commit()
-        return new
-
-    # ── professional per-user relationship + event memory ────────────────
+    # ── per-user relationship + event memory ─────────────────────────────
     async def relationship_get(self, chat_id: int, user_id: int,
                                persona: str) -> RelationshipState:
         cur = await self.conn.execute(
@@ -429,9 +411,7 @@ class AiStore:
             "AND persona=?", (chat_id, user_id, persona))
         row = await cur.fetchone()
         if row is None:
-            affinity = await self.affinity_get(chat_id, user_id)
-            return RelationshipState(
-                affinity=affinity, label=_relationship_label(affinity))
+            return RelationshipState()
         try:
             reasons = json.loads(row["reasons_json"] or "[]")
         except json.JSONDecodeError:
@@ -470,12 +450,6 @@ class AiStore:
             (chat_id, user_id, persona, current.affinity, current.trust,
              current.respect, current.familiarity,
              json.dumps(current.reasons, ensure_ascii=False), _now()))
-        # Keep the old affinity API/status compatible with v1.
-        await self.conn.execute(
-            "INSERT INTO affinity(chat_id,user_id,value,updated) VALUES(?,?,?,?) "
-            "ON CONFLICT(chat_id,user_id) DO UPDATE SET value=excluded.value,"
-            "updated=excluded.updated",
-            (chat_id, user_id, current.affinity, _now()))
         await self.conn.commit()
         return current
 
@@ -566,7 +540,7 @@ class AiStore:
                                user_id: int | None = None,
                                thread_id: int = 0) -> ConversationState:
         cur = await self.conn.execute(
-            "SELECT * FROM conversation_state_v2 WHERE chat_id=? AND user_id=? "
+            "SELECT * FROM conversation_state WHERE chat_id=? AND user_id=? "
             "AND persona=? AND thread_id=?",
             (chat_id, int(user_id or 0), persona, int(thread_id or 0)))
         row = await cur.fetchone()
@@ -589,7 +563,7 @@ class AiStore:
                                topic: str, register: str, heat: int,
                                conflict: str = "") -> None:
         await self.conn.execute(
-            "INSERT INTO conversation_state_v2(chat_id,user_id,persona,"
+            "INSERT INTO conversation_state(chat_id,user_id,persona,"
             "thread_id,topic,register,heat,conflict,updated) "
             "VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id,user_id,persona,thread_id) DO UPDATE SET "
@@ -658,23 +632,6 @@ class AiStore:
             cur_id = row["reply_to"]
         chain.reverse()
         return chain
-
-    # ── thread rolling summaries ──────────────────────────────────────────
-    async def get_thread_summary(self, chat_id: int, root_id: int) -> dict | None:
-        cur = await self.conn.execute(
-            "SELECT * FROM thread_summary WHERE chat_id=? AND root_id=?",
-            (chat_id, root_id))
-        row = await cur.fetchone()
-        return dict(row) if row else None
-
-    async def set_thread_summary(self, chat_id: int, root_id: int,
-                                 upto_id: int, summary: str) -> None:
-        await self.conn.execute(
-            "INSERT INTO thread_summary(chat_id,root_id,upto_id,summary) "
-            "VALUES(?,?,?,?) ON CONFLICT(chat_id,root_id) DO UPDATE SET "
-            "upto_id=excluded.upto_id, summary=excluded.summary",
-            (chat_id, root_id, upto_id, summary[:2000]))
-        await self.conn.commit()
 
     # ── provider usage ────────────────────────────────────────────────────
     async def usage_today(self, model: str) -> int:
@@ -865,12 +822,12 @@ class AiStore:
         return {key: int(row[key] or 0)
                 for key in ("total", "hashed", "modeled")}
 
-    async def kb_mark_legacy_meta(self, chapter: int) -> None:
+    async def kb_mark_unknown_meta(self, chapter: int) -> None:
         await self.conn.execute(
             "INSERT INTO summary_meta(chapter,prompt_version,built_at) "
-            "VALUES(?, 'legacy-unknown', ?) ON CONFLICT(chapter) DO UPDATE SET "
+            "VALUES(?, 'unknown', ?) ON CONFLICT(chapter) DO UPDATE SET "
             "prompt_version=CASE WHEN summary_meta.prompt_version='' THEN "
-            "'legacy-unknown' ELSE summary_meta.prompt_version END,"
+            "'unknown' ELSE summary_meta.prompt_version END,"
             "built_at=CASE WHEN summary_meta.built_at='' THEN excluded.built_at "
             "ELSE summary_meta.built_at END", (chapter, _now()))
         await self.conn.commit()

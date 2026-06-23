@@ -25,10 +25,9 @@ class Job:
     username: str | None
     text: str
     priority: str          # DIRECT | AMBIENT
-    mode: str              # insult | plot | lore | casual
     enqueued_at: float
+    plan: dict[str, Any]    # current ReplyPlan, JSON-safe for tracing
     replied_to: int | None = None  # msg id the USER replied to (if any)
-    plan: dict[str, Any] | None = None  # v2 ReplyPlan, JSON-safe for tracing
     needs_classifier: bool = False
     persona_key: str = ""
     profile_version: str = ""

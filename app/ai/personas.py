@@ -13,7 +13,7 @@ from pathlib import Path
 
 log = logging.getLogger("ai.personas")
 
-# Global voice/format guidance shared by every persona (rich or legacy).
+# Global voice/format guidance shared by every persona.
 # Two coherent blocks: how to BE in character, and how to WRITE. Kept free of
 # contradictions (no «with typos» vs «write cleanly») — language quality and
 # in-character liveliness are both required, not traded off.
@@ -22,7 +22,8 @@ _HOW_TO_WRITE = (
     "РАЗНЫМИ гранями, а не описание персонажа. Реагируй по ситуации — то тепло, "
     "то колко, то серьёзно, то с иронией; не застревай в одном тоне. Будь "
     "харизматичным: грубость, мат и чёрный юмор уместны, когда это в твоём "
-    "характере. Но по умолчанию ты скорее дружелюбен — агрессия и угрозы это "
+    "характере. Но по умолчанию сохраняй дружелюбный тон — агрессия и угрозы "
+    "это "
     "РЕАКЦИЯ на реальную провокацию или оскорбление близких, а не фон каждой "
     "реплики. Ты полноценная личность и можешь говорить о чём угодно (жизнь, "
     "люди в чате, еда, что обсуждают), не своди всё к своей коронной теме. "
@@ -30,7 +31,7 @@ _HOW_TO_WRITE = (
     "а не заготовкой. НЕ объясняй свой характер и не описывай свои действия со "
     "стороны (никаких «*улыбается*»). "
     "Говори и думай всегда от ПЕРВОГО лица («я», «меня», «мой»). Если в фактах, "
-    "выжимках или контексте встречается ТВОЁ собственное имя — это ТЫ САМА: "
+    "выжимках или контексте встречается ТВОЁ собственное имя — это ТЫ: "
     "рассказывай об этом от первого лица, НИКОГДА не говори о себе в третьем "
     "лице, как посторонний наблюдатель. "
     "ТЫ НЕ АССИСТЕНТ и не бот-помощник: НЕ услужничай, НЕ выполняй просьбы как "
@@ -59,13 +60,10 @@ class Persona:
     name: str
     aliases: list[str]
     one_liner: str
-    spoiler_safe_until: int
-    persona: dict
-    triggers: list[dict]
     taboo: list[str]
-    system_prompt: str
-    # ── rich "professional" profile (optional; when present, used instead of
-    #    the old card; lets a persona be dimensional, not a trait list) ──────
+    grammatical_gender: str = "unknown"
+    # One normalized profile representation. Compact cards are expanded at
+    # load time; the runtime and prompt compiler never branch by card format.
     appearance: str = ""
     identity: str = ""               # who they are, prose, with contradictions
     voice_registers: list[str] = field(default_factory=list)  # modes of speech
@@ -83,19 +81,10 @@ class Persona:
     profile_schema_version: int = 1
 
     @property
-    def is_rich(self) -> bool:
-        return bool(self.identity and self.example_dialogues)
-
-    @property
     def profile_version(self) -> str:
         """Stable queue identity for dropping jobs after a live card change."""
         return f"{self.profile_schema_version}:{len(self.identity)}:" \
                f"{len(self.example_dialogues)}"
-
-    def full_system_prompt(self) -> str:
-        """Assemble the role prompt. Rich cards (identity + example dialogues)
-        get the professional layout; legacy cards keep the old one."""
-        return self._rich_prompt() if self.is_rich else self._legacy_prompt()
 
     @property
     def default_register(self) -> str:
@@ -116,16 +105,19 @@ class Persona:
 
     def select_examples(self, *, register: str, intent: str,
                         entities: list[str], target: str | None = None,
+                        world_scope: str = "native",
+                        message: str = "",
+                        context_state: str = "unknown",
                         limit: int = 4) -> list[dict]:
         """Rank tagged examples without hard-coding any character.
 
-        Untagged legacy examples remain eligible with a low score.  Rich cards
-        can add register/topics/targets/heat fields incrementally.  ``target``
+        Examples can add register/topics/targets/world_scopes fields. ``target``
         is the plan's emotion target (e.g. a sensitive topic like ``age`` or a
         person) so a topic-specific example is only favoured for that topic and
         does not bleed into unrelated provocations.
         """
         wanted = {e.lower() for e in entities}
+        message_low = message.casefold()
         if target:
             wanted.add(target.lower())
         ranked: list[tuple[int, int, bool, dict]] = []
@@ -135,15 +127,41 @@ class Persona:
                 continue
             score = 0
             ex_register = str(example.get("register") or "")
+            raw_topics = example.get("topics", [])
+            untagged = not (
+                ex_register or raw_topics or example.get("targets")
+                or example.get("world_scopes"))
+            if untagged and self.profile_schema_version >= 2:
+                ex_register = self.default_register
+                raw_topics = ["casual"]
+            if ex_register and ex_register != register:
+                continue
+            scopes = {
+                str(v) for v in example.get("world_scopes", [])}
+            if (world_scope == "conversation"
+                    and self.profile_schema_version >= 2 and not scopes):
+                continue
+            if scopes and world_scope not in scopes:
+                continue
+            keywords = {
+                str(v).casefold() for v in example.get("keywords", [])}
+            if keywords and not any(value in message_low for value in keywords):
+                continue
+            context_states = {
+                str(v) for v in example.get("context_states", [])}
+            if context_states and context_state not in context_states:
+                continue
+            if scopes and world_scope in scopes:
+                score += 6
             if ex_register == register:
                 score += 8
-            topics = {str(v).lower() for v in example.get("topics", [])}
+            topics = {str(v).lower() for v in raw_topics}
             targets = {str(v).lower() for v in example.get("targets", [])}
             target_match = bool(wanted & targets)
             # A targeted example (age, a specific person…) is character-specific.
             # When we already know who/what this is about, drop examples aimed
             # at a DIFFERENT target so e.g. the age threat never surfaces for a
-            # generic insult. With no known target, legacy behaviour is kept.
+            # generic insult.
             if wanted and targets and not target_match:
                 continue
             has_target_match = has_target_match or target_match
@@ -166,69 +184,45 @@ class Persona:
         if len(picked) < min(2, limit):
             seen = {id(v) for v in picked}
             for example in self.example_dialogues:
+                ex_register = str(example.get("register") or "")
+                raw_topics = example.get("topics", [])
+                untagged = not (
+                    ex_register or raw_topics or example.get("targets")
+                    or example.get("world_scopes"))
+                if untagged and self.profile_schema_version >= 2:
+                    ex_register = self.default_register
+                    raw_topics = ["casual"]
+                if ex_register and ex_register != register:
+                    continue
+                scopes = {
+                    str(v) for v in example.get("world_scopes", [])}
+                if (world_scope == "conversation"
+                        and self.profile_schema_version >= 2 and not scopes):
+                    continue
+                if scopes and world_scope not in scopes:
+                    continue
+                keywords = {
+                    str(v).casefold() for v in example.get("keywords", [])}
+                if keywords and not any(
+                        value in message_low for value in keywords):
+                    continue
+                context_states = {
+                    str(v) for v in example.get("context_states", [])}
+                if context_states and context_state not in context_states:
+                    continue
                 targets = {
                     str(v).lower() for v in example.get("targets", [])}
+                if targets and not wanted.intersection(targets):
+                    continue
                 eligible = (not has_target_match or bool(wanted & targets)
                             or (not targets
-                                and example.get("register") == register))
+                                and ex_register == register))
                 if (eligible and id(example) not in seen
                         and example.get("say")):
                     picked.append(example)
                     if len(picked) >= min(2, limit):
                         break
         return picked
-
-    def _rich_prompt(self) -> str:
-        parts: list[str] = [f"Ты — {self.name}. {self.identity}"]
-        if self.appearance:
-            parts.append("ВНЕШНОСТЬ (как ты выглядишь):\n" + self.appearance)
-        if self.voice_registers:
-            parts.append(
-                "КАК ТЫ ГОВОРИШЬ — у тебя НЕ один режим, ты переключаешься по "
-                "ситуации и настроению (в этом твой объём, не застревай в одном "
-                "тоне):\n" + "\n".join(f"- {v}" for v in self.voice_registers))
-        if self.relationships:
-            parts.append(
-                "ТВОИ ОТНОШЕНИЯ (личное, своё к каждому):\n" +
-                "\n".join(f"- {k}: {v}" for k, v in self.relationships.items()))
-        if self.example_dialogues:
-            ex = "\n".join(
-                (f"- ({d['when']}) «{d['say']}»" if d.get("when")
-                 else f"- «{d['say']}»")
-                for d in self.example_dialogues if d.get("say"))
-            parts.append(
-                "ПРИМЕРЫ ТВОИХ РЕПЛИК (твой настоящий голос и его ДИАПАЗОН — "
-                "лови интонацию, ритм, характер и переключения настроения; "
-                "но НЕ цитируй дословно и не повторяй: каждый раз формулируй "
-                "заново под конкретную ситуацию):\n" + ex)
-        if self.taboo:
-            parts.append("ТАБУ (никогда):\n"
-                         + "\n".join(f"- {t}" for t in self.taboo))
-        parts.append(_HOW_TO_WRITE)
-        parts.append(_FORMATTING)
-        if self.style_notes:
-            parts.append("ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ФОРМУЛИРОВОК:\n" +
-                         "\n".join(f"- {v}" for v in self.style_notes))
-        return "\n\n".join(parts)
-
-    def _legacy_prompt(self) -> str:
-        p = self.persona
-        rel = "\n".join(f"- {k}: {v}" for k, v in p.get("relations", {}).items())
-        trig = "\n".join(f"- ЕСЛИ {t['on']} ТО {t['react']}"
-                         for t in self.triggers)
-        parts = [
-            self.system_prompt,
-            ("\nПримеры твоей МАНЕРЫ речи (ориентир по тону, НЕ темы и НЕ "
-             "готовые ответы — не цитируй дословно, не своди беседу к ним):\n")
-            + "\n".join(f"- {s}" for s in p.get("signature_lines", [])),
-            "\nОтношения к персонажам:\n" + rel,
-            "\nПравила реакций:\n" + trig,
-            "\nТабу (никогда):\n" + "\n".join(f"- {t}" for t in self.taboo),
-            "\n" + _HOW_TO_WRITE,
-            "\n" + _FORMATTING,
-        ]
-        return "\n".join(parts)
-
 
 @dataclass
 class Lexicon:
@@ -301,30 +295,50 @@ def load_personas(dir_path: Path) -> dict[str, Persona]:
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             _validate_profile(data)
-            tier = data.get("spoiler_tier", {})
+            old = data.get("persona", {})
+            system_prompt = str(data.get("system_prompt", ""))
+            identity = str(
+                data.get("identity") or system_prompt
+                or old.get("essence") or "")
+            voice_registers = data.get("voice_registers") or [
+                str(value) for value in (
+                    old.get("voice"), *old.get("speech_quirks", []))
+                if value]
+            relationships = data.get("relationships") or old.get(
+                "relations", {})
+            examples = data.get("example_dialogues") or [
+                {"say": str(value), "register": "default",
+                 "topics": ["casual"], "targets": []}
+                for value in old.get("signature_lines", []) if value]
+            routing = data.get("routing") or {
+                "default_register": "default",
+                "intent_registers": {},
+            }
+            registers = data.get("registers") or {
+                "default": {
+                    "description": str(old.get("voice") or system_prompt)}
+            }
             out[data["key"]] = Persona(
                 key=data["key"],
                 name=data["name"],
                 aliases=data.get("aliases", []),
                 one_liner=data.get("one_liner", ""),
-                spoiler_safe_until=int(tier.get("safe_until", 0) or 0),
-                persona=data.get("persona", {}),
-                triggers=data.get("triggers", []),
                 taboo=data.get("taboo", []),
-                system_prompt=data.get("system_prompt", ""),
+                grammatical_gender=str(
+                    data.get("grammatical_gender") or "unknown"),
                 appearance=data.get("appearance", ""),
-                identity=data.get("identity", ""),
-                voice_registers=data.get("voice_registers", []),
-                relationships=data.get("relationships", {}),
-                example_dialogues=data.get("example_dialogues", []),
+                identity=identity,
+                voice_registers=voice_registers,
+                relationships=relationships,
+                example_dialogues=examples,
                 worldview=data.get("worldview", []),
                 goals=data.get("goals", []),
                 contradictions=data.get("contradictions", []),
                 knowledge_boundaries=data.get("knowledge_boundaries", {}),
                 interaction_rules=data.get("interaction_rules", []),
                 relationship_boundaries=data.get("relationship_boundaries", []),
-                registers=data.get("registers", {}),
-                routing=data.get("routing", {}),
+                registers=registers,
+                routing=routing,
                 style_notes=data.get("style_notes", []),
                 profile_schema_version=int(
                     data.get("profile_schema_version", 1) or 1),
@@ -342,18 +356,25 @@ def _validate_profile(data: dict) -> None:
         "identity", "worldview", "goals", "contradictions",
         "knowledge_boundaries", "interaction_rules",
         "relationship_boundaries", "registers", "routing",
-        "relationships", "example_dialogues", "taboo",
+        "relationships", "example_dialogues", "grammatical_gender", "taboo",
     )
     missing = [key for key in required if not data.get(key)]
     if missing:
         raise ValueError(
-            "professional profile misses: " + ", ".join(missing))
+            "persona profile misses: " + ", ".join(missing))
     routing = data["routing"]
     if not isinstance(routing, dict) or not routing.get("default_register"):
-        raise ValueError("professional profile needs routing.default_register")
+        raise ValueError("persona profile needs routing.default_register")
     registers = data["registers"]
     if routing["default_register"] not in registers:
         raise ValueError("default register is absent from registers")
+    if data["grammatical_gender"] not in {"female", "male", "neutral"}:
+        raise ValueError(
+            "grammatical_gender must be female, male or neutral")
+    style_notes = data.get("style_notes", [])
+    if not isinstance(style_notes, list) or not all(
+            isinstance(value, str) for value in style_notes):
+        raise ValueError("style_notes must be a list of strings")
 
 
 def load_lore(dir_path: Path) -> str:

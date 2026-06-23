@@ -120,7 +120,7 @@ async def run() -> None:
     kb_builder = None
     if cfg.ai_enabled:
         from .ai.engine import AiEngine
-        from .ai.client import AVAILABLE_MODELS, DEFAULT_MODEL, AiApiClient
+        from .ai.client import DEFAULT_MODEL, AiApiClient
         from .ai.kb_builder import KbBuilder
         from .ai.personas import load_lexicon, load_lore, load_personas
         from .ai.store import AiStore
@@ -128,13 +128,10 @@ async def run() -> None:
         redactor.add_secret(cfg.ai_api_key)
         ai_store = AiStore(cfg.ai_db_path)
         await ai_store.connect()
-        # the active model is a runtime setting (switchable via /ai model);
-        # drop a stale pick that's no longer a supported roleplay model
-        model = (await ai_store.get("active_model")) or cfg.ai_model
-        if model not in AVAILABLE_MODELS:
-            model = (cfg.ai_model if cfg.ai_model in AVAILABLE_MODELS
-                     else DEFAULT_MODEL)
-        await ai_store.set("active_model", model)
+        # One quality policy for every persona: 70B first, 17B only when the
+        # primary model is unavailable. Runtime model switching would silently
+        # turn the fallback into the default and make tests non-reproducible.
+        model = DEFAULT_MODEL
         personas = load_personas(cfg.ai_personas_dir)
         lexicon = load_lexicon(cfg.ai_personas_dir)
         lore = load_lore(cfg.ai_personas_dir)

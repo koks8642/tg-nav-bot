@@ -1,7 +1,7 @@
 """Async Groq chat-completions client for persona replies.
 
-The active roleplay model is switchable at runtime. The professional v2 engine
-uses the Llama-only list as a quality/rate-limit cascade: stronger first,
+The active roleplay model is switchable at runtime. The persona engine uses
+the Llama-only list as an availability cascade: stronger first,
 smaller last, never crossing into assistant-like model families. Rate limits
 surface as RateLimited so the engine can pace itself; empty replies as
 EmptyResponse.
@@ -24,9 +24,9 @@ CHAT_API = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_CLASSIFIER_MODEL = "llama-3.1-8b-instant"
 
-# Chat models offered by /ai model — LLAMA ONLY. The safety-tuned gpt-oss
-# family breaks character (writes code, plays assistant) and qwen goes stiff,
-# so they are deliberately excluded from roleplay. llama-3.3-70b is the best.
+# Fixed roleplay cascade. The safety-tuned gpt-oss family breaks character
+# (writes code, plays assistant) and qwen goes stiff, so they are deliberately
+# excluded. llama-3.3-70b is always primary; 17b is availability fallback.
 AVAILABLE_MODELS = (
     "llama-3.3-70b-versatile",
     "meta-llama/llama-4-scout-17b-16e-instruct",

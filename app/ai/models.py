@@ -21,6 +21,7 @@ class ReplyPlan:
     needs_knowledge: bool = False
     search_query: str = ""
     entities: list[str] = field(default_factory=list)
+    conversation_entities: list[str] = field(default_factory=list)
     emotion_target: str | None = None
     affinity_delta: int = 0
     risk_flags: list[str] = field(default_factory=list)
@@ -34,17 +35,9 @@ class ReplyPlan:
         self.affinity_delta = max(-3, min(3, int(self.affinity_delta)))
         if self.knowledge_scope not in {"relevant", "exact", "causal"}:
             self.knowledge_scope = "relevant"
-        if self.world_scope not in {"native", "shared", "foreign"}:
+        if self.world_scope not in {
+                "native", "shared", "foreign", "conversation"}:
             self.world_scope = "native"
-
-    @property
-    def mode(self) -> str:
-        """Compatibility with the v1 queue/generation vocabulary."""
-        if self.intent == "provocation":
-            return "insult"
-        if self.intent in {"plot", "lore"}:
-            return self.intent
-        return "casual"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -107,7 +100,6 @@ class KnowledgeItem:
     forbidden_secrets: list[str] = field(default_factory=list)
     relevance: str = "primary"
     epistemic_note: str = ""
-    late_spoiler: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -121,10 +113,6 @@ class KnowledgeBundle:
     @property
     def chapters(self) -> list[int]:
         return list(dict.fromkeys(i.chapter for i in self.items))
-
-    @property
-    def has_late_spoiler(self) -> bool:
-        return any(i.late_spoiler for i in self.items)
 
     @property
     def forbidden_secrets(self) -> list[str]:

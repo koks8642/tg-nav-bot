@@ -15,6 +15,9 @@
       "uniqueItems": true
     },
     "one_liner": {"type": "string"},
+    "grammatical_gender": {
+      "enum": ["female", "male", "neutral"]
+    },
     "identity": {"type": "string"},
     "worldview": {"type": "array", "items": {"type": "string"}},
     "goals": {"type": "array", "items": {"type": "string"}},
@@ -28,6 +31,7 @@
     },
     "interaction_rules": {"type": "array", "items": {"type": "string"}},
     "relationship_boundaries": {"type": "array", "items": {"type": "string"}},
+    "style_notes": {"type": "array", "items": {"type": "string"}},
     "registers": {
       "type": "object",
       "additionalProperties": {
@@ -70,6 +74,20 @@
           "register": {"type": "string"},
           "topics": {"type": "array", "items": {"type": "string"}},
           "targets": {"type": "array", "items": {"type": "string"}},
+          "world_scopes": {
+            "type": "array",
+            "items": {
+              "enum": ["native", "shared", "foreign", "conversation"]
+            }
+          },
+          "keywords": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "context_states": {
+            "type": "array",
+            "items": {"enum": ["unknown", "informed"]}
+          },
           "heat": {"type": "integer", "minimum": 0, "maximum": 3}
         }
       }
@@ -87,6 +105,7 @@
       "then": {
         "required": [
           "identity",
+          "grammatical_gender",
           "worldview",
           "goals",
           "contradictions",
