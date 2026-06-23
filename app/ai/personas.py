@@ -79,6 +79,7 @@ class Persona:
     relationship_boundaries: list[str] = field(default_factory=list)
     registers: dict[str, dict] = field(default_factory=dict)
     routing: dict = field(default_factory=dict)
+    style_notes: list[str] = field(default_factory=list)  # hard wording rules
     profile_schema_version: int = 1
 
     @property
@@ -205,6 +206,9 @@ class Persona:
                          + "\n".join(f"- {t}" for t in self.taboo))
         parts.append(_HOW_TO_WRITE)
         parts.append(_FORMATTING)
+        if self.style_notes:
+            parts.append("ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ФОРМУЛИРОВОК:\n" +
+                         "\n".join(f"- {v}" for v in self.style_notes))
         return "\n\n".join(parts)
 
     def _legacy_prompt(self) -> str:
@@ -321,6 +325,7 @@ def load_personas(dir_path: Path) -> dict[str, Persona]:
                 relationship_boundaries=data.get("relationship_boundaries", []),
                 registers=data.get("registers", {}),
                 routing=data.get("routing", {}),
+                style_notes=data.get("style_notes", []),
                 profile_schema_version=int(
                     data.get("profile_schema_version", 1) or 1),
             )

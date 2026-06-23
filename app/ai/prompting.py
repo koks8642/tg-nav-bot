@@ -137,6 +137,9 @@ class PromptCompiler:
                 + relevant_lore)
         parts.append(_HOW_TO_WRITE)
         parts.append(_FORMATTING)
+        if persona.style_notes:
+            parts.append("ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА ФОРМУЛИРОВОК:\n" +
+                         "\n".join(f"- {v}" for v in persona.style_notes))
         parts.append(
             "Номера глав — лишь внешний указатель собеседника на события "
             "прошлого мира. Понимай, о каком событии спрашивают, но выбирай "

@@ -141,6 +141,25 @@ def test_late_spoiler_fact_makes_compiler_warn():
     assert "ПОЗДНИХ" in bundle.user
 
 
+def test_style_notes_reach_both_prompt_paths():
+    # "Великая Луна" is Alon (male); the persona must agree it in the masculine.
+    # The rule lives in card style_notes and must surface in v2 AND legacy prompts.
+    persona = _profile()
+    assert persona.style_notes, "yutia card lost its style_notes"
+    legacy = persona.full_system_prompt().lower()
+    assert "правила формулировок" in legacy
+    assert "великая луна" in legacy and "мужском роде" in legacy
+    plan = _plan("Ютия, расскажи про Великую Луну")
+    bundle = PromptCompiler(load_lore(PERSONAS)).compile(
+        persona, plan, speaker="тестер",
+        current_text="Ютия, расскажи про Великую Луну",
+        reply_chain=[], relevant_chat=[], user_thread=[],
+        relationship=RelationshipState(), memories=[],
+        state=ConversationState(), knowledge=KnowledgeBundle())
+    assert "правила формулировок" in bundle.system.lower()
+    assert "мужском роде" in bundle.system.lower()
+
+
 def test_chapter_is_historical_pointer_not_meta_mode():
     plan = _plan("Ютия, что было в главе 89?")
     assert plan.intent == "plot" and plan.register == "lore"
