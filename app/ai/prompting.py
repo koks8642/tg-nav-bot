@@ -32,7 +32,7 @@ class PromptCompiler:
         relationships = persona.relationship_subset(plan.entities)
         examples = persona.select_examples(
             register=plan.register, intent=plan.intent,
-            entities=plan.entities, limit=4)
+            entities=plan.entities, target=plan.emotion_target, limit=4)
         system = self._system(
             persona, plan, relationships, examples, compact=False)
         compact_system = self._system(
@@ -210,12 +210,18 @@ class PromptCompiler:
                     f"{item.text}"
                     + (f"\n  Правило знания: {item.epistemic_note}"
                        if item.epistemic_note else ""))
+            spoiler_note = (
+                " ВНИМАНИЕ: часть фактов касается ПОЗДНИХ событий, которые ещё "
+                "рано раскрывать. Их не пересказывай прямо — ответь уклончиво "
+                "или намёком, поддразни, что всему своё время; используй их "
+                "лишь для СВОЕГО понимания."
+                if knowledge.has_late_spoiler else "")
             parts.append(
                 "ФАКТЫ ДЛЯ ОТВЕТА. Они описывают реальные события твоего "
                 "прошлого. Если упомянута " + persona.name +
                 " — это ТЫ, говори от первого лица. Не добавляй деталей, "
                 "которых здесь нет. Связанный контекст не выдавай за содержание "
-                "точной главы:\n" + "\n".join(facts))
+                "точной главы." + spoiler_note + "\n" + "\n".join(facts))
         elif plan.needs_knowledge:
             parts.append(
                 "По запросу не найдено надёжных фактов. Не выдумывай: честно "

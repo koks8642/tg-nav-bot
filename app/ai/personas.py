@@ -114,13 +114,19 @@ class Persona:
                 if name.lower() in wanted}
 
     def select_examples(self, *, register: str, intent: str,
-                        entities: list[str], limit: int = 4) -> list[dict]:
+                        entities: list[str], target: str | None = None,
+                        limit: int = 4) -> list[dict]:
         """Rank tagged examples without hard-coding any character.
 
         Untagged legacy examples remain eligible with a low score.  Rich cards
-        can add register/topics/targets/heat fields incrementally.
+        can add register/topics/targets/heat fields incrementally.  ``target``
+        is the plan's emotion target (e.g. a sensitive topic like ``age`` or a
+        person) so a topic-specific example is only favoured for that topic and
+        does not bleed into unrelated provocations.
         """
         wanted = {e.lower() for e in entities}
+        if target:
+            wanted.add(target.lower())
         ranked: list[tuple[int, int, bool, dict]] = []
         has_target_match = False
         for idx, example in enumerate(self.example_dialogues):
@@ -133,6 +139,12 @@ class Persona:
             topics = {str(v).lower() for v in example.get("topics", [])}
             targets = {str(v).lower() for v in example.get("targets", [])}
             target_match = bool(wanted & targets)
+            # A targeted example (age, a specific person…) is character-specific.
+            # When we already know who/what this is about, drop examples aimed
+            # at a DIFFERENT target so e.g. the age threat never surfaces for a
+            # generic insult. With no known target, legacy behaviour is kept.
+            if wanted and targets and not target_match:
+                continue
             has_target_match = has_target_match or target_match
             if intent in topics:
                 score += 4

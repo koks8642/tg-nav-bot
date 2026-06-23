@@ -82,6 +82,65 @@ def test_direct_lore_question_is_not_downgraded_to_casual():
     assert {"Ютия", "Хидан"} <= set(plan.entities)
 
 
+def test_colloquial_threats_to_alon_trigger_ice_rage():
+    # Regression: the threat lexicon missed everyday kill-synonyms, so a death
+    # threat against Alon was routed casual/devotion/heat0 — the persona's core
+    # register went dead. Every synonym must reach heat3 ice_rage on Alon.
+    for verb in ("прикончу", "замочу", "грохну", "порешу", "зарежу",
+                 "придушу", "пристрелю", "урою", "закопаю"):
+        plan = _plan(f"я твоего алона {verb}")
+        assert plan.intent == "provocation", (verb, plan.to_dict())
+        assert plan.register == "ice_rage", (verb, plan.to_dict())
+        assert plan.heat == 3, (verb, plan.to_dict())
+        assert plan.emotion_target == "Алон", (verb, plan.to_dict())
+
+
+def test_lore_entities_recognised_in_oblique_cases():
+    # The lexicon knew nominative org names but not declensions, so an oblique
+    # mention slipped to casual with no knowledge lookup.
+    plan = _plan("расскажи про голубую луну")
+    assert plan.intent == "lore" and plan.needs_knowledge
+    assert "Голубая Луна" in plan.entities
+
+
+def test_world_mechanic_question_is_lore_not_real_world():
+    # "как X работает?" used to match the greedy "работ" real-world marker.
+    plan = _plan("что такое красный мир и как он работает?")
+    assert plan.intent == "lore" and plan.needs_knowledge
+    assert "красный мир" in plan.entities
+    # but a genuine everyday-work question must still read as real_world
+    assert _plan("Ютия, что делать на работе?").intent == "real_world"
+
+
+def test_topic_specific_example_does_not_bleed_into_other_provocations():
+    persona = _profile()
+    age_line = "Ещё одно слово о моих годах — и оно вполне может стать для " \
+               "тебя последним."
+    generic = persona.select_examples(
+        register="velvet_threat", intent="provocation", entities=[],
+        target="Ютия", limit=4)
+    assert age_line not in {e["say"] for e in generic}
+    on_age = persona.select_examples(
+        register="velvet_threat", intent="provocation", entities=[],
+        target="age", limit=4)
+    assert age_line in {e["say"] for e in on_age}
+
+
+def test_late_spoiler_fact_makes_compiler_warn():
+    persona = _profile()
+    plan = _plan("Ютия, что было в главе 200?")
+    spoiler = KnowledgeBundle(items=[KnowledgeItem(
+        chapter=200, text="Поздняя тайна.", late_spoiler=True)])
+    assert spoiler.has_late_spoiler
+    bundle = PromptCompiler(load_lore(PERSONAS)).compile(
+        persona, plan, speaker="тестер",
+        current_text="Ютия, что было в главе 200?",
+        reply_chain=[], relevant_chat=[], user_thread=[],
+        relationship=RelationshipState(), memories=[],
+        state=ConversationState(), knowledge=spoiler)
+    assert "ПОЗДНИХ" in bundle.user
+
+
 def test_chapter_is_historical_pointer_not_meta_mode():
     plan = _plan("Ютия, что было в главе 89?")
     assert plan.intent == "plot" and plan.register == "lore"

@@ -59,6 +59,7 @@ class KnowledgeService:
                 forbidden_secrets=forbidden,
                 relevance="primary",
                 epistemic_note=_epistemic_note(perspective),
+                late_spoiler=_is_late_spoiler(persona, int(row["chapter"])),
             ))
 
         # Existing summaries remain a guaranteed fallback while structured
@@ -139,6 +140,7 @@ class KnowledgeService:
                 perspective=perspective,
                 confidence=float(row.get("confidence") or 0.8),
                 forbidden_secrets=forbidden, relevance="related",
+                late_spoiler=_is_late_spoiler(persona, number),
                 epistemic_note=(
                     "Связанный контекст причин/последствий; не подменяет "
                     f"события главы {exact_chapter}.")))
@@ -159,10 +161,17 @@ class KnowledgeService:
             source="summary", participants=participants,
             perspective=perspective, confidence=0.75,
             forbidden_secrets=forbidden,
+            late_spoiler=_is_late_spoiler(persona, int(row["chapter"])),
             epistemic_note=(
                 "Выжимка не доказывает, что ты видела всю главу. Используй "
                 "только прямо доступную тебе часть и не присваивай чужие "
                 "тайные мысли или закрытые сцены."))
+
+
+def _is_late_spoiler(persona: Persona, chapter: int) -> bool:
+    """A fact from beyond the persona's safe chapter is a late spoiler."""
+    safe = persona.spoiler_safe_until
+    return bool(safe and chapter > safe)
 
 
 def _chapter_number(text: str) -> int | None:

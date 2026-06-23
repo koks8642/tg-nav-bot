@@ -107,6 +107,7 @@ class KnowledgeItem:
     forbidden_secrets: list[str] = field(default_factory=list)
     relevance: str = "primary"
     epistemic_note: str = ""
+    late_spoiler: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -120,6 +121,10 @@ class KnowledgeBundle:
     @property
     def chapters(self) -> list[int]:
         return list(dict.fromkeys(i.chapter for i in self.items))
+
+    @property
+    def has_late_spoiler(self) -> bool:
+        return any(i.late_spoiler for i in self.items)
 
     @property
     def forbidden_secrets(self) -> list[str]:
