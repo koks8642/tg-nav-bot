@@ -1,18 +1,26 @@
-name: Test
+name: CI & Deploy
+
+# Tests run on every push/PR to a clean branch. A successful push to a clean
+# branch then auto-deploys over SSH:
+#   master  -> navigation bot   (docker-compose.yml,        service rqm-nav)
+#   ai-prod -> AI persona bot   (docker-compose.test.yml,   project rqm-test)
+# Test branches (nav-test, ai-test) are NOT auto-deployed — try changes there
+# first, then fast-forward the clean branch when ready.
 
 on:
   push:
-    branches:
-      - master
+    branches: [master, ai-prod, nav-test, ai-test]
   pull_request:
-    branches:
-      - master
+    branches: [master, ai-prod]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,3 +36,69 @@ jobs:
         run: python -m pip check
       - name: Build Docker image
         run: docker build -t rqm-nav-bot:test .
+
+  deploy-nav:
+    name: Deploy navigation bot
+    needs: test
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — are deploy secrets configured?
+        id: cfg
+        run: |
+          if [ -n "${{ secrets.DEPLOY_SSH_HOST }}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DEPLOY_SSH_* secrets not set — skipping deploy."
+          fi
+      - name: Deploy over SSH
+        if: steps.cfg.outputs.ready == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.NAV_DIR }}"
+            git fetch origin master
+            git checkout -B master origin/master
+            git reset --hard origin/master
+            DEPLOY_BRANCH=master ./scripts/update_server.sh
+
+  deploy-ai:
+    name: Deploy AI persona bot
+    needs: test
+    if: github.ref == 'refs/heads/ai-prod' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard — are deploy secrets configured?
+        id: cfg
+        run: |
+          if [ -n "${{ secrets.DEPLOY_SSH_HOST }}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DEPLOY_SSH_* secrets not set — skipping deploy."
+          fi
+      - name: Deploy over SSH
+        if: steps.cfg.outputs.ready == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.AI_DIR }}"
+            git fetch origin ai-prod
+            git checkout -B ai-prod origin/ai-prod
+            git reset --hard origin/ai-prod
+            DEPLOY_BRANCH=ai-prod \
+            COMPOSE_FILE=docker-compose.test.yml \
+            COMPOSE_PROJECT=rqm-test \
+            DEPLOY_SERVICE=rqm-test \
+            ./scripts/update_server.sh

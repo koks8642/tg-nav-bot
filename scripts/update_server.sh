@@ -6,6 +6,20 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 branch="${DEPLOY_BRANCH:-master}"
+# Which container set to drive. Defaults keep the original nav-bot behaviour;
+# the AI persona bot passes COMPOSE_FILE=docker-compose.test.yml,
+# COMPOSE_PROJECT=rqm-test, DEPLOY_SERVICE=rqm-test.
+compose_file="${COMPOSE_FILE:-}"
+compose_project="${COMPOSE_PROJECT:-}"
+deploy_service="${DEPLOY_SERVICE:-rqm-nav}"
+
+dc() {
+  local args=()
+  [ -n "$compose_file" ] && args+=(-f "$compose_file")
+  [ -n "$compose_project" ] && args+=(-p "$compose_project")
+  docker compose "${args[@]}" "$@"
+}
+
 previous_commit="$(git rev-parse HEAD 2>/dev/null || true)"
 
 rollback() {
@@ -16,7 +30,7 @@ rollback() {
   echo "Rolling back to ${previous_commit}..." >&2
   git checkout -B "$branch" "$previous_commit"
   git reset --hard "$previous_commit"
-  docker compose up -d --build
+  dc up -d --build
 }
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -42,7 +56,7 @@ git checkout -B "$branch" "$target_commit"
 git reset --hard "$target_commit"
 
 echo "Rebuilding and restarting Docker service..."
-if ! docker compose up -d --build; then
+if ! dc up -d --build; then
   echo "Deploy build/start failed." >&2
   rollback || true
   exit 1
@@ -52,7 +66,7 @@ echo "Running container smoke check..."
 sleep 5
 smoke_ok=0
 for i in 1 2 3 4 5 6 7 8 9 10; do
-  if docker compose exec -T rqm-nav python -m app.smoke; then
+  if dc exec -T "$deploy_service" python -m app.smoke; then
     smoke_ok=1
     break
   fi
@@ -71,4 +85,4 @@ echo "Cleaning unused Docker images..."
 docker image prune -f >/dev/null 2>&1 || true
 
 echo "Current containers:"
-docker compose ps
+dc ps
