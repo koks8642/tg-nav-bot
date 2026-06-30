@@ -33,3 +33,10 @@ Thumbs.db
 # pytest --basetemp artifact (CI)
 .test-tmp/
 .pytest-*/
+
+# Build / test artifacts — never commit these
+*.tar.gz
+*.tgz
+.release-*
+pytest_out.txt
+*_out.txt
